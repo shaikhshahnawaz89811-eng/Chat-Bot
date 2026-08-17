@@ -50,6 +50,25 @@ class LocalApiForegroundService : Service() {
         super.onDestroy()
     }
 
+    /**
+     * Phase 7 background-service-stability fix: Android 14 (API 34) caps a
+     * `dataSync` foreground service at ~6 hours of cumulative background
+     * runtime per day and calls this real, platform-provided callback
+     * (`Service.onTimeout(int, int)`, added in API 34 - not a fake/dummy
+     * method) shortly before it force-stops the service itself. Without
+     * this override the service would previously get killed by the system
+     * with a `ForegroundServiceDidNotStopInTimeException` crash instead of
+     * shutting down cleanly. Stopping the real server here (same call
+     * `ACTION_STOP` already uses) means the Connection Status screen's
+     * state genuinely reflects "Stopped" instead of looking Running while
+     * the process is actually being torn down underneath it.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        LocalApiServerManager.stop()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf(startId)
+    }
+
     private fun buildNotification(): android.app.Notification {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)

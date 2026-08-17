@@ -107,7 +107,6 @@ dependencies {
     implementation("androidx.room:room-ktx:2.6.1")
     ksp("androidx.room:room-compiler:2.6.1")
     implementation("net.zetetic:sqlcipher-android:4.6.1")
-    implementation("androidx.sqlite:sqlite:2.4.0")
     // Holds the random SQLCipher passphrase itself behind Android Keystore
     // (AES256-GCM), so the encryption key isn't just sitting in plain
     // SharedPreferences next to the DB it protects.

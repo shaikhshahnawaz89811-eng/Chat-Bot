@@ -4,7 +4,8 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
-import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
+import net.sqlcipher.database.SQLiteDatabase
+import net.sqlcipher.database.SupportFactory
 
 /**
  * Real SQLCipher-encrypted Room database - `openHelperFactory(SupportFactory(...))`
@@ -27,9 +28,9 @@ abstract class ApiKeyDatabase : RoomDatabase() {
             }
 
         private fun build(context: Context): ApiKeyDatabase {
-            System.loadLibrary("sqlcipher")
+            SQLiteDatabase.loadLibs(context)
             val passphrase = DatabaseKeyProvider(context).getOrCreatePassphrase()
-            val factory = SupportOpenHelperFactory(passphrase.concatToString().toByteArray(Charsets.UTF_8))
+            val factory = SupportFactory(SQLiteDatabase.getBytes(passphrase))
             return Room.databaseBuilder(context, ApiKeyDatabase::class.java, "brain_api_keys.db")
                 .openHelperFactory(factory)
                 .build()
