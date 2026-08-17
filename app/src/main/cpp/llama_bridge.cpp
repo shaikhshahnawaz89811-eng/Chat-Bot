@@ -79,7 +79,6 @@ Java_com_brain_offlineai_engine_BrainNative_nativeLoadModel(
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = 0; // CPU-only: correct default for phones
                                     // without a verified GPU backend build.
-    model_params.use_mmap = true;
 
     LOGI("Loading model from %s", pathStr.c_str());
     g_model = llama_model_load_from_file(pathStr.c_str(), model_params);
