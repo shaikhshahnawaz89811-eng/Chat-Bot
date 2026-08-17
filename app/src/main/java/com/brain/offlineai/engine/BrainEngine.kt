@@ -1,0 +1,91 @@
+package com.brain.offlineai.engine
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.withContext
+
+/** Real state of the local llama.cpp engine - no state here is decorative. */
+sealed class EngineState {
+    data object Unloaded : EngineState()
+    data class Loading(val modelName: String) : EngineState()
+    data class Loaded(val modelName: String, val contextSize: Int) : EngineState()
+    data class Error(val message: String) : EngineState()
+}
+
+/**
+ * Single process-wide owner of the native llama.cpp context. There is only
+ * ever one model loaded at a time (matches the Phase-1 "AI Engine Status"
+ * card, which shows exactly one model).
+ */
+object BrainEngine {
+
+    private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
+    val state: StateFlow<EngineState> = _state
+
+    private var backendReady = false
+
+    /**
+     * Loads [modelPath] (already copied into app-private storage by
+     * ModelFileManager). Runs on Dispatchers.Default since model loading
+     * (mmap + metadata parse) is CPU/IO-bound and can take several seconds
+     * for a multi-hundred-MB GGUF file - never on the main thread.
+     */
+    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 2048, nThreads: Int = 4) {
+        _state.value = EngineState.Loading(modelDisplayName)
+        withContext(Dispatchers.Default) {
+            if (!backendReady) {
+                backendReady = BrainNative.nativeBackendInit()
+            }
+            val ok = BrainNative.nativeLoadModel(modelPath, nCtx, nThreads)
+            _state.value = if (ok) {
+                EngineState.Loaded(modelDisplayName, BrainNative.nativeGetContextSize())
+            } else {
+                EngineState.Error("Model failed to load - check the file is a valid GGUF and fits in device RAM.")
+            }
+        }
+    }
+
+    suspend fun unloadModel() {
+        withContext(Dispatchers.Default) {
+            BrainNative.nativeUnloadModel()
+        }
+        _state.value = EngineState.Unloaded
+    }
+
+    val isLoaded: Boolean
+        get() = _state.value is EngineState.Loaded
+
+    /**
+     * Streams real generated text pieces from the model as a cold Flow.
+     * Each emission is one decoded token piece straight from
+     * llama_token_to_piece - nothing here is scripted or pre-written.
+     * Cancelling collection of this flow cancels generation inside the
+     * native loop via the TokenCallback returning false.
+     */
+    fun generate(prompt: String, maxTokens: Int = 512, temperature: Float = 0.7f, topP: Float = 0.9f): Flow<String> =
+        callbackFlow {
+            if (!isLoaded) {
+                close(IllegalStateException("No model loaded"))
+                return@callbackFlow
+            }
+            var cancelled = false
+            val callback = BrainNative.TokenCallback { token ->
+                val sendResult = trySend(token)
+                cancelled = sendResult.isFailure
+                !cancelled
+            }
+            withContext(Dispatchers.Default) {
+                val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
+                if (stopReason.startsWith("error:")) {
+                    close(IllegalStateException(stopReason))
+                } else {
+                    close()
+                }
+            }
+            awaitClose { /* native generation already finished by the time we get here */ }
+        }
+}

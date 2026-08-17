@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Brain 100% offline engine hai. Local API server (Phase 4) sirf 127.0.0.1
+    par chalega — is config se explicitly sirf loopback allow hoga, koi bhi
+    external cleartext traffic allow nahi hoga. Isse "No Internet for AI
+    Inference" wala highlight enforce hota hai code-level par bhi.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

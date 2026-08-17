@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Phase 4: Local API Server. INTERNET is required for any socket bind
+         even loopback-only (Android enforces this regardless of address);
+         the actual loopback-only restriction is enforced in code
+         (LocalApiServer binds "127.0.0.1" explicitly, never "0.0.0.0") and
+         in network_security_config.xml. FOREGROUND_SERVICE(+DATA_SYNC) lets
+         the server keep running while the app is backgrounded, matching the
+         mockup's "Works in Background" highlight badge. POST_NOTIFICATIONS
+         is needed on Android 13+ to show the ongoing-server notification
+         (the service still runs fine without it granted, it just won't be
+         visible in the status bar). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.BrainOfflineAI"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:largeHeap="true"
+        tools:targetApi="31"
+        xmlns:tools="http://schemas.android.com/tools">
+        <!-- largeHeap: a real GGUF model (even 1.5B Q4_K_M) plus its KV
+             cache genuinely needs more Dalvik heap headroom than the
+             default limit on many devices - this is a real requirement
+             of Phase 2, not a precaution for something imaginary. -->
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@style/Theme.BrainOfflineAI"
+            android:configChanges="orientation|screenSize|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Phase 4: real foreground service hosting the loopback-only
+             OpenAI-compatible server (see server/LocalApiServer.kt). Not
+             exported - only this app can start/stop it. -->
+        <service
+            android:name=".server.LocalApiForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+    </application>
+
+</manifest>

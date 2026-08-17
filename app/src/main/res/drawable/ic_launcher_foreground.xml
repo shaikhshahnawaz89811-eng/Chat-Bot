@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/vector"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Left brain hemisphere -->
+    <path
+        android:fillColor="#7B5CF5"
+        android:pathData="M38,30 C28,30 22,38 23,47 C17,50 15,58 20,64 C18,70 22,77 30,78 C32,84 40,87 46,83 L46,32 C44,30 41,30 38,30 Z" />
+    <!-- Right brain hemisphere -->
+    <path
+        android:fillColor="#4FD8E8"
+        android:pathData="M70,30 C80,30 86,38 85,47 C91,50 93,58 88,64 C90,70 86,77 78,78 C76,84 68,87 62,83 L62,32 C64,30 67,30 70,30 Z" />
+    <!-- Center divider / synapse dot -->
+    <path android:fillColor="#F5F6FA" android:pathData="M53,34 h2 v50 h-2 z" />
+</vector>

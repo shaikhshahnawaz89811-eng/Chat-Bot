@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Colors picked directly from the provided mockup (1000156881.png) -->
+    <color name="brain_bg_primary">#0A0E1C</color>
+    <color name="brain_bg_card">#131829</color>
+    <color name="brain_bg_card_alt">#161C30</color>
+    <color name="brain_border">#232A42</color>
+
+    <color name="brain_purple_primary">#7B5CF5</color>
+    <color name="brain_purple_dark">#5B3FD1</color>
+    <color name="brain_purple_bubble">#6C4EF0</color>
+
+    <color name="brain_cyan_accent">#4FD8E8</color>
+    <color name="brain_pink_accent">#F0609B</color>
+
+    <color name="brain_success_green">#2ECC71</color>
+    <color name="brain_warning_amber">#F5A623</color>
+    <color name="brain_danger_red">#EF4B4B</color>
+
+    <color name="brain_text_primary">#F5F6FA</color>
+    <color name="brain_text_secondary">#8A90A8</color>
+    <color name="brain_text_muted">#5C6280</color>
+</resources>
