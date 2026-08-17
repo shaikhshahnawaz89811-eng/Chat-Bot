@@ -8,6 +8,7 @@ import androidx.lifecycle.AndroidViewModel
 import com.brain.offlineai.data.settings.AppSettingsRepository
 import com.brain.offlineai.data.settings.AppSettingsState
 import com.brain.offlineai.ui.theme.applyBrainTheme
+import kotlin.jvm.JvmName
 
 /**
  * Screen 12 from the mockup ("General Settings"). Every switch here is
@@ -35,6 +36,7 @@ class GeneralSettingsViewModel(application: Application) : AndroidViewModel(appl
         applyBrainTheme(enabled)
     }
 
+    @JvmName("updateAnimationsEnabled")
     fun setAnimationsEnabled(enabled: Boolean) {
         animationsEnabled = enabled
         repository.setAnimationsEnabled(enabled)
@@ -50,6 +52,7 @@ class GeneralSettingsViewModel(application: Application) : AndroidViewModel(appl
      * side effect here would be two owners toggling the same real Service
      * (Rule 3/17 - one real endpoint per action, not two paths to it).
      */
+    @JvmName("updateAutoStartLocalApi")
     fun setAutoStartLocalApi(enabled: Boolean) {
         autoStartLocalApi = enabled
         repository.setAutoStartLocalApi(enabled)

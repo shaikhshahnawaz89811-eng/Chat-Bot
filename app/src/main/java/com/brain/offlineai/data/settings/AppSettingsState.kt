@@ -5,6 +5,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.brain.offlineai.ui.theme.applyBrainTheme
+import kotlin.jvm.JvmName
 
 /**
  * Single, process-wide holder of the real live values behind Phase 6's
@@ -33,6 +34,7 @@ object AppSettingsState {
         applyBrainTheme(repo.isDarkTheme())
     }
 
+    @JvmName("updateAnimationsEnabled")
     fun setAnimationsEnabled(enabled: Boolean) {
         animationsEnabled = enabled
     }
