@@ -37,6 +37,12 @@ enum class ProcessMarking(
     VERIFYING("\u2705", "Verifying", "Verifying result...", "Result verified"),
     RECHECKING("\uD83D\uDD01", "Rechecking", "Rechecking...", "Recheck complete"),
     SAFETY_CHECK("\uD83D\uDEE1\uFE0F", "Safety Check", "Running safety check...", "Safety check passed"),
+    // Phase 17.1 (PROGRESS.md Phase 17 Plan) - additive marking,
+    // was listed in the mockup's section 2 "LIVE PROCESS ANIMATION" table
+    // ("Building | Building APK... | Build successful") but had no enum
+    // entry yet. Nothing above is touched or renumbered (Document-Editing
+    // Convention) - this is a pure addition.
+    BUILDING("\uD83C\uDFD7\uFE0F", "Building", "Building APK...", "Build successful"),
     PACKAGING("\uD83D\uDCE6", "Packaging", "Packaging project...", "Packaged"),
     ZIPPING("\uD83D\uDDDC\uFE0F", "Zipping", "Creating ZIP...", "ZIP ready"),
     UPLOADING("\u2B06\uFE0F", "Uploading", "Uploading file...", "Upload complete"),

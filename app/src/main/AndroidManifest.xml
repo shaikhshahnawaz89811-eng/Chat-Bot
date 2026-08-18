@@ -16,6 +16,14 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Phase 11: Artifact card + ZIP/file output + download flow. Only
+         needed for the real legacy (API 26-28) "Save to Device" path in
+         ArtifactFileManager.exportToDownloads - API 29+ uses scoped-storage
+         MediaStore.Downloads instead, which needs no permission at all
+         (maxSdkVersion=28 reflects that honestly, same targeted-permission
+         approach the Phase 4 permissions above already use). -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+
     <application
         android:name=".BrainApplication"
         android:allowBackup="false"
@@ -53,6 +61,21 @@
             android:name=".server.LocalApiForegroundService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Phase 11: real FileProvider so Share / Open in File Manager can
+             hand a genuine content:// Uri to another app for an artifact
+             file that actually lives in this app's private storage - never
+             exported, never grants broader access than the one file's Uri
+             it's asked for (see ArtifactFileManager.getShareUri). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
     </application>
 

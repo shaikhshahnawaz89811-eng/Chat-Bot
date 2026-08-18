@@ -46,19 +46,29 @@ app/src/main/java/com/brain/offlineai/
   ├─ server/                      # loopback-only OpenAI-compatible local API server
   ├─ data/apikeys/                # SQLCipher-encrypted API key storage
   ├─ data/history/                # real chat-session persistence (Phase 7)
+  ├─ data/attachments/            # real file/ZIP/image/video upload storage (Phase 10)
+  ├─ data/artifacts/              # real generated-file/ZIP output + download (Phase 11)
   ├─ data/settings/, data/analytics/  # persisted app/model settings, usage counters
   ├─ ui/theme/                    # colors/type/theme pulled from the mockup
-  ├─ ui/components/               # reusable pieces (drawer, bubbles, bars)
+  ├─ ui/process/, ui/tasks/, ui/normalize/, ui/multimodal/, ui/recovery/
+  │                               # marking system, multi-task splitter, input
+  │                               # normalizer, attachment-role router, error
+  │                               # recovery (Phases 8, 12, 13, 14, 15)
+  ├─ ui/components/               # reusable pieces (drawer, bubbles, bars, cards)
   └─ ui/screens/                  # one folder per feature
 ```
 
 ## Status
 
-All 7 phases in PROGRESS.md are complete - the full mockup (14 screens),
-the local llama.cpp engine, the encrypted API-key system, the loopback-only
-local API server, and real chat history are all wired end-to-end. See
-PROGRESS.md for the authoritative, phase-by-phase detail and the Phase 7
-final audit notes.
+All 15 phases in PROGRESS.md are complete - the full original mockup (14
+screens), the local llama.cpp engine, the encrypted API-key system, the
+loopback-only local API server, real chat history, and the full
+Claude-style AI agent chat UI spec (markings/live process card, streaming
+states, file/ZIP/image/video upload, artifact output + download, multi-task
+handling, input normalization, multimodal attachment routing, and error &
+recovery) are all wired end-to-end. See PROGRESS.md for the authoritative,
+phase-by-phase detail, including every deliberate scope reduction and every
+not-yet-wired marking, documented rather than hidden.
 
 ## Getting a model onto the phone (Phase 2)
 

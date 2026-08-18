@@ -16,7 +16,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import com.brain.offlineai.data.artifacts.ArtifactDownloadTarget
+import com.brain.offlineai.data.artifacts.ArtifactInfo
 import com.brain.offlineai.data.settings.AppSettingsState
+import com.brain.offlineai.ui.screens.chat.ArtifactDownloadUiState
 import com.brain.offlineai.ui.screens.chat.ChatMessage
 import com.brain.offlineai.ui.screens.chat.ThinkingStep
 import com.brain.offlineai.ui.theme.*
@@ -26,14 +29,33 @@ import kotlin.math.sin
 fun UserBubble(message: ChatMessage) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
         Column(horizontalAlignment = Alignment.End) {
-            Box(
-                modifier = Modifier
-                    .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 4.dp, bottomStart = 16.dp, bottomEnd = 16.dp))
-                    .background(BrainPurpleBubble)
-                    .padding(horizontal = 14.dp, vertical = 10.dp)
-                    .widthIn(max = 260.dp)
-            ) {
-                Text(message.text, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+            // Phase 10 (File/ZIP/Image/Video upload flow) - real attachments
+            // actually sent with this message, rendered above the text bubble
+            // (empty for every message from every earlier phase - additive only).
+            if (message.attachments.isNotEmpty()) {
+                // Phase 14 (Multimodal input use-case routing) - real
+                // role lookup by attachment id, from this same message's
+                // own [ChatMessage.attachmentRoutes] (empty for every
+                // message from before this phase, so `role` is simply
+                // null then - additive only).
+                val roleByAttachmentId = message.attachmentRoutes.associateBy { it.attachmentId }
+                Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    message.attachments.forEach { attachment ->
+                        SentAttachmentCard(attachment, role = roleByAttachmentId[attachment.id]?.role)
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+            if (message.text.isNotBlank()) {
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(topStart = 16.dp, topEnd = 4.dp, bottomStart = 16.dp, bottomEnd = 16.dp))
+                        .background(BrainPurpleBubble)
+                        .padding(horizontal = 14.dp, vertical = 10.dp)
+                        .widthIn(max = 260.dp)
+                ) {
+                    Text(message.text, color = Color.White, style = MaterialTheme.typography.bodyLarge)
+                }
             }
             Text(
                 message.timestamp,
@@ -45,12 +67,60 @@ fun UserBubble(message: ChatMessage) {
     }
 }
 
+/**
+ * Phase 11 (Artifact card + ZIP/file output + download flow) - real
+ * download params are additive with safe no-op defaults, so every earlier
+ * phase's call sites with just `message` still compile unchanged
+ * (Document-Editing Convention). [message.artifacts] is empty for any
+ * plain-prose reply, so the artifact card below simply doesn't render for
+ * the vast majority of TEXT messages.
+ */
 @Composable
-fun BotTextBubble(message: ChatMessage) {
+fun BotTextBubble(
+    message: ChatMessage,
+    artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
+    onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
+    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
+) {
     BotCardShell {
         Text(message.text, color = BrainTextPrimary, style = MaterialTheme.typography.bodyLarge)
         Spacer(Modifier.height(4.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+        if (message.artifacts.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            ArtifactCard(
+                artifacts = message.artifacts,
+                artifactSteps = message.artifactSteps,
+                downloadStates = artifactDownloadStates,
+                zipDownloadId = "zip-${message.id}",
+                onDownload = onDownloadArtifact,
+                onDownloadAll = onDownloadAllArtifacts
+            )
+        }
+    }
+}
+
+/** Phase 8 (new Claude-style UI spec) - renders [ChatMessage.processSteps]
+ *  via [LiveProcessCard]. Real call site is [com.brain.offlineai.ui.screens.chat.ChatViewModel]
+ *  emitting a genuine THINKING step while it checks engine state / loads
+ *  settings before a real generation starts - see that file's sendMessage(). */
+@Composable
+fun BotProcessBubble(message: ChatMessage) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+        LiveProcessCard(steps = message.processSteps, modifier = Modifier.widthIn(max = 280.dp))
+    }
+}
+
+/** Phase 12 (Multi-task handling engine, new Claude-style UI spec section
+ *  6) - renders [ChatMessage.tasks] via [TaskListCard]. Real call site is
+ *  [com.brain.offlineai.ui.screens.chat.ChatViewModel.runMultiTaskMessage],
+ *  which is only ever invoked when [com.brain.offlineai.ui.tasks.TaskSplitter]
+ *  genuinely found 2+ distinct tasks in the user's own message - an
+ *  ordinary single-instruction message never reaches this bubble. */
+@Composable
+fun BotTaskListBubble(message: ChatMessage) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
+        TaskListCard(tasks = message.tasks, modifier = Modifier.widthIn(max = 280.dp))
     }
 }
 
@@ -136,8 +206,14 @@ fun BotCodingBubble(message: ChatMessage) {
  * was missing before, matching what BotTextBubble already shows for a
  * plain finished reply.
  */
+/** Phase 11 - same additive, safe-default download params as [BotTextBubble] above. */
 @Composable
-fun BotCodeDoneBubble(message: ChatMessage) {
+fun BotCodeDoneBubble(
+    message: ChatMessage,
+    artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
+    onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
+    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
+) {
     BotCardShell {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
@@ -172,6 +248,17 @@ fun BotCodeDoneBubble(message: ChatMessage) {
         Text("Done.", color = BrainSuccessGreen, style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(2.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+        if (message.artifacts.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            ArtifactCard(
+                artifacts = message.artifacts,
+                artifactSteps = message.artifactSteps,
+                downloadStates = artifactDownloadStates,
+                zipDownloadId = "zip-${message.id}",
+                onDownload = onDownloadArtifact,
+                onDownloadAll = onDownloadAllArtifacts
+            )
+        }
     }
 }
 
@@ -188,7 +275,15 @@ fun BotGeneratingBubble(message: ChatMessage) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             PulsingDot(color = BrainPurplePrimary)
             Spacer(Modifier.width(8.dp))
-            Text("Generating...", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+            // Phase 9 - real start/streaming distinction: message.generationProgress
+            // is the real running token count already collected from BrainEngine's
+            // Flow (Phase 2). Zero tokens so far means the real decode loop hasn't
+            // produced its first piece yet (Starting...); any token already means
+            // real pieces are actively arriving (Streaming reply...). No new timer
+            // or fake state was added - this reads the same real counter the token
+            // count on the right already uses.
+            val label = if (message.generationProgress == 0) "Starting..." else "Streaming reply..."
+            Text(label, color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.weight(1f))
             Text("${message.generationProgress} tokens", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
         }
