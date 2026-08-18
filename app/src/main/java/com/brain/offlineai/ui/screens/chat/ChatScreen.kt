@@ -22,10 +22,10 @@ import com.brain.offlineai.ui.theme.BrainBgPrimary
 import kotlinx.coroutines.launch
 
 /**
- * [openSessionId] is non-null only when this screen is reached from the
- * real History screen (Phase 7) reopening a past conversation - the
- * default bottom-nav Chat tab still passes null and behaves exactly like
- * every earlier phase (a fresh conversation, no call-site change there).
+ * UI-only redesign of the existing ChatScreen.
+ *
+ * Existing ViewModel, engine, attachment picker, artifact download flow and
+ * message-state routing are intentionally preserved.
  */
 @Composable
 fun ChatScreen(
@@ -48,14 +48,6 @@ fun ChatScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
-    // Phase 11 (Artifact card + ZIP/file output + download flow) - real
-    // runtime-permission gate, only ever needed on API 26-28 for the
-    // "Save to Device" option (API 29+ uses scoped-storage MediaStore,
-    // which needs no permission - see ChatViewModel.needsLegacyStoragePermission).
-    // The screen owns this launcher (same "screen owns the launcher"
-    // convention Phase 10's attachment picker already established) since
-    // requesting a runtime permission requires an Activity context the
-    // ViewModel doesn't have.
     var pendingLegacyDownload by remember { mutableStateOf<ArtifactInfo?>(null) }
     val storagePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
@@ -68,7 +60,8 @@ fun ChatScreen(
     }
 
     val onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { artifact, target ->
-        if (target == ArtifactDownloadTarget.SAVE_TO_DEVICE &&
+        if (
+            target == ArtifactDownloadTarget.SAVE_TO_DEVICE &&
             Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
             viewModel.needsLegacyStoragePermission()
         ) {
@@ -79,12 +72,7 @@ fun ChatScreen(
         }
     }
 
-    // Phase 10 (File/ZIP/Image/Video upload flow) - the screen owns the
-    // real SAF picker launcher, same "screen owns the launcher, ViewModel
-    // owns what happens with the result" split ModelsScreen already uses
-    // for its own OpenDocument picker. OpenMultipleDocuments (not the
-    // single-file OpenDocument Models uses) since this flow genuinely
-    // supports attaching more than one file at once.
+    // Existing real Android file picker. No new/fake upload source is added.
     val attachmentPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
@@ -97,40 +85,86 @@ fun ChatScreen(
 
     LaunchedEffect(messages.size) {
         if (messages.isNotEmpty()) {
-            scope.launch { listState.animateScrollToItem(messages.size - 1) }
+            scope.launch {
+                listState.animateScrollToItem(messages.size - 1)
+            }
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize().background(BrainBgPrimary)) {
-        ChatTopBar(title = "Brain", onMenuClick = onMenuClick)
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(BrainBgPrimary)
+    ) {
+        // Same existing top bar; only the title is changed to Chat Bot.
+        ChatTopBar(
+            title = "Chat Bot",
+            onMenuClick = onMenuClick
+        )
 
         LazyColumn(
             state = listState,
-            modifier = Modifier.weight(1f).fillMaxWidth(),
-            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentPadding = PaddingValues(
+                horizontal = 12.dp,
+                vertical = 8.dp
+            ),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            items(messages, key = { it.id }) { message ->
+            items(
+                messages,
+                key = { it.id }
+            ) { message ->
                 when {
                     message.isUser -> UserBubble(message)
-                    message.state == BotMessageState.PROCESS -> BotProcessBubble(message)
-                    message.state == BotMessageState.TASK_LIST -> BotTaskListBubble(message)
-                    message.state == BotMessageState.THINKING -> BotThinkingBubble(message)
-                    message.state == BotMessageState.CODING -> BotCodingBubble(message)
-                    message.state == BotMessageState.CODE_DONE -> BotCodeDoneBubble(
-                        message,
-                        artifactDownloadStates = artifactDownloads,
-                        onDownloadArtifact = onDownloadArtifact,
-                        onDownloadAllArtifacts = { artifacts -> viewModel.onDownloadAllArtifacts(message.id, artifacts) }
-                    )
-                    message.state == BotMessageState.GENERATING -> BotGeneratingBubble(message)
-                    message.state == BotMessageState.SYSTEM_NOTE -> BotSystemNoteBubble(message)
-                    else -> BotTextBubble(
-                        message,
-                        artifactDownloadStates = artifactDownloads,
-                        onDownloadArtifact = onDownloadArtifact,
-                        onDownloadAllArtifacts = { artifacts -> viewModel.onDownloadAllArtifacts(message.id, artifacts) }
-                    )
+
+                    message.state == BotMessageState.PROCESS ->
+                        BotProcessBubble(message)
+
+                    message.state == BotMessageState.TASK_LIST ->
+                        BotTaskListBubble(message)
+
+                    message.state == BotMessageState.THINKING ->
+                        BotThinkingBubble(message)
+
+                    message.state == BotMessageState.CODING ->
+                        BotCodingBubble(message)
+
+                    message.state == BotMessageState.CODE_DONE ->
+                        BotCodeDoneBubble(
+                            message,
+                            artifactDownloadStates = artifactDownloads,
+                            onDownloadArtifact = onDownloadArtifact,
+                            onDownloadAllArtifacts = {
+                                artifacts ->
+                                viewModel.onDownloadAllArtifacts(
+                                    message.id,
+                                    artifacts
+                                )
+                            }
+                        )
+
+                    message.state == BotMessageState.GENERATING ->
+                        BotGeneratingBubble(message)
+
+                    message.state == BotMessageState.SYSTEM_NOTE ->
+                        BotSystemNoteBubble(message)
+
+                    else ->
+                        BotTextBubble(
+                            message,
+                            artifactDownloadStates = artifactDownloads,
+                            onDownloadArtifact = onDownloadArtifact,
+                            onDownloadAllArtifacts = {
+                                artifacts ->
+                                viewModel.onDownloadAllArtifacts(
+                                    message.id,
+                                    artifacts
+                                )
+                            }
+                        )
                 }
             }
         }
@@ -141,7 +175,9 @@ fun ChatScreen(
             onSend = viewModel::sendMessage,
             isBusy = isBusy,
             pendingAttachments = pendingAttachments,
-            onAttachClick = { attachmentPickerLauncher.launch(arrayOf("*/*")) },
+            onAttachClick = {
+                attachmentPickerLauncher.launch(arrayOf("*/*"))
+            },
             onRemoveAttachment = viewModel::onRemoveAttachment
         )
     }
