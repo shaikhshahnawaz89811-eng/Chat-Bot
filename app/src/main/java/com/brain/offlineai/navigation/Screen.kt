@@ -51,7 +51,13 @@ sealed class Screen(val route: String, val label: String) {
     }
 
     companion object {
-        val bottomNavItems = listOf(Chat, History, Models, Settings)
-        val drawerItems = listOf(Chat, ApiKeys, Models, LocalApi, Analytics, Settings, About)
+        // Lazy on purpose - see the fix note above the class. Building
+        // these eagerly referenced sibling `data object`s of this same
+        // sealed class, which crashes with a NullPointerException the
+        // instant Screen.Chat is touched before every sibling singleton
+        // has finished constructing (a classic JVM circular static-init
+        // ordering issue, not a logic bug in the routes themselves).
+        val bottomNavItems by lazy { listOf(Chat, History, Models, Settings) }
+        val drawerItems by lazy { listOf(Chat, ApiKeys, Models, LocalApi, Analytics, Settings, About) }
     }
 }
