@@ -5,6 +5,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.util.Log
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -281,6 +282,12 @@ class ChatViewModel(
         // already disables Send for this same reason, this is the real
         // ViewModel-side guard behind it.
         if (text.isEmpty() && readyAttachments.isEmpty()) return
+        // Set synchronously, before launching the coroutine below - if this
+        // were only set inside viewModelScope.launch { ... }, a second
+        // sendMessage() call arriving before that coroutine actually starts
+        // running would still see isBusy.value == false and slip past the
+        // guard above, sending the same message twice.
+        isBusy.value = true
         inputText.value = ""
         // Clear the pending row now - these attachments are about to become
         // real, sent [ChatMessage.attachments], not pending ones anymore.
@@ -307,10 +314,21 @@ class ChatViewModel(
         analyticsStore.incrementMessagesSent()
 
         viewModelScope.launch {
-            isBusy.value = true
             ChatTaskForegroundService.start(getApplication())
+            // Real bug fix: everything below this point used to run inside a
+            // try { ... } finally { ... } with NO catch. Any genuine throw
+            // before streamRealResponse() started (a Room write in
+            // ensureSession/persistMessage, InputNormalizer, ZipEditResolver,
+            // TaskSplitter, etc.) silently killed this coroutine - isBusy
+            // still got reset in finally, so a second send looked "normal",
+            // but the user got zero bot bubble and zero error, forever, on
+            // whichever send actually hit the throw. This catch makes that
+            // failure visible instead of silent, and still lets real
+            // cancellation (leaving the screen, process death) propagate.
+            var activeSessionIdForError: String? = null
             try {
                 val activeSessionId = ensureSession(text.ifEmpty { readyAttachments.first().fileName })
+                activeSessionIdForError = activeSessionId
                 persistMessage(activeSessionId, userMessage)
                 if (readyAttachments.isNotEmpty()) {
                     persistAttachments(activeSessionId, userMessage.id, readyAttachments)
@@ -454,6 +472,26 @@ class ChatViewModel(
                 } else {
                     streamRealResponse(activeSessionId, normalizedText + attachmentContextBlock + zipEditContext, zipEditTarget)
                 }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e // real cancellation (screen left, process reclaimed) must keep propagating, never swallowed
+            } catch (e: Exception) {
+                Log.e("ChatViewModel", "sendMessage failed before/while generating a response", e)
+                val errorText = "Something went wrong before I could reply: " +
+                    (e.message ?: e::class.java.simpleName) +
+                    ". Please try sending that again."
+                val sid = activeSessionIdForError
+                if (sid != null) {
+                    postSystemNote(sid, errorText)
+                } else {
+                    // ensureSession() itself is what threw - there is no
+                    // session to persist a note into yet, so show the error
+                    // directly in the on-screen list instead of losing it.
+                    val botId = nextId++
+                    upsertBotMessage(
+                        botId,
+                        ChatMessage(id = botId, text = errorText, isUser = false, timestamp = timeNow(), state = BotMessageState.SYSTEM_NOTE)
+                    )
+                }
             } finally {
                 isBusy.value = false
                 ChatTaskForegroundService.stop(getApplication())
@@ -570,6 +608,25 @@ class ChatViewModel(
                     // Real final count, written once per completed generation
                     // (not per streamed token) - Rule 20 minimal-necessary-payload.
                     analyticsStore.addTokensGenerated(tokenCount.toLong())
+                } else if (cause is kotlinx.coroutines.CancellationException) {
+                    // Real interruption - the user left the screen, the app
+                    // was backgrounded, or the process was reclaimed while a
+                    // real generation was still in flight. Before this fix
+                    // the tokens streamed so far were held only in
+                    // [messages] (in-memory Compose state) and were never
+                    // written to [historyRepository] - so anything short of
+                    // a full completion vanished with no trace, even though
+                    // real work had genuinely happened. NonCancellable is
+                    // required here because this coroutine's own Job is
+                    // already cancelled by the time onCompletion runs, so an
+                    // ordinary suspend DB write would be rejected immediately.
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                        val partialText = builder.toString()
+                        if (partialText.isNotBlank()) {
+                            val partialMessage = renderMessage(botId, partialText, BotMessageState.TEXT)
+                            persistMessage(activeSessionId, partialMessage)
+                        }
+                    }
                 }
             }
             .catch { e ->
