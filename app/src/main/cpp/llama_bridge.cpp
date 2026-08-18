@@ -144,6 +144,25 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
         return env->NewStringUTF("error: no model loaded");
     }
 
+    // Real bug fix: g_ctx (and its KV cache) is a single process-wide
+    // context that lives across every call to this function - nothing
+    // was ever clearing it between messages. Message 2's prompt was
+    // therefore being decoded on TOP of whatever was still sitting in
+    // the KV cache from message 1 (n_cur below always restarts local
+    // position accounting at 0 for the new prompt, but the cache itself
+    // still held message 1's real tokens), so the model was effectively
+    // still attending to the previous message's state - exactly the
+    // "second message's tokens/behaviour look like they belong to the
+    // first one" symptom. Clearing real KV memory here makes every
+    // nativeGenerate() call start from a genuinely clean, empty cache -
+    // this app never sends running conversation history in [prompt]
+    // anyway (Kotlin side only sends the current message's own text), so
+    // a full clear on every call is correct, not just a workaround.
+    llama_memory_t mem = llama_get_memory(g_ctx);
+    if (mem != nullptr) {
+        llama_memory_clear(mem, true);
+    }
+
     const char *promptChars = env->GetStringUTFChars(prompt, nullptr);
     std::string promptStr(promptChars);
     env->ReleaseStringUTFChars(prompt, promptChars);
