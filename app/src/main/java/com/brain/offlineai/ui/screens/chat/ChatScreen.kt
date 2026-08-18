@@ -32,7 +32,24 @@ fun ChatScreen(
     openSessionId: String? = null,
     viewModel: ChatViewModel = run {
         val context = LocalContext.current
-        val restoredSessionId = openSessionId ?: CurrentChatSessionStore.get(context)
+        // Bug fix: this used to re-read CurrentChatSessionStore on every
+        // recomposition. ChatViewModel.ensureSession() writes a brand-new
+        // session id into that same store the instant the FIRST message of
+        // a fresh chat is sent - while generation is still streaming. That
+        // write used to change `restoredSessionId` on the next
+        // recomposition, which changed the `key` passed to viewModel(...)
+        // below, which made Compose throw away the in-flight ChatViewModel
+        // and create a brand-new one (openSessionId now non-null) that
+        // never actually sent anything - explaining both the silent first
+        // message and the frozen "Thinking" card on the second one (both
+        // instances then race the single shared BrainEngine native
+        // context). `remember(openSessionId)` captures the restored id
+        // exactly once per real navigation into this screen, so a later
+        // CurrentChatSessionStore.set() from inside an already-running
+        // ChatViewModel can never re-key this composable mid-generation.
+        val restoredSessionId = remember(openSessionId) {
+            openSessionId ?: CurrentChatSessionStore.get(context)
+        }
         val application = context.applicationContext as android.app.Application
         viewModel(
             key = restoredSessionId ?: "current",
