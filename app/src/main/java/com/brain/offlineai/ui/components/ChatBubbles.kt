@@ -4,7 +4,9 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
@@ -139,7 +141,7 @@ fun BotThinkingBubble(message: ChatMessage) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             PulsingDot()
             Spacer(Modifier.width(8.dp))
-            Text("Brain is thinking...", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+            Text("Chat Bot is thinking...", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
         }
         Spacer(Modifier.height(10.dp))
         message.thinkingSteps.forEach { step -> ThinkingStepRow(step) }
@@ -181,6 +183,8 @@ fun BotCodingBubble(message: ChatMessage) {
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(10.dp))
                 .background(BrainBgPrimary)
+                .heightIn(max = 280.dp)
+                .verticalScroll(rememberScrollState())
                 .padding(12.dp)
         ) {
             Column {
