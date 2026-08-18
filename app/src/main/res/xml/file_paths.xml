@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Phase 11: only the real "artifacts" subfolder under app-private files
+     storage is exposed - matches ArtifactFileManager.artifactsDir
+     (File(context.filesDir, "artifacts")) exactly, nothing broader. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <files-path name="artifacts" path="artifacts/" />
+</paths>
