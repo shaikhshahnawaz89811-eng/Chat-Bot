@@ -189,7 +189,13 @@ class ChatViewModel(
             }
     }
 
-    /** Real streamed text is rendered as a code block whenever it actually contains a fenced code block. */
+    /** Real streamed text is rendered as a code block whenever it actually
+     *  contains a fenced code block. CODING is only used while generation is
+     *  still live (state == GENERATING) - once generation has finished, the
+     *  same fenced text renders as CODE_DONE instead, so the message can
+     *  actually report "done" rather than staying on the live/pulsing
+     *  "Coding..." label forever (Rule 17: endpoint existing isn't enough,
+     *  it has to be correct - "finished" has to actually look finished). */
     private fun renderMessage(id: Long, text: String, state: BotMessageState, tokenCount: Int = 0): ChatMessage {
         val hasFence = text.contains("```")
         return if (hasFence) {
@@ -199,9 +205,10 @@ class ChatViewModel(
                 afterFence.substringAfter('\n', "")
             } else afterFence
             val codeBody = body.substringBefore("```").lines()
+            val codeState = if (state == BotMessageState.GENERATING) BotMessageState.CODING else BotMessageState.CODE_DONE
             ChatMessage(
                 id = id, text = text, isUser = false, timestamp = timeNow(),
-                state = BotMessageState.CODING, codeLines = codeBody,
+                state = codeState, codeLines = codeBody,
                 generationProgress = tokenCount
             )
         } else {

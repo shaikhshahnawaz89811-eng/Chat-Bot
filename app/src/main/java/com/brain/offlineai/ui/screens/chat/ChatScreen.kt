@@ -57,6 +57,7 @@ fun ChatScreen(
                     message.isUser -> UserBubble(message)
                     message.state == BotMessageState.THINKING -> BotThinkingBubble(message)
                     message.state == BotMessageState.CODING -> BotCodingBubble(message)
+                    message.state == BotMessageState.CODE_DONE -> BotCodeDoneBubble(message)
                     message.state == BotMessageState.GENERATING -> BotGeneratingBubble(message)
                     message.state == BotMessageState.SYSTEM_NOTE -> BotSystemNoteBubble(message)
                     else -> BotTextBubble(message)

@@ -128,6 +128,54 @@ fun BotCodingBubble(message: ChatMessage) {
 }
 
 /**
+ * Completed counterpart of [BotCodingBubble] (Rule 8 Part A / Rule 15 -
+ * CODING's missing "done" counterpart, as its own small focused
+ * composable rather than more branches crammed into BotCodingBubble).
+ * Static checkmark instead of the live pulsing dot, and an explicit
+ * "Done." text line + timestamp - the real "ho gaya" signal in text that
+ * was missing before, matching what BotTextBubble already shows for a
+ * plain finished reply.
+ */
+@Composable
+fun BotCodeDoneBubble(message: ChatMessage) {
+    BotCardShell {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                imageVector = Icons.Filled.CheckCircle,
+                contentDescription = null,
+                tint = BrainSuccessGreen,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text("Code ready", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+        }
+        Spacer(Modifier.height(8.dp))
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(BrainBgPrimary)
+                .padding(12.dp)
+        ) {
+            Column {
+                message.codeLines.forEach { line ->
+                    Text(
+                        text = line,
+                        color = BrainCyanAccent,
+                        fontFamily = FontFamily.Monospace,
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Text("Done.", color = BrainSuccessGreen, style = MaterialTheme.typography.bodySmall)
+        Spacer(Modifier.height(2.dp))
+        Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+/**
  * Phase 2: shows the real text streaming in from llama.cpp token-by-token,
  * plus a live token counter. There's no fake percent-complete bar anymore -
  * a real generation can legitimately stop anywhere between 1 token and the
