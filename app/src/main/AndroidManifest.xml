@@ -62,6 +62,14 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Chat Bot fix bundle: keeps app at foreground priority while a
+             user-started generation is running (see tasks/ChatTaskForegroundService.kt).
+             Uses the same dataSync type + permissions already declared above. -->
+        <service
+            android:name=".tasks.ChatTaskForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Phase 11: real FileProvider so Share / Open in File Manager can
              hand a genuine content:// Uri to another app for an artifact
              file that actually lives in this app's private storage - never

@@ -59,6 +59,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import com.brain.offlineai.tasks.ChatTaskForegroundService
 
 /**
  * Drives the Chat screen state - Phase 2 rewrite, Phase 5 wiring added,
@@ -307,6 +308,7 @@ class ChatViewModel(
 
         viewModelScope.launch {
             isBusy.value = true
+            ChatTaskForegroundService.start(getApplication())
             try {
                 val activeSessionId = ensureSession(text.ifEmpty { readyAttachments.first().fileName })
                 persistMessage(activeSessionId, userMessage)
@@ -454,6 +456,7 @@ class ChatViewModel(
                 }
             } finally {
                 isBusy.value = false
+                ChatTaskForegroundService.stop(getApplication())
             }
         }
     }
@@ -464,6 +467,7 @@ class ChatViewModel(
         if (existing != null) return existing
         val created = historyRepository.createSession(firstMessageText)
         sessionId = created
+        CurrentChatSessionStore.set(getApplication(), created)
         return created
     }
 

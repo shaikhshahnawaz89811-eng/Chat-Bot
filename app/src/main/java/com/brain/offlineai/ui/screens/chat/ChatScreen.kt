@@ -1,7 +1,9 @@
 package com.brain.offlineai.ui.screens.chat
 
 import android.Manifest
+import android.content.ContentValues
 import android.os.Build
+import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -9,8 +11,10 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -21,21 +25,18 @@ import com.brain.offlineai.ui.components.*
 import com.brain.offlineai.ui.theme.BrainBgPrimary
 import kotlinx.coroutines.launch
 
-/**
- * UI-only redesign of the existing ChatScreen.
- *
- * Existing ViewModel, engine, attachment picker, artifact download flow and
- * message-state routing are intentionally preserved.
- */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun ChatScreen(
     onMenuClick: () -> Unit,
     openSessionId: String? = null,
     viewModel: ChatViewModel = run {
-        val context = LocalContext.current.applicationContext as android.app.Application
+        val context = LocalContext.current
+        val restoredSessionId = openSessionId ?: CurrentChatSessionStore.get(context)
+        val application = context.applicationContext as android.app.Application
         viewModel(
-            key = openSessionId ?: "current",
-            factory = ChatViewModel.Factory(context, openSessionId)
+            key = restoredSessionId ?: "current",
+            factory = ChatViewModel.Factory(application, restoredSessionId)
         )
     }
 ) {
@@ -49,6 +50,9 @@ fun ChatScreen(
     val context = LocalContext.current
 
     var pendingLegacyDownload by remember { mutableStateOf<ArtifactInfo?>(null) }
+    var showAttachmentMenu by remember { mutableStateOf(false) }
+    var cameraUri by remember { mutableStateOf<android.net.Uri?>(null) }
+
     val storagePermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -72,14 +76,55 @@ fun ChatScreen(
         }
     }
 
-    // Existing real Android file picker. No new/fake upload source is added.
     val attachmentPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
+        showAttachmentMenu = false
         uris.forEach { uri ->
             val name = UriMetadataResolver.resolveDisplayName(context, uri)
             val mimeType = UriMetadataResolver.resolveMimeType(context, uri)
             viewModel.onAttachmentPicked(uri, name, mimeType)
+        }
+    }
+
+    val photoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        showAttachmentMenu = false
+        if (uri != null) {
+            val name = UriMetadataResolver.resolveDisplayName(context, uri)
+            val mimeType = UriMetadataResolver.resolveMimeType(context, uri)
+            viewModel.onAttachmentPicked(uri, name, mimeType)
+        }
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.TakePicture()
+    ) { success ->
+        showAttachmentMenu = false
+        val uri = cameraUri
+        if (success && uri != null) {
+            val name = UriMetadataResolver.resolveDisplayName(context, uri).ifBlank { "photo.jpg" }
+            val mimeType = UriMetadataResolver.resolveMimeType(context, uri) ?: "image/jpeg"
+            viewModel.onAttachmentPicked(uri, name, mimeType)
+        } else if (uri != null) {
+            runCatching { context.contentResolver.delete(uri, null, null) }
+        }
+        cameraUri = null
+    }
+
+    fun launchCamera() {
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, "ChatBot_${System.currentTimeMillis()}.jpg")
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        }
+        val uri = context.contentResolver.insert(
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            values
+        )
+        if (uri != null) {
+            cameraUri = uri
+            cameraLauncher.launch(uri)
         }
     }
 
@@ -96,7 +141,6 @@ fun ChatScreen(
             .fillMaxSize()
             .background(BrainBgPrimary)
     ) {
-        // Same existing top bar; only the title is changed to Chat Bot.
         ChatTopBar(
             title = "Chat Bot",
             onMenuClick = onMenuClick
@@ -137,12 +181,8 @@ fun ChatScreen(
                             message,
                             artifactDownloadStates = artifactDownloads,
                             onDownloadArtifact = onDownloadArtifact,
-                            onDownloadAllArtifacts = {
-                                artifacts ->
-                                viewModel.onDownloadAllArtifacts(
-                                    message.id,
-                                    artifacts
-                                )
+                            onDownloadAllArtifacts = { artifacts ->
+                                viewModel.onDownloadAllArtifacts(message.id, artifacts)
                             }
                         )
 
@@ -157,14 +197,57 @@ fun ChatScreen(
                             message,
                             artifactDownloadStates = artifactDownloads,
                             onDownloadArtifact = onDownloadArtifact,
-                            onDownloadAllArtifacts = {
-                                artifacts ->
-                                viewModel.onDownloadAllArtifacts(
-                                    message.id,
-                                    artifacts
-                                )
+                            onDownloadAllArtifacts = { artifacts ->
+                                viewModel.onDownloadAllArtifacts(message.id, artifacts)
                             }
                         )
+                }
+            }
+        }
+
+        if (showAttachmentMenu) {
+            ModalBottomSheet(
+                onDismissRequest = { showAttachmentMenu = false },
+                containerColor = com.brain.offlineai.ui.theme.BrainBgCard
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp, vertical = 8.dp)
+                ) {
+                    Text(
+                        text = "Add to Chat Bot",
+                        color = com.brain.offlineai.ui.theme.BrainTextPrimary,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Spacer(Modifier.height(8.dp))
+
+                    TextButton(
+                        onClick = {
+                            attachmentPickerLauncher.launch(arrayOf("*/*"))
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("📄  File")
+                    }
+
+                    TextButton(
+                        onClick = {
+                            photoPickerLauncher.launch("image/*")
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("🖼  Photo")
+                    }
+
+                    TextButton(
+                        onClick = { launchCamera() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("📷  Camera")
+                    }
+
+                    Spacer(Modifier.height(16.dp))
                 }
             }
         }
@@ -176,7 +259,7 @@ fun ChatScreen(
             isBusy = isBusy,
             pendingAttachments = pendingAttachments,
             onAttachClick = {
-                attachmentPickerLauncher.launch(arrayOf("*/*"))
+                showAttachmentMenu = true
             },
             onRemoveAttachment = viewModel::onRemoveAttachment
         )
