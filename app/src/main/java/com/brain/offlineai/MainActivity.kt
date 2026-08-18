@@ -101,7 +101,7 @@ fun BrainApp() {
             NavHost(
                 navController = navController,
                 startDestination = Screen.Chat.route,
-                modifier = Modifier.padding(bottom = innerPadding.calculateBottomPadding())
+                modifier = Modifier.padding(innerPadding)
             ) {
                 composable(Screen.Chat.route) {
                     ChatScreen(onMenuClick = { scope.launch { drawerState.open() } })

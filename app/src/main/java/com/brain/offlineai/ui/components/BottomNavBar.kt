@@ -37,6 +37,7 @@ fun BrainBottomNavBar(currentRoute: String, onNavigate: (Screen) -> Unit) {
         modifier = Modifier
             .fillMaxWidth()
             .background(BrainBgCard)
+            .navigationBarsPadding()
             .padding(vertical = 8.dp),
         horizontalArrangement = Arrangement.SpaceEvenly
     ) {

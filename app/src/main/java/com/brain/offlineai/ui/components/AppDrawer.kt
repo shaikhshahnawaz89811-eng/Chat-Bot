@@ -62,6 +62,14 @@ fun AppDrawerContent(
 
 @Composable
 private fun DrawerHeader() {
+    val engineState by BrainEngine.state.collectAsState()
+    val runsLine = when (val state = engineState) {
+        is EngineState.Loaded -> "Runs ${state.modelName} (GGUF, user-imported)"
+        is EngineState.Loading -> "Loading ${state.modelName}..."
+        is EngineState.Error -> "No model loaded - import + load a .gguf in Models"
+        is EngineState.Unloaded -> "No model loaded - import + load a .gguf in Models"
+    }
+
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -84,7 +92,7 @@ private fun DrawerHeader() {
     Spacer(Modifier.height(12.dp))
     Column(modifier = Modifier.padding(horizontal = 20.dp)) {
         Text("100% Offline • No Internet", color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
-        Text("Runs Qwen2.5-1.5B-Instruct (GGUF, user-imported)", color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
+        Text(runsLine, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
             Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(BrainSuccessGreen))
             Spacer(Modifier.width(6.dp))
