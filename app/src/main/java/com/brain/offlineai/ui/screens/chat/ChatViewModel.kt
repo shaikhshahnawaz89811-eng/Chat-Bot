@@ -1054,7 +1054,31 @@ class ChatViewModel(
                         ProjectTypeGate.isCreationRequest(processingText) &&
                         runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
                     if (!triedMultiFile) {
-                        streamRealResponse(activeSessionId, processingText + extraContextBlock + zipEditContext, zipEditTarget)
+                        // Bug fix (user report - planning times out on a
+                        // web-search-heavy request, falls back here, and
+                        // the fallback *also* looks stuck at "Starting...
+                        // 0 tokens" for a long stretch). Root cause: this
+                        // was the one real call site in the whole message
+                        // pipeline that still sent [extraContextBlock]
+                        // completely uncapped - [runMultiFileBuild]'s own
+                        // planning and per-file prompts already cap it
+                        // (see [PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP] /
+                        // [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s own docs),
+                        // but a fallback single response - very often the
+                        // exact case right after a planning timeout, i.e.
+                        // already the slow path - was still handed the
+                        // full, real web-search text (up to ~4-5k real
+                        // characters from [WebSearchContextBuilder]) on
+                        // top of everything else. Same bounded-snippet
+                        // treatment as the other two prompts now, so the
+                        // fallback's own on-device prefill genuinely has a
+                        // real chance to finish inside [GENERATION_CHUNK_TIMEOUT_MS]
+                        // instead of needing a second, even-longer timeout
+                        // to give up on.
+                        val trimmedStreamExtraContext = if (extraContextBlock.length > STREAM_EXTRA_CONTEXT_CHAR_CAP) {
+                            extraContextBlock.take(STREAM_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this reply)"
+                        } else extraContextBlock
+                        streamRealResponse(activeSessionId, processingText + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -2353,6 +2377,20 @@ class ChatViewModel(
          * whole thing.
          */
         private const val PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 1500
+
+        /**
+         * Bug fix (user request - fallback single-response reply after a
+         * planning timeout still looked stuck, because it was the one
+         * real call site never given this same cap - see where this is
+         * used above for the full explanation). Kept generous (bigger
+         * than [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 600 and
+         * [PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 1500) since a
+         * fallback reply is the ONE real call for this whole turn - no
+         * per-file repetition to worry about - but still a real, bounded
+         * ceiling rather than the raw, uncapped web-search/attachment
+         * text.
+         */
+        private const val STREAM_EXTRA_CONTEXT_CHAR_CAP = 2500
 
         /**
          * Bug fix (user request - "net search karta hai fir working card
