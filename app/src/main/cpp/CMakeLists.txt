@@ -23,7 +23,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # new "b<number>" tags constantly. If the CI build fails on this line,
 # bump LLAMA_CPP_TAG below to the latest tag and push again.
 # ---------------------------------------------------------------------------
-set(LLAMA_CPP_TAG "b10453" CACHE STRING "Pinned llama.cpp release tag")
+set(LLAMA_CPP_TAG "b10488" CACHE STRING "Pinned llama.cpp release tag")
 
 include(FetchContent)
 FetchContent_Declare(
