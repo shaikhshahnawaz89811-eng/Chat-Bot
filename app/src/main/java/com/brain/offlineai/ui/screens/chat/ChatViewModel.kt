@@ -2328,8 +2328,18 @@ class ChatViewModel(
          * honestly cancelled and the caller falls back to the existing
          * single-response flow instead of sitting stuck with a Stop button
          * that cannot reach a still-prefilling native call.
+         *
+         * Raised from the original 45s (user report - planning kept
+         * timing out on genuinely ordinary requests, "planner kharab
+         * hai"). Now that prefill itself is real chunked/cancellable
+         * (see llama_bridge.cpp's own doc), a longer ceiling here no
+         * longer risks a stuck app the way it used to when a slow
+         * prefill kept running unstoppable in the background - it just
+         * gives the on-device model genuinely enough time to finish a
+         * normal planning pass before honestly giving up. Matches
+         * [GENERATION_CHUNK_TIMEOUT_MS]'s own ceiling.
          */
-        private const val PLANNING_GENERATION_TIMEOUT_MS = 45_000L
+        private const val PLANNING_GENERATION_TIMEOUT_MS = 90_000L
 
         /**
          * Bug fix (user request) - same real reasoning as

@@ -194,7 +194,23 @@ fun ChatScreen(
                 // so the card grows below the screen. A large offset is
                 // clamped by LazyListState to the real item end and pins the
                 // actual bottom without inventing a fixed card height.
-                listState.animateScrollToItem(messages.size - 1, Int.MAX_VALUE)
+                //
+                // Real bug fix (user report - UI "aage piche" glitch/jitter
+                // while a reply streams). This LaunchedEffect keys on
+                // [lastMessage] itself, so it re-fires on every single
+                // token/process-step update while streaming - that's the
+                // whole point (see this block's own doc above), but
+                // [animateScrollToItem] is a real, genuine animation: every
+                // one of those re-fires cancelled whatever animation was
+                // still mid-flight from the previous token and started a
+                // brand new one, dozens of times a second. Visually that's
+                // exactly a back-and-forth jitter, not smooth tracking.
+                // [scrollToItem] jumps straight to position with no
+                // animation to interrupt, so rapid re-fires just keep
+                // resetting the same fixed point instead of colliding with
+                // each other - still pins the bottom on every update, just
+                // without the stutter.
+                listState.scrollToItem(messages.size - 1, Int.MAX_VALUE)
             }
         }
     }

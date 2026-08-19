@@ -145,6 +145,15 @@ object BrainEngine {
             val callback = BrainNative.TokenCallback { token ->
                 if (cancelled.get()) {
                     false
+                } else if (token.isEmpty()) {
+                    // Real prefill heartbeat (see llama_bridge.cpp's own
+                    // doc on the chunked-prefill fix) - native calls this
+                    // between prompt chunks purely so a real Kotlin-side
+                    // cancel/timeout can interrupt prefill itself, not
+                    // only the token-by-token decode loop after it. Never
+                    // a real generated token: not sent into the flow, and
+                    // never counted toward the reply.
+                    true
                 } else {
                     trySend(token).isSuccess && !cancelled.get()
                 }

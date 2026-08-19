@@ -16,6 +16,7 @@
 #include <vector>
 #include <mutex>
 #include <cstring>
+#include <algorithm>
 
 #include "llama.h"
 
@@ -220,13 +221,54 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.7f));
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
-    // --- Feed the prompt through decode ---
-    llama_batch batch = llama_batch_get_one(prompt_tokens.data(), static_cast<int32_t>(prompt_tokens.size()));
+    // --- Feed the prompt through decode, in chunks ---
+    // Real bug fix (user report - after a Kotlin-side timeout gives up
+    // waiting on a slow reply, the NEXT message/reply gets stuck at
+    // "Starting..." with 0 tokens forever, seemingly looping). Root
+    // cause: this whole function holds g_engine_mutex for its entire
+    // duration, and this used to be ONE single llama_decode() call for
+    // the whole prompt - completely uninterruptible. A withTimeoutOrNull
+    // on the Kotlin side only stops *waiting* on this call; it can never
+    // actually stop the call itself while it's inside this one
+    // monolithic decode, so a slow prefill (long prompt on a small
+    // on-device model) kept running in the background, still holding
+    // g_engine_mutex, long after Kotlin had already given up on it -
+    // and every subsequent generate() call (the timeout's own fallback
+    // reply, or simply the next message) then blocked trying to acquire
+    // the same mutex, looking exactly like a silent infinite hang.
+    // Feeding the prompt in bounded chunks and checking the real,
+    // already-existing Kotlin-side cancel signal (the same TokenCallback
+    // used for real generated tokens - an empty piece here is just a
+    // heartbeat, never counted as a real token) between chunks means a
+    // timeout/Stop can now actually interrupt prefill itself, not only
+    // the decode-one-token-at-a-time loop below.
     std::string stopReason = "max_tokens";
+    const int kPrefillChunkTokens = 256;
+    const int n_prompt = static_cast<int>(prompt_tokens.size());
+    int n_fed = 0;
+    bool prefillCancelled = false;
+    while (n_fed < n_prompt) {
+        int chunkLen = std::min(kPrefillChunkTokens, n_prompt - n_fed);
+        llama_batch chunkBatch = llama_batch_get_one(prompt_tokens.data() + n_fed, chunkLen);
+        if (llama_decode(g_ctx, chunkBatch) != 0) {
+            llama_sampler_free(sampler);
+            return env->NewStringUTF("error: llama_decode failed on prompt");
+        }
+        n_fed += chunkLen;
 
-    if (llama_decode(g_ctx, batch) != 0) {
+        if (n_fed < n_prompt) {
+            jstring heartbeat = env->NewStringUTF("");
+            jboolean keepGoing = env->CallBooleanMethod(callback, onTokenMethod, heartbeat);
+            env->DeleteLocalRef(heartbeat);
+            if (!keepGoing) {
+                prefillCancelled = true;
+                break;
+            }
+        }
+    }
+    if (prefillCancelled) {
         llama_sampler_free(sampler);
-        return env->NewStringUTF("error: llama_decode failed on prompt");
+        return env->NewStringUTF("cancelled");
     }
 
     int n_generated = 0;
