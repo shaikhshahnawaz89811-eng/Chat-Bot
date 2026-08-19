@@ -37,7 +37,7 @@ object ProjectTypeGate {
         "node", "react", "vue", "angular", "html", "css", "flutter", "dart",
         "swift", "ios", "c++", "c#", "csharp", "rust", "golang", " go ",
         "php", "ruby", "django", "flask", "spring", ".net", "unity",
-        "jetpack compose", "compose"
+        "jetpack compose", "compose", "web"
     )
 
     /** Phase 25 - real, public aliases of this file's own existing keyword lists above, reused (not duplicated) by [WebSearchTrigger.buildTargetSearchQuery] and by [isCreationRequest] below - same "don't duplicate an existing abstraction before reusing it" reasoning [ContextManager]'s own doc already gives. */

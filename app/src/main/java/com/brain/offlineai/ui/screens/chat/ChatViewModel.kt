@@ -244,6 +244,9 @@ class ChatViewModel(
      */
     private var generationJob: Job? = null
 
+    /** Distinguishes an explicit Stop tap from lifecycle/process cancellation. */
+    private var userStopRequested = false
+
     init {
         // Phase 23 - real, idempotent (safe if another ViewModel instance
         // already started it) registration of the real device thermal
@@ -485,6 +488,7 @@ class ChatViewModel(
         // running would still see isBusy.value == false and slip past the
         // guard above, sending the same message twice.
         isBusy.value = true
+        userStopRequested = false
         inputText.value = ""
         // Clear the pending row now - these attachments are about to become
         // real, sent [ChatMessage.attachments], not pending ones anymore.
@@ -629,15 +633,17 @@ class ChatViewModel(
                 // for this session takes priority over evaluating this new
                 // message as a fresh request.
                 val hasZipThisTurn = readyAttachments.any { it.kind == AttachmentKind.ZIP }
+                // Preserve the original request when this message is the
+                // platform/language answer. It must continue through the
+                // normal search, planning, and generation pipeline.
+                var processingText = normalizedText
                 if (!hasZipThisTurn) {
                     val pendingProjectType = projectTypePauseRepository.getAwaiting(activeSessionId)
                     if (pendingProjectType != null) {
                         if (ProjectTypeGate.answerNamesPlatform(normalizedText)) {
                             projectTypePauseRepository.markResumed(pendingProjectType.id)
-                            val combined = "${pendingProjectType.originalRequest}\n\nPlatform/language: $normalizedText"
+                            processingText = "${pendingProjectType.originalRequest}\n\nPlatform/language: $normalizedText"
                             postSystemNote(activeSessionId, "Resuming with platform/language: $normalizedText")
-                            streamRealResponse(activeSessionId, combined)
-                            return@launch
                         } else {
                             // Same "a genuinely different message means the
                             // user moved on" reasoning AgentTaskStatus.ABANDONED
@@ -721,9 +727,9 @@ class ChatViewModel(
                 // or any message when no key is configured, does zero
                 // extra work and stays fully offline, silently.
                 val hasZipAttachment = readyAttachments.any { it.kind == AttachmentKind.ZIP }
-                val searchQuery = WebSearchTrigger.newProjectSearchQuery(normalizedText)
-                    ?: WebSearchTrigger.existingProjectSearchQuery(normalizedText, hasZipAttachment)
-                    ?: WebSearchTrigger.buildTargetSearchQuery(normalizedText)
+                val searchQuery = WebSearchTrigger.newProjectSearchQuery(processingText)
+                    ?: WebSearchTrigger.existingProjectSearchQuery(processingText, hasZipAttachment)
+                    ?: WebSearchTrigger.buildTargetSearchQuery(processingText)
                 val webSearchContextBlock = if (searchQuery != null) {
                     runWebSearch(activeSessionId, searchQuery)
                 } else {
@@ -764,7 +770,7 @@ class ChatViewModel(
                         // never loop forever asking the same question;
                         // fall back to the safe default (explain, not a
                         // silent rewrite - Rule 10, no ungrounded action).
-                        val isDiagnoseOnly = !editIntentWords.any { normalizedText.lowercase().contains(it) }
+                        val isDiagnoseOnly = !editIntentWords.any { processingText.lowercase().contains(it) }
                         postSystemNote(
                             activeSessionId,
                             "Resuming: " + (if (isDiagnoseOnly) "reviewing" else "editing target resolved") +
@@ -796,7 +802,7 @@ class ChatViewModel(
                     }
                 } else if (pendingClarification != null) {
                     val resumeEntries = toolGateway.listZipEntries(pendingClarification.resumeStoredPath)
-                    val resumeMatch = ZipEditResolver.resolveEditTarget(resumeEntries, normalizedText)
+                    val resumeMatch = ZipEditResolver.resolveEditTarget(resumeEntries, processingText)
                     if (resumeMatch != null) {
                         val entryContent = toolGateway.readZipEntry(pendingClarification.resumeStoredPath, resumeMatch.name)
                         if (entryContent != null) {
@@ -804,7 +810,7 @@ class ChatViewModel(
                             // check as the fresh-target path above, so
                             // resuming a clarification never force-patches
                             // a file the user only asked to be reviewed.
-                            val isDiagnoseOnly = isDiagnoseOnlyIntent(normalizedText)
+                            val isDiagnoseOnly = isDiagnoseOnlyIntent(processingText)
                             // Real resume - the user's own next message
                             // genuinely answered the question, so this
                             // task is done, not abandoned/guessed.
@@ -901,8 +907,8 @@ class ChatViewModel(
                     // [ZipEditResolver.resolveEditTargetByDeclaration]'s own
                     // doc) only when the filename match itself found
                     // nothing - never overrides a real filename hit.
-                    val match = ZipEditResolver.resolveEditTarget(entries, normalizedText)
-                        ?: ZipEditResolver.resolveEditTargetByDeclaration(entries, zipInfo.storedPath, normalizedText)
+                    val match = ZipEditResolver.resolveEditTarget(entries, processingText)
+                        ?: ZipEditResolver.resolveEditTargetByDeclaration(entries, zipInfo.storedPath, processingText)
                     if (match != null) {
                         val entryContent = toolGateway.readZipEntry(zipInfo.storedPath, match.name)
                         if (entryContent != null) {
@@ -919,7 +925,7 @@ class ChatViewModel(
                             // [attachArtifactsOrPatchZip] can only ever
                             // patch the real ZIP on a request that
                             // genuinely asked for a change.
-                            if (isIntentUnclear(normalizedText)) {
+                            if (isIntentUnclear(processingText)) {
                                 // Weakness-review fix - stop and ask
                                 // instead of silently defaulting to a
                                 // full-file rewrite when the message named
@@ -940,7 +946,7 @@ class ChatViewModel(
                                 postSystemNote(activeSessionId, question)
                                 return@launch
                             }
-                            val isDiagnoseOnly = isDiagnoseOnlyIntent(normalizedText)
+                            val isDiagnoseOnly = isDiagnoseOnlyIntent(processingText)
                             postSystemNote(
                                 activeSessionId,
                                 (if (isDiagnoseOnly) "Reviewing" else "Editing target resolved") +
@@ -971,7 +977,7 @@ class ChatViewModel(
                         // generic reply about the whole archive. See
                         // [AgentClarificationGate] for the exact,
                         // conservative real check (no model guess).
-                        val clarification = AgentClarificationGate.evaluateZipEditAmbiguity(entries, normalizedText, zipInfo.fileName)
+                        val clarification = AgentClarificationGate.evaluateZipEditAmbiguity(entries, processingText, zipInfo.fileName)
                         if (clarification != null) {
                             agentTaskRepository.saveAwaitingClarification(
                                 id = UUID.randomUUID().toString(),
@@ -1002,7 +1008,7 @@ class ChatViewModel(
                 // user typed, only the real prompt sent onward is cleaned
                 // (and, per Phase 14 above, may now also carry the real
                 // attachment context block appended after it).
-                val taskTexts = TaskSplitter.split(normalizedText)
+                val taskTexts = TaskSplitter.split(processingText)
                 // Phase 22 - the real web-search context (empty string
                 // when [searchQuery] was null or the real search didn't
                 // succeed) rides along with the attachment context block
@@ -1044,14 +1050,23 @@ class ChatViewModel(
                     // same safe-default posture every other real gate in
                     // this app already holds itself to.
                     val triedMultiFile = zipAttachments.isEmpty() && zipEditTarget == null &&
-                        ProjectTypeGate.isCreationRequest(normalizedText) &&
-                        runMultiFileBuild(activeSessionId, normalizedText, extraContextBlock)
+                        ProjectTypeGate.isCreationRequest(processingText) &&
+                        runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
                     if (!triedMultiFile) {
-                        streamRealResponse(activeSessionId, normalizedText + extraContextBlock + zipEditContext, zipEditTarget)
+                        streamRealResponse(activeSessionId, processingText + extraContextBlock + zipEditContext, zipEditTarget)
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e // real cancellation (screen left, process reclaimed) must keep propagating, never swallowed
+                // A cancelled generation must not leave the live PROCESS/
+                // GENERATING bubble as if work were still running. The
+                // cancellation is still rethrown so coroutine structured
+                // concurrency remains correct, but the real partial output
+                // (if any) is settled into a normal text/code card first.
+                val wasUserStop = userStopRequested
+                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                    settleTransientBotMessageAfterCancellation(wasUserStop)
+                }
+                throw e // lifecycle/process cancellation must keep propagating
             } catch (e: Exception) {
                 Log.e("ChatViewModel", "sendMessage failed before/while generating a response", e)
                 val errorText = "Something went wrong before I could reply: " +
@@ -1092,7 +1107,49 @@ class ChatViewModel(
      * interrupted one always was.
      */
     fun stopGeneration() {
+        if (!isBusy.value) return
+        userStopRequested = true
         generationJob?.cancel()
+    }
+
+    /**
+     * Removes only the last active transient bot card. Completed process cards
+     * from earlier turns remain in chat history; the card that was actually
+     * interrupted is settled so it cannot keep animating after Stop.
+     */
+    private suspend fun settleTransientBotMessageAfterCancellation(userStopped: Boolean) {
+        val lastBot = messages.value.lastOrNull { !it.isUser } ?: return
+        if (lastBot.state !in setOf(
+                BotMessageState.PROCESS,
+                BotMessageState.GENERATING,
+                BotMessageState.CODING
+            )
+        ) return
+
+        if (lastBot.text.isNotBlank()) {
+            val split = splitIntroAndCode(lastBot.text)
+            if (split.codeLines != null) {
+                val settled = lastBot.copy(
+                    state = BotMessageState.CODE_DONE,
+                    codeLines = split.codeLines,
+                    text = lastBot.text
+                )
+                upsertBotMessage(lastBot.id, settled)
+                sessionId?.let { persistMessage(it, settled) }
+            } else {
+                val settled = lastBot.copy(state = BotMessageState.TEXT)
+                upsertBotMessage(lastBot.id, settled)
+                sessionId?.let { persistMessage(it, settled) }
+            }
+        } else {
+            removeBotMessage(lastBot.id)
+        }
+
+        if (userStopped) {
+            sessionId?.let {
+                postSystemNote(it, "Generation stopped. The partial reply above was kept.")
+            }
+        }
     }
 
     /** Real session creation on first send only - see class doc above for why this stays lazy. */
@@ -1614,6 +1671,21 @@ class ChatViewModel(
             if (index < 0) return
             val existing = steps[index]
             steps[index] = existing.copy(status = if (failed) ProcessStepStatus.FAILED else ProcessStepStatus.COMPLETE, label = label ?: existing.label)
+            // Mutating the local list is not enough: Compose only sees the
+            // new process state when a new ChatMessage is emitted. Without
+            // this immediate upsert, the card could visibly remain RUNNING
+            // until a later step happened to be appended.
+            upsertBotMessage(
+                planBotId,
+                ChatMessage(
+                    id = planBotId,
+                    text = "",
+                    isUser = false,
+                    timestamp = timeNow(),
+                    state = BotMessageState.PROCESS,
+                    processSteps = steps.toList()
+                )
+            )
         }
 
         // Real single generation call, budgeted the same way
@@ -1695,7 +1767,10 @@ class ChatViewModel(
             return if (names.isEmpty()) "" else "$fileName defines: ${names.joinToString(", ")}"
         }
 
-        val planningStepId = pushRunning(ProcessMarking.PLANNING)
+        val planningStepId = pushRunning(
+            ProcessMarking.PLANNING,
+            "Planning project files with the local model"
+        )
         val planningPrompt = PlanningEngine.buildPlanningPrompt(originalRequest, extraContextBlock)
         val (planningRaw, _) = try {
             generateOnce(planningPrompt)
@@ -3072,15 +3147,33 @@ class ChatViewModel(
             }
             is WebSearchOutcome.Success -> {
                 val botId = nextId++
-                val step = ProcessStep(
-                    id = 1L,
-                    marking = ProcessMarking.SEARCHING,
-                    status = ProcessStepStatus.COMPLETE,
-                    label = "Search complete (${outcome.results.size} result${if (outcome.results.size == 1) "" else "s"})"
-                )
+                // Keep the actual query and every actual returned URL in the
+                // expandable process card. A generic "search complete"
+                // label made it impossible to tell which web pages were
+                // consulted, even though Tavily returned those URLs.
+                val steps = buildList {
+                    add(
+                        ProcessStep(
+                            id = 1L,
+                            marking = ProcessMarking.SEARCHING,
+                            status = ProcessStepStatus.COMPLETE,
+                            label = "Searched: \"$query\" (${outcome.results.size} result${if (outcome.results.size == 1) "" else "s"})"
+                        )
+                    )
+                    outcome.results.forEachIndexed { index, result ->
+                        add(
+                            ProcessStep(
+                                id = (index + 2).toLong(),
+                                marking = ProcessMarking.SEARCHING,
+                                status = ProcessStepStatus.COMPLETE,
+                                label = "${index + 1}. ${result.title}\n${result.url}"
+                            )
+                        )
+                    }
+                }
                 val message = ChatMessage(
                     id = botId, text = "", isUser = false, timestamp = timeNow(),
-                    state = BotMessageState.PROCESS, processSteps = listOf(step)
+                    state = BotMessageState.PROCESS, processSteps = steps
                 )
                 upsertBotMessage(botId, message)
                 persistMessage(activeSessionId, message)

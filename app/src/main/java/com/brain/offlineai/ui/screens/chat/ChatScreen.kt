@@ -188,7 +188,13 @@ fun ChatScreen(
             layoutInfo.visibleItemsInfo.last().index >= messages.size - 2
         if (nearBottom) {
             scope.launch {
-                listState.animateScrollToItem(messages.size - 1)
+                // The last LazyColumn item can itself grow (streaming text,
+                // process rows, or the expanded search summary). Scrolling
+                // only to its index leaves the viewport at the old offset,
+                // so the card grows below the screen. A large offset is
+                // clamped by LazyListState to the real item end and pins the
+                // actual bottom without inventing a fixed card height.
+                listState.animateScrollToItem(messages.size - 1, Int.MAX_VALUE)
             }
         }
     }

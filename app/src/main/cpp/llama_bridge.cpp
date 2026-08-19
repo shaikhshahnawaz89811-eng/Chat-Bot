@@ -191,9 +191,29 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
         return env->NewStringUTF("error: prompt longer than context window");
     }
 
-    // --- Build a real sampler chain (temperature -> top-p -> distribution) ---
+    // --- Build a real sampler chain (repeat-penalty -> top-k -> top-p ->
+    // temperature -> distribution) ---
+    // Real bug fix: with no repetition penalty at all, a small on-device
+    // model (e.g. Qwen2.5-1.5B) very often falls into a genuine sampling
+    // loop - once it emits a phrase, that same phrase's tokens keep
+    // scoring highest again on every following step, so it regenerates
+    // the identical line over and over until maxTokens is hit, both
+    // offline and when web-search context is used (the search only
+    // changes the prompt/context fed in - this sampler chain runs the
+    // same way regardless). llama_sampler_init_penalties looks back over
+    // the last [penalty_last_n] real generated tokens and down-weights
+    // ones already seen, which is the standard llama.cpp fix for this -
+    // added first in the chain so it applies before top-k/top-p narrow
+    // the distribution.
+    const int penalty_last_n = 64;
+    const float penalty_repeat = 1.1f;
+    const float penalty_freq = 0.0f;
+    const float penalty_present = 0.0f;
+
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+        penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
     llama_sampler_chain_add(sampler, llama_sampler_init_top_p(topP > 0 ? topP : 0.9f, 1));
     llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.7f));

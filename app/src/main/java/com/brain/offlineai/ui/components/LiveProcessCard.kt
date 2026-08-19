@@ -19,11 +19,13 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import com.brain.offlineai.ui.process.ProcessStep
 import com.brain.offlineai.ui.process.ProcessStepStatus
 import com.brain.offlineai.ui.theme.*
+import com.brain.offlineai.data.settings.AppSettingsState
 
 /**
  * Visual-only upgrade of the EXISTING process component.
@@ -141,7 +143,12 @@ fun LiveProcessCard(
             // its own, so a growing step list would silently overflow past
             // the fixed 240dp window while the visible content jumped as
             // the surrounding animateContentSize() resized the card.
-            LaunchedEffect(steps.size, steps.lastOrNull()?.status) {
+            LaunchedEffect(
+                steps.size,
+                steps.lastOrNull()?.status,
+                steps.lastOrNull()?.label,
+                showSummary
+            ) {
                 if (stepsScrollState.maxValue > 0) {
                     stepsScrollState.animateScrollTo(stepsScrollState.maxValue)
                 }
@@ -218,6 +225,17 @@ private fun ProcessStepRow(
     accent: Color
 ) {
     val running = step.status == ProcessStepStatus.RUNNING
+    val animate = running && AppSettingsState.animationsEnabled
+    val transition = rememberInfiniteTransition(label = "process-step-${step.id}")
+    val pulse by transition.animateFloat(
+        initialValue = 0.72f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(700),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "process-step-pulse-${step.id}"
+    )
 
     val rowColor = when (step.status) {
         ProcessStepStatus.FAILED -> BrainDangerRed
@@ -240,7 +258,13 @@ private fun ProcessStepRow(
 
         Text(
             text = step.marking.icon,
-            modifier = Modifier.width(24.dp)
+            modifier = Modifier
+                .width(24.dp)
+                .graphicsLayer {
+                    alpha = if (animate) pulse else 1f
+                    scaleX = if (animate) 0.94f + (pulse * 0.06f) else 1f
+                    scaleY = if (animate) 0.94f + (pulse * 0.06f) else 1f
+                }
         )
 
         Text(
