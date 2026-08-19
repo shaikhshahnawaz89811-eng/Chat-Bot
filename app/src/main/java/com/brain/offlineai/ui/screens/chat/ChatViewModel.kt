@@ -156,7 +156,6 @@ class ChatViewModel(
      * internally by [exportArtifact]/[onDownloadAllArtifacts]/[onCancelDownload].
      */
     private val downloadJobs = mutableMapOf<String, Job>()
-        private set
 
     /** Null until the first message of a fresh conversation is actually sent - see class doc above. */
     private var sessionId: String? = openSessionId
