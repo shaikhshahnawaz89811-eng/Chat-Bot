@@ -1,12 +1,16 @@
 package com.brain.offlineai.engine
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** Real state of the local llama.cpp engine - no state here is decorative. */
 sealed class EngineState {
@@ -124,21 +128,45 @@ object BrainEngine {
                 close(IllegalStateException("No model loaded"))
                 return@callbackFlow
             }
-            var cancelled = false
+            /*
+             * Do not call the blocking JNI function directly from this
+             * callbackFlow producer.  A coroutine timeout/cancellation cannot
+             * regain control while nativeGenerate is doing prompt prefill, so
+             * the old implementation could leave the UI on "Working" forever
+             * and keep the model running in an orphaned coroutine.
+             *
+             * The native call still owns the process-wide native mutex, so a
+             * later request cannot corrupt the model while a timed-out call is
+             * finishing.  The detached worker is deliberately cancelled from
+             * the flow, while the callback's atomic flag makes nativeGenerate
+             * stop at its next token boundary.
+             */
+            val cancelled = AtomicBoolean(false)
             val callback = BrainNative.TokenCallback { token ->
-                val sendResult = trySend(token)
-                cancelled = sendResult.isFailure
-                !cancelled
-            }
-            withContext(Dispatchers.Default) {
-                val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
-                if (stopReason.startsWith("error:")) {
-                    close(IllegalStateException(stopReason))
+                if (cancelled.get()) {
+                    false
                 } else {
-                    onStopReason(stopReason)
-                    close()
+                    trySend(token).isSuccess && !cancelled.get()
                 }
             }
-            awaitClose { /* native generation already finished by the time we get here */ }
+
+            // This scope is independent of the collector.  That is
+            // intentional: cancelling the collector must return immediately
+            // even if JNI is currently inside a long, non-cancellable prefill.
+            val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+                val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
+                if (!cancelled.get()) {
+                    if (stopReason.startsWith("error:")) {
+                        close(IllegalStateException(stopReason))
+                    } else {
+                        onStopReason(stopReason)
+                        close()
+                    }
+                }
+            }
+            awaitClose {
+                cancelled.set(true)
+                worker.cancel()
+            }
         }
 }

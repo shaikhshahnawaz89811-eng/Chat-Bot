@@ -16,12 +16,21 @@ import com.brain.offlineai.data.websearch.WebSearchResult
 object WebSearchContextBuilder {
 
     private const val MAX_CONTENT_CHARS_PER_RESULT = 600
+    // Tavily's answer is useful context, but it is not bounded by the
+    // per-result cap.  An unusually long answer used to inflate the planning
+    // prompt and make on-device prefill look like the process had hung.
+    private const val MAX_ANSWER_CHARS = 1200
 
     fun buildContextBlock(query: String, results: List<WebSearchResult>, answer: String?): String {
         if (results.isEmpty() && answer == null) return ""
         val sections = buildString {
             if (answer != null) {
-                append("Tavily's summarized answer: ").append(answer).append("\n\n")
+                val boundedAnswer = if (answer.length > MAX_ANSWER_CHARS) {
+                    answer.take(MAX_ANSWER_CHARS) + "... (truncated)"
+                } else {
+                    answer
+                }
+                append("Tavily's summarized answer: ").append(boundedAnswer).append("\n\n")
             }
             results.forEachIndexed { index, result ->
                 val content = if (result.content.length > MAX_CONTENT_CHARS_PER_RESULT) {
