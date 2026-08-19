@@ -59,7 +59,8 @@ fun ArtifactCard(
     downloadStates: Map<String, ArtifactDownloadUiState>,
     zipDownloadId: String,
     onDownload: (ArtifactInfo, ArtifactDownloadTarget) -> Unit,
-    onDownloadAll: (List<ArtifactInfo>) -> Unit
+    onDownloadAll: (List<ArtifactInfo>) -> Unit,
+    onCancelDownload: (String) -> Unit = {}
 ) {
     if (artifacts.isEmpty()) return
 
@@ -86,7 +87,8 @@ fun ArtifactCard(
                 ArtifactRow(
                     artifact = artifact,
                     state = downloadStates[artifact.id] ?: ArtifactDownloadUiState.Idle,
-                    onDownload = { target -> onDownload(artifact, target) }
+                    onDownload = { target -> onDownload(artifact, target) },
+                    onCancel = { onCancelDownload(artifact.id) }
                 )
                 if (index != artifacts.lastIndex) Spacer(Modifier.height(8.dp))
             }
@@ -96,7 +98,8 @@ fun ArtifactCard(
                 ArtifactZipRow(
                     fileCount = artifacts.size,
                     state = downloadStates[zipDownloadId] ?: ArtifactDownloadUiState.Idle,
-                    onDownloadAll = { onDownloadAll(artifacts) }
+                    onDownloadAll = { onDownloadAll(artifacts) },
+                    onCancel = { onCancelDownload(zipDownloadId) }
                 )
             }
         }
@@ -107,7 +110,8 @@ fun ArtifactCard(
 private fun ArtifactRow(
     artifact: ArtifactInfo,
     state: ArtifactDownloadUiState,
-    onDownload: (ArtifactDownloadTarget) -> Unit
+    onDownload: (ArtifactDownloadTarget) -> Unit,
+    onCancel: () -> Unit
 ) {
     var showOptions by remember { mutableStateOf(false) }
 
@@ -144,8 +148,18 @@ private fun ArtifactRow(
             }
             is ArtifactDownloadUiState.Exporting -> {
                 Spacer(Modifier.height(6.dp))
-                val pct = if (state.totalBytes > 0) (state.bytesCopied * 100 / state.totalBytes).toInt() else 0
-                Text("Downloading... $pct%", color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val pct = if (state.totalBytes > 0) (state.bytesCopied * 100 / state.totalBytes).toInt() else 0
+                    Text(
+                        "Downloading... $pct%",
+                        color = BrainTextSecondary,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onCancel, modifier = Modifier.size(22.dp)) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancel download", tint = BrainTextMuted, modifier = Modifier.size(14.dp))
+                    }
+                }
                 Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
                     progress = { if (state.totalBytes > 0) state.bytesCopied.toFloat() / state.totalBytes else 0f },
@@ -178,7 +192,8 @@ private fun ArtifactRow(
 private fun ArtifactZipRow(
     fileCount: Int,
     state: ArtifactDownloadUiState,
-    onDownloadAll: () -> Unit
+    onDownloadAll: () -> Unit,
+    onCancel: () -> Unit
 ) {
     Column(
         modifier = Modifier
@@ -199,8 +214,18 @@ private fun ArtifactZipRow(
                 }
             }
             is ArtifactDownloadUiState.Exporting -> {
-                val pct = if (state.totalBytes > 0) (state.bytesCopied * 100 / state.totalBytes).toInt() else 0
-                Text("Zipping & downloading... $pct%", color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    val pct = if (state.totalBytes > 0) (state.bytesCopied * 100 / state.totalBytes).toInt() else 0
+                    Text(
+                        "Zipping & downloading... $pct%",
+                        color = BrainTextSecondary,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onCancel, modifier = Modifier.size(22.dp)) {
+                        Icon(Icons.Filled.Close, contentDescription = "Cancel download", tint = BrainTextMuted, modifier = Modifier.size(14.dp))
+                    }
+                }
                 Spacer(Modifier.height(4.dp))
                 LinearProgressIndicator(
                     progress = { if (state.totalBytes > 0) state.bytesCopied.toFloat() / state.totalBytes else 0f },

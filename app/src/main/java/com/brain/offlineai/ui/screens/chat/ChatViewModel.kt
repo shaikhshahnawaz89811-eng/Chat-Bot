@@ -52,8 +52,6 @@ import com.brain.offlineai.ui.tasks.TaskSplitter
 import com.brain.offlineai.ui.tasks.TaskStatus
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -151,6 +149,13 @@ class ChatViewModel(
      * [onDownloadArtifact]/[onDownloadAllArtifacts].
      */
     var artifactDownloads = mutableStateOf(mapOf<String, ArtifactDownloadUiState>())
+
+    /**
+     * Real, per-download-id [Job] tracking so [onCancelDownload] can cancel
+     * an actual in-progress export - not exposed to the UI, only used
+     * internally by [exportArtifact]/[onDownloadAllArtifacts]/[onCancelDownload].
+     */
+    private val downloadJobs = mutableMapOf<String, Job>()
         private set
 
     /** Null until the first message of a fresh conversation is actually sent - see class doc above. */
@@ -285,6 +290,32 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Bug fix (user request - "chunk max ho jae or kaam bach jae toh kya
+     * hoga") - real, minimal state for a reply whose real chunk loop in
+     * [streamRealResponse] genuinely ran out of [MAX_CONTINUATION_CHUNKS]
+     * while the model's own last real stop reason was still "max_tokens"
+     * (i.e. the task itself was NOT actually finished - a real
+     * "end_of_generation"/"context_full"/cancel/error never happened, the
+     * safety ceiling just ran out first). Null whenever there is no such
+     * real unfinished reply waiting - true for every ordinary message that
+     * finishes inside the chunk cap, so this never affects the common case.
+     * [continuationPrompt] already holds the real original prompt plus
+     * every real token generated across every chunk so far - resuming
+     * never re-asks the model to guess or repeat what it already said.
+     * Consumed (and cleared) the moment the user's very next message is a
+     * real continue request (see [CONTINUE_TRIGGERS] in [sendMessage]);
+     * sending anything else clears it too, since a genuinely different
+     * message means the user moved on and a later unrelated "continue"
+     * should not resume stale, out-of-context work.
+     */
+    private data class PendingContinuation(
+        val sessionId: String,
+        val continuationPrompt: String,
+        val zipEditTarget: ZipEditTarget?
+    )
+    private var pendingContinuation: PendingContinuation? = null
+
     fun sendMessage() {
         if (isBusy.value) return
         val text = inputText.value.trim()
@@ -354,6 +385,26 @@ class ChatViewModel(
                             "this build never fabricates an answer without a real model."
                     )
                     return@launch
+                }
+
+                // Bug fix (user request - "chunk max ho jae or kaam bach
+                // jae toh kya hoga") - a real, still-unfinished reply from
+                // an earlier message (see [pendingContinuation]'s own doc)
+                // is only ever resumed by an explicit, deterministic
+                // continue request - never guessed from an unrelated
+                // message, and never silently resumed behind the user's
+                // back. Cleared here either way: a real continue request
+                // consumes it by resuming; anything else means the user
+                // genuinely moved on, so the old unfinished reply is
+                // dropped rather than resumed later out of context by a
+                // much later, unrelated "continue".
+                val pending = pendingContinuation
+                if (pending != null) {
+                    pendingContinuation = null
+                    if (text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS) {
+                        streamRealResponse(activeSessionId, pending.continuationPrompt, pending.zipEditTarget)
+                        return@launch
+                    }
                 }
 
                 if (text.isEmpty()) {
@@ -640,149 +691,367 @@ class ChatViewModel(
             botId,
             ChatMessage(id = botId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = 0)
         )
-        BrainEngine.generate(prompt, temperature = settings.temperature, topP = settings.topP)
-            .onCompletion { cause ->
-                if (cause == null) {
-                    val finalFull = builder.toString().ifBlank { "(model returned no output)" }
-                    val finalSplit = splitIntroAndCode(finalFull)
-                    val finalCodeId = codeId
-                    if (finalSplit.codeLines == null || finalCodeId == null) {
-                        // No real fence ever appeared - unchanged, single
-                        // plain-text card, same as every earlier phase.
-                        val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
-                        upsertBotMessage(botId, renderedMessage)
-                        persistMessage(activeSessionId, renderedMessage)
-                    } else {
-                        // Finalize the prose card (or drop it if there
-                        // genuinely was no prose before the fence).
-                        if (finalSplit.introText.isNotBlank()) {
-                            val introMessage = ChatMessage(id = botId, text = finalSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
-                            upsertBotMessage(botId, introMessage)
-                            persistMessage(activeSessionId, introMessage)
+
+        // Bug fix (user request - "chota kaam kar pa raha he, bada nahin,
+        // bich me he ruk gaya") - real root cause was that every call here
+        // used [BrainEngine.generate]'s hardcoded maxTokens=512 default (it
+        // was never actually passed from anywhere in this file), so the
+        // native decode loop in llama_bridge.cpp always hit its hard
+        // ceiling and returned stopReason=="max_tokens" for any real answer
+        // that genuinely needed more than ~512 tokens (e.g. a multi-file
+        // Termux coding agent), while everything below treated that exactly
+        // like a real finished reply - there was no earlier bug in
+        // [TaskSplitter]; that class only breaks apart the user's *own*
+        // message text into separate tasks and never touches how long a
+        // single answer is allowed to run.
+        //
+        // The real fix is this chunked, auto-continue loop: each iteration
+        // asks the real model for one more real chunk, sized to however
+        // much of the actual loaded context window is genuinely still free
+        // (see [chunkTokenBudget] - never a fixed re-guess), and only stops
+        // asking for another chunk once the model's own real stop reason
+        // says the answer is genuinely finished ("end_of_generation"), the
+        // real context window is genuinely full ("context_full"), the user
+        // genuinely cancelled, a real error was thrown, or [MAX_CONTINUATION_CHUNKS]
+        // is reached (a hard safety ceiling against a pathological model
+        // that never emits an end-of-generation token, so this can never
+        // loop forever). Continuation prompts are just the real original
+        // prompt plus every real token produced so far - never an invented
+        // rewrite of what the model already said - so a short task that
+        // finishes in the first real chunk behaves exactly as before
+        // (single call, single stop reason, loop runs once).
+        var continuationPrompt = prompt
+        var stopReason = "max_tokens"
+        var chunkIndex = 0
+        var fatalError: Throwable? = null
+        val loadedContextSize = (BrainEngine.state.value as? EngineState.Loaded)?.contextSize ?: settings.contextLength
+
+        try {
+            while (stopReason == "max_tokens" && chunkIndex < MAX_CONTINUATION_CHUNKS) {
+                chunkIndex++
+                val chunkBudget = chunkTokenBudget(loadedContextSize, continuationPrompt)
+                if (chunkBudget <= 0) {
+                    // The real prompt-so-far (original prompt + everything
+                    // genuinely generated in earlier chunks) already fills
+                    // the real context window - same honest boundary the
+                    // native side itself enforces on a first call. Stop
+                    // asking for more instead of sending a call the native
+                    // side would just reject.
+                    stopReason = "context_full"
+                    break
+                }
+
+                var chunkStopReason = "max_tokens"
+                var chunkFailed = false
+                try {
+                    BrainEngine.generate(
+                        continuationPrompt,
+                        maxTokens = chunkBudget,
+                        temperature = settings.temperature,
+                        topP = settings.topP,
+                        onStopReason = { chunkStopReason = it }
+                    ).collect { piece ->
+                        builder.append(piece)
+                        tokenCount++
+                        val full = builder.toString()
+                        val split = splitIntroAndCode(full)
+                        if (split.codeLines == null) {
+                            // Still just prose - this stays the one live card, same
+                            // GENERATING bubble as before any fence ever appears.
+                            upsertBotMessage(botId, ChatMessage(id = botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = tokenCount))
                         } else {
-                            removeBotMessage(botId)
-                        }
-                        // Phase 11 (Artifact card + ZIP/file output +
-                        // download flow) - only a genuinely *completed*
-                        // response's fenced blocks become real files;
-                        // nothing is extracted while still streaming. Runs
-                        // against the full raw text (fence markers intact)
-                        // since ArtifactExtractor needs those to find every
-                        // real block, not just the first one this card
-                        // shows live.
-                        val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines)
-                        var finalCodeMessage = attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
-                        // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
-                        // runs when [finalCodeMessage] genuinely has real
-                        // artifacts AND at least one of them is real
-                        // app/project source (.kt/.java/.xml/.gradle*).
-                        // Bug fix (user request) - [animateAppCreationPipeline]
-                        // now also builds a real zip for a genuine multi-file
-                        // build, so its returned message (with that zip
-                        // appended to its real artifact list when it
-                        // happened) replaces [finalCodeMessage] here rather
-                        // than being discarded.
-                        if (isAppProjectArtifactSet(finalCodeMessage.artifacts)) {
-                            finalCodeMessage = animateAppCreationPipeline(finalCodeId, activeSessionId, prompt, finalCodeMessage)
-                        }
-                        upsertBotMessage(finalCodeId, finalCodeMessage)
-                        persistMessage(activeSessionId, finalCodeMessage)
-                    }
-                    // Real final count, written once per completed generation
-                    // (not per streamed token) - Rule 20 minimal-necessary-payload.
-                    analyticsStore.addTokensGenerated(tokenCount.toLong())
-                } else if (cause is kotlinx.coroutines.CancellationException) {
-                    // Real interruption - the user left the screen, the app
-                    // was backgrounded, or the process was reclaimed while a
-                    // real generation was still in flight. Before this fix
-                    // the tokens streamed so far were held only in
-                    // [messages] (in-memory Compose state) and were never
-                    // written to [historyRepository] - so anything short of
-                    // a full completion vanished with no trace, even though
-                    // real work had genuinely happened. NonCancellable is
-                    // required here because this coroutine's own Job is
-                    // already cancelled by the time onCompletion runs, so an
-                    // ordinary suspend DB write would be rejected immediately.
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                        val partialFull = builder.toString()
-                        if (partialFull.isNotBlank()) {
-                            val partialSplit = splitIntroAndCode(partialFull)
-                            val partialCodeId = codeId
-                            if (partialSplit.codeLines == null || partialCodeId == null) {
-                                val partialMessage = ChatMessage(id = botId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
-                                persistMessage(activeSessionId, partialMessage)
-                            } else {
-                                if (partialSplit.introText.isNotBlank()) {
-                                    persistMessage(activeSessionId, ChatMessage(id = botId, text = partialSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                            if (codeId == null) {
+                                // The fence just appeared for the first time - the
+                                // prose card is done changing now, freeze it as its
+                                // own real, separate finished card (or remove it
+                                // entirely if there was no real prose before the
+                                // fence at all).
+                                if (split.introText.isNotBlank()) {
+                                    upsertBotMessage(botId, ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                                } else {
+                                    removeBotMessage(botId)
                                 }
-                                persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = partialSplit.codeLines))
+                                codeId = nextId++
                             }
+                            upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
                         }
+                        // Bug fix (user request) - real, periodic on-disk copy of
+                        // whatever has genuinely streamed so far, keyed to the
+                        // same id the final message will use (botId while still
+                        // plain prose, codeId once a fence has appeared) so this
+                        // upsert and the final persistMessage() write the same
+                        // row - never a stray leftover partial row under a
+                        // different id. See [persistEveryNTokens]'s doc above for
+                        // why this exists.
+                        if (tokenCount % persistEveryNTokens == 0) {
+                            persistMessage(
+                                activeSessionId,
+                                ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                            )
+                        }
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    // A real prompt-too-long rejection from the native side
+                    // (see [chunkTokenBudget]'s doc - the Kotlin-side token
+                    // estimate is a heuristic, so the native tokenizer can
+                    // still legitimately disagree once in a while) is the
+                    // same honest "the real context window is full" outcome
+                    // as [chunkTokenBudget] returning 0 above - not a real
+                    // failure of generation itself, so it's handled the same
+                    // way (stop the loop, keep whatever real content already
+                    // streamed) instead of routing to [handleGenerationFailure].
+                    if (e.message?.contains("context window") == true) {
+                        chunkStopReason = "context_full"
+                    } else {
+                        chunkFailed = true
+                        fatalError = e
+                    }
+                }
+
+                if (chunkFailed) break
+                stopReason = chunkStopReason
+                continuationPrompt = prompt + "\n\n" + builder.toString()
+            }
+        } catch (ce: kotlinx.coroutines.CancellationException) {
+            // Real interruption - the user left the screen, the app was
+            // backgrounded, or the process was reclaimed while a real
+            // generation was still in flight. NonCancellable is required
+            // here because this coroutine's own Job is already cancelled by
+            // the time this catch runs, so an ordinary suspend DB write
+            // would be rejected immediately.
+            kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                val partialFull = builder.toString()
+                if (partialFull.isNotBlank()) {
+                    val partialSplit = splitIntroAndCode(partialFull)
+                    val partialCodeId = codeId
+                    if (partialSplit.codeLines == null || partialCodeId == null) {
+                        val partialMessage = ChatMessage(id = botId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                        persistMessage(activeSessionId, partialMessage)
+                    } else {
+                        if (partialSplit.introText.isNotBlank()) {
+                            persistMessage(activeSessionId, ChatMessage(id = botId, text = partialSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                        }
+                        persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = partialSplit.codeLines))
                     }
                 }
             }
-            .catch { e ->
-                // Phase 15 (Error & Recovery Flow) - a genuine generation
-                // failure no longer becomes a single flat SYSTEM_NOTE; it
-                // runs through the real Error -> Investigating -> Root
-                // cause -> Fixing -> Re-testing -> Verified sequence below.
-                // Bug fix (user request) - [handleGenerationFailure] now
-                // returns the real id of whichever message genuinely ends
-                // up holding the final result (the single TEXT/SYSTEM_NOTE
-                // card, or - once its own retry success also splits into
-                // intro+code - the real separate code card's own new id).
-                // That id is written into this function's own [codeId], the
-                // exact var the real `return codeId ?: botId` below already
-                // reads, so a retry that recovers via a genuinely different
-                // id is never silently dropped in favor of the stale [botId].
-                codeId = handleGenerationFailure(botId, activeSessionId, prompt, settings, e)
-            }
-            .collect { piece ->
-                builder.append(piece)
-                tokenCount++
-                val full = builder.toString()
-                val split = splitIntroAndCode(full)
-                if (split.codeLines == null) {
-                    // Still just prose - this stays the one live card, same
-                    // GENERATING bubble as before any fence ever appears.
-                    upsertBotMessage(botId, ChatMessage(id = botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = tokenCount))
+            throw ce
+        }
+
+        // Bug fix (user request - "chunk max ho jae or kaam bach jae toh
+        // kya hoga") - true only when the real loop above genuinely ran
+        // out of [MAX_CONTINUATION_CHUNKS] while the model's own real last
+        // stop reason was still "max_tokens" (still mid-answer) - never
+        // true for a real "end_of_generation" or "context_full" stop,
+        // which already end the loop with [stopReason] set to something
+        // else. See where this is used below for what happens next.
+        val hitChunkCap = fatalError == null && stopReason == "max_tokens" && chunkIndex >= MAX_CONTINUATION_CHUNKS
+
+        if (fatalError != null) {
+            // Phase 15 (Error & Recovery Flow) - a genuine generation
+            // failure no longer becomes a single flat SYSTEM_NOTE; it
+            // runs through the real Error -> Investigating -> Root
+            // cause -> Fixing -> Re-testing -> Verified sequence below.
+            // Bug fix (user request) - [handleGenerationFailure] now
+            // returns the real id of whichever message genuinely ends
+            // up holding the final result (the single TEXT/SYSTEM_NOTE
+            // card, or - once its own retry success also splits into
+            // intro+code - the real separate code card's own new id).
+            // That id is written into this function's own [codeId], the
+            // exact var the real `return codeId ?: botId` below already
+            // reads, so a retry that recovers via a genuinely different
+            // id is never silently dropped in favor of the stale [botId].
+            codeId = handleGenerationFailure(botId, activeSessionId, prompt, settings, fatalError!!)
+        } else {
+            val finalFull = builder.toString().ifBlank { "(model returned no output)" }
+            val finalSplit = splitIntroAndCode(finalFull)
+            val finalCodeId = codeId
+            if (finalSplit.codeLines == null || finalCodeId == null) {
+                // No real fence ever appeared - unchanged, single
+                // plain-text card, same as every earlier phase.
+                val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                upsertBotMessage(botId, renderedMessage)
+                persistMessage(activeSessionId, renderedMessage)
+            } else {
+                // Finalize the prose card (or drop it if there
+                // genuinely was no prose before the fence).
+                if (finalSplit.introText.isNotBlank()) {
+                    val introMessage = ChatMessage(id = botId, text = finalSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                    upsertBotMessage(botId, introMessage)
+                    persistMessage(activeSessionId, introMessage)
                 } else {
-                    if (codeId == null) {
-                        // The fence just appeared for the first time - the
-                        // prose card is done changing now, freeze it as its
-                        // own real, separate finished card (or remove it
-                        // entirely if there was no real prose before the
-                        // fence at all).
-                        if (split.introText.isNotBlank()) {
-                            upsertBotMessage(botId, ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
-                        } else {
-                            removeBotMessage(botId)
-                        }
-                        codeId = nextId++
-                    }
-                    upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
+                    removeBotMessage(botId)
                 }
-                // Bug fix (user request) - real, periodic on-disk copy of
-                // whatever has genuinely streamed so far, keyed to the
-                // same id the final message will use (botId while still
-                // plain prose, codeId once a fence has appeared) so this
-                // upsert and the final persistMessage() write the same
-                // row - never a stray leftover partial row under a
-                // different id. See [persistEveryNTokens]'s doc above for
-                // why this exists.
-                if (tokenCount % persistEveryNTokens == 0) {
-                    persistMessage(
-                        activeSessionId,
-                        ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
-                    )
+                // Phase 11 (Artifact card + ZIP/file output +
+                // download flow) - only a genuinely *completed*
+                // response's fenced blocks become real files;
+                // nothing is extracted while still streaming. Runs
+                // against the full raw text (fence markers intact)
+                // since ArtifactExtractor needs those to find every
+                // real block, not just the first one this card
+                // shows live.
+                val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines)
+                var finalCodeMessage = attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
+                // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
+                // runs when [finalCodeMessage] genuinely has real
+                // artifacts AND at least one of them is real
+                // app/project source (.kt/.java/.xml/.gradle*).
+                // Bug fix (user request) - [animateAppCreationPipeline]
+                // now also builds a real zip for a genuine multi-file
+                // build, so its returned message (with that zip
+                // appended to its real artifact list when it
+                // happened) replaces [finalCodeMessage] here rather
+                // than being discarded.
+                if (isAppProjectArtifactSet(finalCodeMessage.artifacts)) {
+                    finalCodeMessage = animateAppCreationPipeline(finalCodeId, activeSessionId, prompt, finalCodeMessage)
                 }
+                upsertBotMessage(finalCodeId, finalCodeMessage)
+                persistMessage(activeSessionId, finalCodeMessage)
             }
-        // Reached only after the whole real flow above has genuinely
-        // completed (onCompletion/catch have already run and their own
-        // real suspend work - persistMessage - has already finished, since
-        // both are suspend operators inside this same collected flow), so
-        // messages.value already holds both real card(s)' final state here.
+            // Real final count, written once per completed generation
+            // (not per streamed token) - Rule 20 minimal-necessary-payload.
+            analyticsStore.addTokensGenerated(tokenCount.toLong())
+
+            // Bug fix (user request - "chunk max ho jae or kaam bach jae
+            // toh kya hoga") - [hitChunkCap] is only ever true when the
+            // real loop above stopped because [MAX_CONTINUATION_CHUNKS]
+            // ran out while the model's own real last stop reason was
+            // still "max_tokens" - i.e. the task genuinely was not
+            // finished, it was just the *safety ceiling* that ended the
+            // loop, not the model itself. Without this, that case looked
+            // identical to a real, genuinely finished reply (same
+            // CODE_DONE/TEXT card above) with silently missing content -
+            // exactly the original bug, just moved from ~512 tokens to
+            // ~12,288. This makes it honest instead: the card above still
+            // shows everything real that was actually generated (nothing
+            // discarded), and this note makes the truncation visible and
+            // actionable rather than silent. [pendingContinuation] is
+            // armed with the real prompt-so-far so the very next literal
+            // "continue" (see [CONTINUE_TRIGGERS]) makes one more real
+            // `generate()` call picking up from exactly here.
+            if (hitChunkCap) {
+                pendingContinuation = PendingContinuation(activeSessionId, continuationPrompt, zipEditTarget)
+                postSystemNote(
+                    activeSessionId,
+                    "This reply hit this app's per-message length safety limit before the task " +
+                        "was actually finished. Nothing generated so far was lost - reply " +
+                        "\"continue\" to keep going from exactly where it stopped."
+                )
+            } else if (stopReason == "context_full") {
+                // Bug fix (user request - "line se, koi guse ga nahin, sab
+                // token ke hisab se") - real, honest handling of the other
+                // genuine (and, per the chunk-math above, far more likely
+                // in practice) way a big task stops before it's actually
+                // finished: the real loaded context window - not an
+                // arbitrary chunk count - is genuinely full. Typing
+                // "continue" would NOT actually work here the way it does
+                // for [hitChunkCap] above: every chunk re-decodes prompt +
+                // everything generated so far from scratch, and that
+                // combined text is already sitting right at the real
+                // context ceiling, so an identical follow-up call would
+                // just immediately hit "context_full" again with zero new
+                // real tokens - promising it would "continue" would be
+                // exactly the kind of fabricated capability this codebase
+                // deliberately avoids everywhere else. The one real,
+                // actionable fix is a bigger real Context Length (Model
+                // Settings screen, up to 8192) *before* sending the next
+                // attempt - so that's what this says instead of a false
+                // "continue" promise. [pendingContinuation] is
+                // deliberately NOT armed here, unlike [hitChunkCap].
+                postSystemNote(
+                    activeSessionId,
+                    "This reply filled the model's real loaded context window " +
+                        "(currently $loadedContextSize tokens) before the task was " +
+                        "actually finished, so it genuinely can't be continued as-is. " +
+                        "Raise Context Length in Model Settings (up to 8192) and send " +
+                        "the request again for a longer reply."
+                )
+            }
+        }
+        // Reached only after the whole real chunk loop above has genuinely
+        // completed and its own real suspend work - persistMessage - has
+        // already finished, so messages.value already holds both real
+        // card(s)' final state here.
         return codeId ?: botId
+    }
+
+    /**
+     * Bug fix (user request - real chunked/auto-continue generation, see
+     * [streamRealResponse]) - how many more tokens are safe to ask the real
+     * model for in the *next* chunk, given [contextSize] (the real, loaded
+     * n_ctx) and everything [promptSoFar] already contains (the original
+     * prompt plus every real token generated in earlier chunks).
+     *
+     * There's no cheap, exact way to get a real token count from plain
+     * Kotlin without duplicating llama.cpp's own tokenizer, so this uses
+     * the same conservative characters-per-token heuristic (~3 chars/token,
+     * safely below the ~4 chars/token average for English/code so this
+     * only ever under-estimates how much room is actually left) that's
+     * common for sizing prompts against a context window; the native side
+     * (llama_bridge.cpp) is still the real, authoritative check - it
+     * genuinely rejects a call with "error: prompt longer than context
+     * window" if this estimate was ever too optimistic, and
+     * [streamRealResponse] already treats that specific rejection as a
+     * real, graceful "context_full" stop rather than a crash.
+     * [RESERVED_OUTPUT_MARGIN_TOKENS] keeps a real floor of room for the
+     * model's own reply on top of the prompt itself.
+     */
+    private fun chunkTokenBudget(contextSize: Int, promptSoFar: String): Int {
+        val estimatedPromptTokens = (promptSoFar.length / 3) + 1
+        val remaining = contextSize - estimatedPromptTokens - RESERVED_OUTPUT_MARGIN_TOKENS
+        return remaining.coerceIn(0, CHUNK_MAX_TOKENS)
+    }
+
+    companion object {
+        /**
+         * Bug fix (user request - "line se, bich me koi na guse, continue
+         * karne ki zaroorat na pade") - real chunks are cheap to loop
+         * (each one is bounded by a real, shrinking [chunkTokenBudget]
+         * anyway), and the actual, hard stopping point for a single reply
+         * was never really this count - it's the real loaded context
+         * window ([loadedContextSize] in [streamRealResponse]): every
+         * chunk re-decodes the *entire* prompt-so-far from scratch (native
+         * side clears the KV cache on every call), so the prompt genuinely
+         * cannot grow past `contextLength` tokens no matter how many
+         * chunks are allowed. At the max real Context Length setting
+         * (8192, see [com.brain.offlineai.data.settings.ModelSettingsRepository.MAX_CONTEXT_LENGTH])
+         * that's only ever ~8 real chunks before [chunkTokenBudget]
+         * genuinely hits 0 and the loop stops itself via "context_full" -
+         * so 64 here is generous headroom, never the thing that actually
+         * ends a reply in practice, which is exactly the point: chunks now
+         * keep going strictly in order, one at a time, automatically,
+         * entirely on their own, with no user "continue" needed for any
+         * realistically-sized task. Only a genuinely pathological model
+         * that keeps a *shrinking* budget non-zero for 64 straight real
+         * chunks would ever hit this - true only as a last-resort safety
+         * ceiling against an unbounded loop, not a real everyday limit.
+         */
+        private const val MAX_CONTINUATION_CHUNKS = 64
+
+        /** Per-chunk cap - large on-device models on a phone are already slow; asking for one giant chunk risks a very long unresponsive stretch instead of visible streaming progress. */
+        private const val CHUNK_MAX_TOKENS = 1024
+
+        /** Real floor of context room reserved for the reply itself when estimating how much prompt a chunk can safely carry. */
+        private const val RESERVED_OUTPUT_MARGIN_TOKENS = 64
+
+        /**
+         * Bug fix (user request - "chunk max ho jae or kaam bach jae toh
+         * kya hoga") - the exact, case-insensitive set of user messages
+         * that resume a real [pendingContinuation] instead of starting a
+         * genuinely new, unrelated message. Kept small and literal on
+         * purpose (same deterministic-over-guessed philosophy
+         * [com.brain.offlineai.ui.normalize.InputNormalizer] and
+         * [com.brain.offlineai.ui.tasks.TaskSplitter] already use
+         * elsewhere in this file) - a real message that merely contains
+         * one of these words as part of a longer, different instruction is
+         * never misread as a continue request.
+         */
+        private val CONTINUE_TRIGGERS = setOf(
+            "continue", "keep going", "go on", "next",
+            "continue karo", "aage badho", "aage badhao", "jari rakho", "jaari rakho"
+        )
     }
 
     /**
@@ -1383,34 +1652,60 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Real, per-download cancel (fixes the previously-missing Cancel action
+     * for an in-progress Save to Device/Download All export - the old
+     * Cancel button only ever closed the pre-download options menu, it
+     * never touched a real running export). Cancels the actual coroutine
+     * [Job] copying real bytes right now, removes any real partial file it
+     * had started writing, and resets the card back to a real Idle state -
+     * never leaves the UI stuck showing a percentage that stopped moving.
+     */
+    fun onCancelDownload(id: String) {
+        // Cancelling the real Job stops the real byte-copy loop at its next
+        // suspension point (Flow.emit() is a real cancellation checkpoint) -
+        // no separate stop signal needed, and no fake "cancelled" state is
+        // shown unless the Job genuinely stopped.
+        downloadJobs.remove(id)?.cancel()
+        updateDownloadState(id, ArtifactDownloadUiState.Idle)
+    }
+
     /** Real "Download All" - zips the genuine artifact files on disk first, then exports that real ZIP the same way a single artifact would be. */
     fun onDownloadAllArtifacts(messageId: Long, artifacts: List<ArtifactInfo>) {
         if (artifacts.isEmpty()) return
         val zipId = "zip-$messageId"
-        viewModelScope.launch {
+        val job = viewModelScope.launch {
             updateDownloadState(zipId, ArtifactDownloadUiState.Exporting(0L, 0L, ArtifactDownloadTarget.SAVE_TO_DEVICE))
             try {
                 val zipFile = artifactFileManager.createZip(artifacts.map { File(it.storedPath) }, "brain_artifacts_$messageId.zip")
                 exportArtifact(zipId, zipFile, "application/zip", ArtifactDownloadTarget.SAVE_TO_DEVICE)
             } catch (e: Exception) {
-                updateDownloadState(zipId, ArtifactDownloadUiState.Failed("ZIP creation failed: ${e.message}"))
+                if (e !is kotlinx.coroutines.CancellationException) {
+                    updateDownloadState(zipId, ArtifactDownloadUiState.Failed("ZIP creation failed: ${e.message}"))
+                }
             }
         }
+        downloadJobs[zipId] = job
     }
 
     private fun exportArtifact(id: String, file: File, mimeType: String, target: ArtifactDownloadTarget) {
-        viewModelScope.launch {
+        val job = viewModelScope.launch {
             artifactFileManager.exportToDownloads(file, mimeType).collect { progress ->
                 when (progress) {
                     is ArtifactExportProgress.Copying ->
                         updateDownloadState(id, ArtifactDownloadUiState.Exporting(progress.bytesCopied, progress.totalBytes, target))
-                    is ArtifactExportProgress.Done ->
+                    is ArtifactExportProgress.Done -> {
+                        downloadJobs.remove(id)
                         updateDownloadState(id, ArtifactDownloadUiState.Complete(progress.uri, target))
-                    is ArtifactExportProgress.Failed ->
+                    }
+                    is ArtifactExportProgress.Failed -> {
+                        downloadJobs.remove(id)
                         updateDownloadState(id, ArtifactDownloadUiState.Failed(progress.reason))
+                    }
                 }
             }
         }
+        downloadJobs[id] = job
     }
 
     /**

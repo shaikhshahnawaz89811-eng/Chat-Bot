@@ -133,11 +133,25 @@ fun LiveProcessCard(
         Spacer(Modifier.height(8.dp))
 
         if (expanded) {
+            val stepsScrollState = rememberScrollState()
+
+            // Real fix: as new steps genuinely arrive (or the running step's
+            // status genuinely changes), keep the real scroll position
+            // pinned to the bottom - this list previously never moved on
+            // its own, so a growing step list would silently overflow past
+            // the fixed 240dp window while the visible content jumped as
+            // the surrounding animateContentSize() resized the card.
+            LaunchedEffect(steps.size, steps.lastOrNull()?.status) {
+                if (stepsScrollState.maxValue > 0) {
+                    stepsScrollState.animateScrollTo(stepsScrollState.maxValue)
+                }
+            }
+
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .heightIn(max = 240.dp)
-                    .verticalScroll(rememberScrollState())
+                    .verticalScroll(stepsScrollState)
             ) {
                 steps.forEachIndexed { index, step ->
                     ProcessStepRow(

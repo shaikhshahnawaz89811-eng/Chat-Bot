@@ -65,8 +65,28 @@ object BrainEngine {
      * llama_token_to_piece - nothing here is scripted or pre-written.
      * Cancelling collection of this flow cancels generation inside the
      * native loop via the TokenCallback returning false.
+     *
+     * Bug fix (user request - "bada task nahin kar pa raha") - [onStopReason]
+     * is additive (default no-op, so every existing call site, e.g.
+     * [com.brain.offlineai.server.LocalApiServer], is unaffected) and hands
+     * back the real, literal stop reason [BrainNative.nativeGenerate]
+     * already returns ("end_of_generation", "max_tokens", "context_full",
+     * "cancelled") right before the flow closes normally. Before this,
+     * that string was read only to check for an "error:" prefix and then
+     * thrown away - so nothing upstream could ever tell a genuinely
+     * finished reply ("end_of_generation") apart from one that was simply
+     * cut off by [maxTokens] mid-answer ("max_tokens"). ChatViewModel uses
+     * this to know when it's real to keep going with a real follow-up
+     * `generate()` call instead of silently presenting a truncated answer
+     * as if it were complete.
      */
-    fun generate(prompt: String, maxTokens: Int = 512, temperature: Float = 0.7f, topP: Float = 0.9f): Flow<String> =
+    fun generate(
+        prompt: String,
+        maxTokens: Int = 512,
+        temperature: Float = 0.7f,
+        topP: Float = 0.9f,
+        onStopReason: (String) -> Unit = {}
+    ): Flow<String> =
         callbackFlow {
             if (!isLoaded) {
                 close(IllegalStateException("No model loaded"))
@@ -83,6 +103,7 @@ object BrainEngine {
                 if (stopReason.startsWith("error:")) {
                     close(IllegalStateException(stopReason))
                 } else {
+                    onStopReason(stopReason)
                     close()
                 }
             }

@@ -82,7 +82,8 @@ fun BotTextBubble(
     message: ChatMessage,
     artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
     onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
-    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
+    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {},
+    onCancelDownload: (String) -> Unit = {}
 ) {
     BotCardShell {
         Text(message.text, color = BrainTextPrimary, style = MaterialTheme.typography.bodyLarge)
@@ -96,7 +97,8 @@ fun BotTextBubble(
                 downloadStates = artifactDownloadStates,
                 zipDownloadId = "zip-${message.id}",
                 onDownload = onDownloadArtifact,
-                onDownloadAll = onDownloadAllArtifacts
+                onDownloadAll = onDownloadAllArtifacts,
+                onCancelDownload = onCancelDownload
             )
         }
     }
@@ -224,7 +226,8 @@ fun BotCodeDoneBubble(
     message: ChatMessage,
     artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
     onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
-    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
+    onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {},
+    onCancelDownload: (String) -> Unit = {}
 ) {
     BotCardShell {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -268,7 +271,8 @@ fun BotCodeDoneBubble(
                 downloadStates = artifactDownloadStates,
                 zipDownloadId = "zip-${message.id}",
                 onDownload = onDownloadArtifact,
-                onDownloadAll = onDownloadAllArtifacts
+                onDownloadAll = onDownloadAllArtifacts,
+                onCancelDownload = onCancelDownload
             )
         }
     }

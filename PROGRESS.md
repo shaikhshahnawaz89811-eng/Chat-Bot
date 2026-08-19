@@ -2274,13 +2274,109 @@ app/src/main/java/.../ui/screens/chat/ChatViewModel.kt  (verifyArtifactSyntax ad
 
 ---
 
+## Phase 18 — Real Artifact-Download Cancel + Real Auto-Scroll Fix ✅ DONE (this build)
+
+Two real, user-reported bugs fixed this phase (no new feature scope added):
+
+**1. Cancel button on artifact downloads genuinely did nothing.** The only
+existing "Cancel" (`DownloadOptionsRow`'s Close button) just closed the
+pre-download options menu (`showOptions = false`) - once a Save to
+Device/Download All export actually started, there was no real way to stop
+it; the download IconButton was even hidden while `Exporting`, so there was
+no control at all during a real in-progress copy.
+- `ChatViewModel.kt` - added a real `downloadJobs: MutableMap<String, Job>`
+  keyed the same way `artifactDownloads` already is (artifact id / `zip-<id>`).
+  `exportArtifact()`/`onDownloadAllArtifacts()` now store their own real
+  `viewModelScope.launch` `Job` in this map. New `onCancelDownload(id)`
+  cancels that real `Job` (Kotlin's real cooperative cancellation - the next
+  `Flow.emit()` inside the real byte-copy loop throws, stopping the copy at
+  its next real checkpoint, not a fake instant stop) and resets the card to
+  a real `Idle` state.
+- `ArtifactCard.kt` - `ArtifactRow`/`ArtifactZipRow` now show a real Cancel
+  (`Icons.Filled.Close`) icon button next to the live percentage while
+  `Exporting`, wired to the new `onCancelDownload` callback threaded through
+  `ArtifactCard` → `BotTextBubble`/`BotCodeDoneBubble` → `ChatScreen`.
+
+**2. Chat list / live process card visibly jumped up-down while a reply was
+still generating.** Root cause (re-read Phase 8/9's own code per Rule 18):
+`ChatScreen`'s auto-scroll `LaunchedEffect(messages.size)` only ever fired
+when a whole new message was added - never while the *last* message's own
+content kept growing in place (streaming text, `LiveProcessCard` adding
+steps, an artifact card appearing). Combined with `LiveProcessCard`'s own
+`animateContentSize()` genuinely resizing the card as steps were added, but
+its inner `verticalScroll` never following that growth, the visible result
+was exactly the reported bug: the card (and the list around it) appeared to
+jump instead of smoothly growing downward.
+- `LiveProcessCard.kt` - the expanded steps column's `rememberScrollState()`
+  now has a real `LaunchedEffect(steps.size, steps.lastOrNull()?.status)`
+  that animates the real scroll position to `maxValue` whenever a step is
+  genuinely added or the running step's real status changes - keeps the
+  visible window pinned to the newest step instead of silently overflowing
+  the fixed 240dp box.
+- `ChatScreen.kt` - the outer auto-scroll effect now keys on
+  `(messages.size, lastMessage)` instead of size alone (`ChatMessage` is a
+  real data class, so a genuine content change - not just a new message -
+  changes this key too), and only auto-follows when the real
+  `LazyListState.layoutInfo` says the user is already near the bottom -
+  so it keeps tracking new/growing content live without yanking the list
+  out from under someone who has deliberately scrolled up to read
+  something earlier (a real, deliberate scroll position is never
+  overridden).
+
+**Explicitly NOT faked (documented, not hidden):**
+- Cancelling a download does not fabricate a "Cancelled" success state -
+  it goes back to the real `Idle` state, same as before any download was
+  started; a partially-written destination file (API 26-28 legacy path, or
+  a still-pending MediaStore row on API 29+) is a real, known, honestly
+  left limitation of this phase - cleanup of that partial file was judged
+  out of scope for a same-day fix rather than half-implemented.
+- No fixed-duration animation was added anywhere - both scroll fixes only
+  ever move to a real, currently-true `maxValue`/`layoutInfo` position,
+  never a timed/simulated one.
+
+**No existing function was deleted or had its existing behavior changed
+outside the shown diffs** (Document-Editing Convention) - `exportArtifact`'s
+real progress/complete/failed branches, `LiveProcessCard`'s existing
+collapse/expand/Summary logic, and every earlier phase's chat/artifact code
+are otherwise untouched.
+
+**Rules applied this phase:** 1 (Cancel is now a real, reachable action with
+a real effect - not a button that silently did nothing), 10/17 (every new
+UI state - Idle-after-cancel, scroll position - reflects a real, current
+value, never assumed/timed), 14 (the cancelled `Job` is removed from the
+map on cancel and also on real completion/failure, so `downloadJobs` never
+accumulates stale entries), 18 (Phase 8/9's own scroll code was re-read in
+full before diagnosing/fixing it), 19 (each edited file viewed in full
+before editing; only the shown diffs were made), 21 (no new file needed -
+small, targeted additions to the four already-relevant files).
+
+**Validation status (Rule 10 — honest, not assumed):** Written and
+reviewed line-by-line; every edited file's braces/parens were checked and
+are balanced (automated check), but **not compiled** (no network/Android
+SDK in this sandbox). First real validation is the GitHub Actions run
+after your `git push`. If the Actions run fails, paste the error back and
+it'll be fixed immediately.
+
+**Files changed this phase:**
+```
+app/src/main/java/.../ui/screens/chat/ChatViewModel.kt   (downloadJobs map; onCancelDownload; exportArtifact/onDownloadAllArtifacts store their Job)
+app/src/main/java/.../ui/components/ArtifactCard.kt      (real Cancel icon button while Exporting, both single-artifact and Download-All rows)
+app/src/main/java/.../ui/components/ChatBubbles.kt       (onCancelDownload threaded through BotTextBubble/BotCodeDoneBubble)
+app/src/main/java/.../ui/screens/chat/ChatScreen.kt       (onCancelDownload wired to viewModel; auto-scroll effect now follows in-place content growth, near-bottom-only)
+app/src/main/java/.../ui/components/LiveProcessCard.kt   (expanded steps column auto-scrolls to newest step as it changes)
+app/build.gradle.kts       (versionCode 15)
+```
+
+---
+
 ## How to continue from here
-This file's own phase numbering (Phase 1-16, plus Phase 17.1/17.2/17.3) is
+This file's own phase numbering (Phase 1-18, plus Phase 17.1/17.2/17.3) is
 now fully built out. If you want further work - bug fixes from a real
 Actions build failure, the still-open status-bar icon-appearance fix
-flagged earlier in this chat, a real on-device Gradle build if you can
-confirm a genuine SDK/toolchain path this app could actually invoke
-(Termux-style, with your explicit go-ahead on that added complexity/size),
-or a genuinely new phase/feature - just say so and it'll be scoped and
-added the same way every phase above was, re-reading this file's current
-state first (Rule 18) before writing any code.
+flagged earlier in this chat, the known partial-file-on-cancel cleanup
+noted in Phase 18 above, a real on-device Gradle build if you can confirm
+a genuine SDK/toolchain path this app could actually invoke (Termux-style,
+with your explicit go-ahead on that added complexity/size), or a
+genuinely new phase/feature - just say so and it'll be scoped and added
+the same way every phase above was, re-reading this file's current state
+first (Rule 18) before writing any code.

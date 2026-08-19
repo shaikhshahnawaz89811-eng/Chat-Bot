@@ -161,8 +161,22 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(messages.size) {
-        if (messages.isNotEmpty()) {
+    // Real fix: this used to key only on messages.size, so it never
+    // re-fired while the LAST message's own content kept growing in place
+    // (streaming text, a live process card adding steps, an artifact card
+    // appearing) - the list simply stopped following new content until the
+    // next whole message arrived, which is what made everything look like
+    // it was jumping up/down instead of smoothly tracking the bottom. Only
+    // auto-follows when the user is already near the bottom (or it's the
+    // first content), so it never yanks the list out from under someone who
+    // has deliberately scrolled up to read earlier messages.
+    val lastMessage = messages.lastOrNull()
+    LaunchedEffect(messages.size, lastMessage) {
+        if (messages.isEmpty()) return@LaunchedEffect
+        val layoutInfo = listState.layoutInfo
+        val nearBottom = layoutInfo.visibleItemsInfo.isEmpty() ||
+            layoutInfo.visibleItemsInfo.last().index >= messages.size - 2
+        if (nearBottom) {
             scope.launch {
                 listState.animateScrollToItem(messages.size - 1)
             }
@@ -216,7 +230,8 @@ fun ChatScreen(
                             onDownloadArtifact = onDownloadArtifact,
                             onDownloadAllArtifacts = { artifacts ->
                                 viewModel.onDownloadAllArtifacts(message.id, artifacts)
-                            }
+                            },
+                            onCancelDownload = { id -> viewModel.onCancelDownload(id) }
                         )
 
                     message.state == BotMessageState.GENERATING ->
@@ -232,7 +247,8 @@ fun ChatScreen(
                             onDownloadArtifact = onDownloadArtifact,
                             onDownloadAllArtifacts = { artifacts ->
                                 viewModel.onDownloadAllArtifacts(message.id, artifacts)
-                            }
+                            },
+                            onCancelDownload = { id -> viewModel.onCancelDownload(id) }
                         )
                 }
             }
