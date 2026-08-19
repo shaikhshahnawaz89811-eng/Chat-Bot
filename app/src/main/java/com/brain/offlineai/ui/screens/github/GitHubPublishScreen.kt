@@ -63,7 +63,7 @@ fun GitHubPublishScreen(
 
     LaunchedEffect(files) {
         if (viewModel.repoName.isBlank()) {
-            viewModel.setRepoName(suggestRepoName(files.firstOrNull()?.first ?: "site"))
+            viewModel.updateRepoName(suggestRepoName(files.firstOrNull()?.first ?: "site"))
         }
     }
 
@@ -117,7 +117,7 @@ fun GitHubPublishScreen(
             val editable = viewModel.step is GitHubPublishStep.Idle || viewModel.step is GitHubPublishStep.Failed
             OutlinedTextField(
                 value = viewModel.repoName,
-                onValueChange = { viewModel.setRepoName(it) },
+                onValueChange = { viewModel.updateRepoName(it) },
                 label = { Text("Repository name") },
                 singleLine = true,
                 enabled = editable,
@@ -133,7 +133,7 @@ fun GitHubPublishScreen(
             Spacer(Modifier.height(10.dp))
             OutlinedTextField(
                 value = viewModel.customDomain,
-                onValueChange = { viewModel.setCustomDomain(it) },
+                onValueChange = { viewModel.updateCustomDomain(it) },
                 label = { Text("Custom domain (optional)") },
                 placeholder = { Text("mysite.com", color = BrainTextMuted) },
                 singleLine = true,

@@ -42,11 +42,11 @@ class GitHubPublishViewModel(application: Application) : AndroidViewModel(applic
 
     private var publishJob: Job? = null
 
-    fun setRepoName(value: String) {
+    fun updateRepoName(value: String) {
         repoName = value
     }
 
-    fun setCustomDomain(value: String) {
+    fun updateCustomDomain(value: String) {
         customDomain = value
     }
 
