@@ -567,6 +567,12 @@ class ChatViewModel(
     private suspend fun streamRealResponse(activeSessionId: String, prompt: String, zipEditTarget: ZipEditTarget? = null): Long {
         val botId = nextId++
         val builder = StringBuilder()
+        // Bug fix (user request) - set only once, the first moment a real
+        // fence shows up in the streamed text so far. From that point on,
+        // botId stays the prose card (finalized, no longer updated) and
+        // codeId becomes its own separate, genuinely distinct card for the
+        // code - never the same card changing its own look mid-stream.
+        var codeId: Long? = null
 
         upsertBotMessage(
             botId,
@@ -587,24 +593,51 @@ class ChatViewModel(
         BrainEngine.generate(prompt, temperature = settings.temperature, topP = settings.topP)
             .onCompletion { cause ->
                 if (cause == null) {
-                    val finalText = builder.toString().ifBlank { "(model returned no output)" }
-                    val renderedMessage = renderMessage(botId, finalText, BotMessageState.TEXT)
-                    // Phase 11 (Artifact card + ZIP/file output + download
-                    // flow) - only a genuinely *completed* response's fenced
-                    // blocks become real files; nothing is extracted while
-                    // still streaming.
-                    val finalMessage = attachArtifactsOrPatchZip(activeSessionId, renderedMessage, zipEditTarget)
-                    // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
-                    // runs when [finalMessage] genuinely has real artifacts
-                    // AND at least one of them is real app/project source
-                    // (.kt/.java/.xml/.gradle*) - an ordinary text-only reply
-                    // or a single unrelated file is untouched, same as before
-                    // this phase (Document-Editing Convention).
-                    if (isAppProjectArtifactSet(finalMessage.artifacts)) {
-                        animateAppCreationPipeline(botId, prompt, finalMessage)
+                    val finalFull = builder.toString().ifBlank { "(model returned no output)" }
+                    val finalSplit = splitIntroAndCode(finalFull)
+                    val finalCodeId = codeId
+                    if (finalSplit.codeLines == null || finalCodeId == null) {
+                        // No real fence ever appeared - unchanged, single
+                        // plain-text card, same as every earlier phase.
+                        val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                        upsertBotMessage(botId, renderedMessage)
+                        persistMessage(activeSessionId, renderedMessage)
+                    } else {
+                        // Finalize the prose card (or drop it if there
+                        // genuinely was no prose before the fence).
+                        if (finalSplit.introText.isNotBlank()) {
+                            val introMessage = ChatMessage(id = botId, text = finalSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                            upsertBotMessage(botId, introMessage)
+                            persistMessage(activeSessionId, introMessage)
+                        } else {
+                            removeBotMessage(botId)
+                        }
+                        // Phase 11 (Artifact card + ZIP/file output +
+                        // download flow) - only a genuinely *completed*
+                        // response's fenced blocks become real files;
+                        // nothing is extracted while still streaming. Runs
+                        // against the full raw text (fence markers intact)
+                        // since ArtifactExtractor needs those to find every
+                        // real block, not just the first one this card
+                        // shows live.
+                        val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines)
+                        var finalCodeMessage = attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
+                        // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
+                        // runs when [finalCodeMessage] genuinely has real
+                        // artifacts AND at least one of them is real
+                        // app/project source (.kt/.java/.xml/.gradle*).
+                        // Bug fix (user request) - [animateAppCreationPipeline]
+                        // now also builds a real zip for a genuine multi-file
+                        // build, so its returned message (with that zip
+                        // appended to its real artifact list when it
+                        // happened) replaces [finalCodeMessage] here rather
+                        // than being discarded.
+                        if (isAppProjectArtifactSet(finalCodeMessage.artifacts)) {
+                            finalCodeMessage = animateAppCreationPipeline(finalCodeId, activeSessionId, prompt, finalCodeMessage)
+                        }
+                        upsertBotMessage(finalCodeId, finalCodeMessage)
+                        persistMessage(activeSessionId, finalCodeMessage)
                     }
-                    upsertBotMessage(botId, finalMessage)
-                    persistMessage(activeSessionId, finalMessage)
                     // Real final count, written once per completed generation
                     // (not per streamed token) - Rule 20 minimal-necessary-payload.
                     analyticsStore.addTokensGenerated(tokenCount.toLong())
@@ -621,10 +654,19 @@ class ChatViewModel(
                     // already cancelled by the time onCompletion runs, so an
                     // ordinary suspend DB write would be rejected immediately.
                     kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                        val partialText = builder.toString()
-                        if (partialText.isNotBlank()) {
-                            val partialMessage = renderMessage(botId, partialText, BotMessageState.TEXT)
-                            persistMessage(activeSessionId, partialMessage)
+                        val partialFull = builder.toString()
+                        if (partialFull.isNotBlank()) {
+                            val partialSplit = splitIntroAndCode(partialFull)
+                            val partialCodeId = codeId
+                            if (partialSplit.codeLines == null || partialCodeId == null) {
+                                val partialMessage = ChatMessage(id = botId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                                persistMessage(activeSessionId, partialMessage)
+                            } else {
+                                if (partialSplit.introText.isNotBlank()) {
+                                    persistMessage(activeSessionId, ChatMessage(id = botId, text = partialSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                                }
+                                persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = partialSplit.codeLines))
+                            }
                         }
                     }
                 }
@@ -634,19 +676,49 @@ class ChatViewModel(
                 // failure no longer becomes a single flat SYSTEM_NOTE; it
                 // runs through the real Error -> Investigating -> Root
                 // cause -> Fixing -> Re-testing -> Verified sequence below.
-                handleGenerationFailure(botId, activeSessionId, prompt, settings, e)
+                // Bug fix (user request) - [handleGenerationFailure] now
+                // returns the real id of whichever message genuinely ends
+                // up holding the final result (the single TEXT/SYSTEM_NOTE
+                // card, or - once its own retry success also splits into
+                // intro+code - the real separate code card's own new id).
+                // That id is written into this function's own [codeId], the
+                // exact var the real `return codeId ?: botId` below already
+                // reads, so a retry that recovers via a genuinely different
+                // id is never silently dropped in favor of the stale [botId].
+                codeId = handleGenerationFailure(botId, activeSessionId, prompt, settings, e)
             }
             .collect { piece ->
                 builder.append(piece)
                 tokenCount++
-                upsertBotMessage(botId, renderMessage(botId, builder.toString(), BotMessageState.GENERATING, tokenCount))
+                val full = builder.toString()
+                val split = splitIntroAndCode(full)
+                if (split.codeLines == null) {
+                    // Still just prose - this stays the one live card, same
+                    // GENERATING bubble as before any fence ever appears.
+                    upsertBotMessage(botId, ChatMessage(id = botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = tokenCount))
+                } else {
+                    if (codeId == null) {
+                        // The fence just appeared for the first time - the
+                        // prose card is done changing now, freeze it as its
+                        // own real, separate finished card (or remove it
+                        // entirely if there was no real prose before the
+                        // fence at all).
+                        if (split.introText.isNotBlank()) {
+                            upsertBotMessage(botId, ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                        } else {
+                            removeBotMessage(botId)
+                        }
+                        codeId = nextId++
+                    }
+                    upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
+                }
             }
         // Reached only after the whole real flow above has genuinely
         // completed (onCompletion/catch have already run and their own
         // real suspend work - persistMessage - has already finished, since
         // both are suspend operators inside this same collected flow), so
-        // messages.value already holds botId's real final state here.
-        return botId
+        // messages.value already holds both real card(s)' final state here.
+        return codeId ?: botId
     }
 
     /**
@@ -681,6 +753,17 @@ class ChatViewModel(
      * ends on a real [BotMessageState.SYSTEM_NOTE] naming the real root
      * cause and the real suggested next action - never a fabricated
      * "fixed" state.
+     *
+     * Bug fix (user request) - a genuinely successful retry's recovered
+     * text now goes through the exact same [splitIntroAndCode] intro/code
+     * split [streamRealResponse]'s own completion path already uses, so a
+     * recovered response with a real fenced block gets the same two
+     * separate, genuine cards (prose card + its own code card) instead of
+     * the old single card that used to hide the intro behind the code.
+     * Returns the real id of whichever message genuinely ends up being the
+     * final one - [botId] itself for the plain-text/SYSTEM_NOTE cases, or
+     * the real new id handed to the split-off code card - so the caller
+     * can correctly track which message actually holds the real outcome.
      */
     private suspend fun handleGenerationFailure(
         botId: Long,
@@ -688,7 +771,7 @@ class ChatViewModel(
         prompt: String,
         settings: ModelSettings,
         error: Throwable
-    ) {
+    ): Long {
         val steps = mutableListOf(
             ProcessStep(
                 id = 1L,
@@ -764,16 +847,43 @@ class ChatViewModel(
         }
 
         if (recoveredText != null) {
-            val renderedMessage = renderMessage(botId, recoveredText, BotMessageState.TEXT)
-            val finalMessage = attachArtifactsIfAny(activeSessionId, renderedMessage)
-            upsertBotMessage(botId, finalMessage)
-            persistMessage(activeSessionId, finalMessage)
-            analyticsStore.addTokensGenerated(recoveredTokenCount.toLong())
+            // Same real intro/code boundary [streamRealResponse]'s own
+            // completion path uses - a recovered response with no real
+            // fence at all still renders exactly as before (single TEXT
+            // card, [botId] unchanged).
+            val split = splitIntroAndCode(recoveredText)
+            if (split.codeLines == null) {
+                val renderedMessage = renderMessage(botId, recoveredText, BotMessageState.TEXT)
+                val finalMessage = attachArtifactsIfAny(activeSessionId, renderedMessage)
+                upsertBotMessage(botId, finalMessage)
+                persistMessage(activeSessionId, finalMessage)
+                analyticsStore.addTokensGenerated(recoveredTokenCount.toLong())
+                return botId
+            } else {
+                // Finalize the prose card (or drop it if there genuinely
+                // was no prose before the fence) - identical convention to
+                // [streamRealResponse]'s own completion handling.
+                if (split.introText.isNotBlank()) {
+                    val introMessage = ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                    upsertBotMessage(botId, introMessage)
+                    persistMessage(activeSessionId, introMessage)
+                } else {
+                    removeBotMessage(botId)
+                }
+                val recoveredCodeId = nextId++
+                val codeRendered = ChatMessage(id = recoveredCodeId, text = recoveredText, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = split.codeLines)
+                val finalCodeMessage = attachArtifactsIfAny(activeSessionId, codeRendered)
+                upsertBotMessage(recoveredCodeId, finalCodeMessage)
+                persistMessage(activeSessionId, finalCodeMessage)
+                analyticsStore.addTokensGenerated(recoveredTokenCount.toLong())
+                return recoveredCodeId
+            }
         } else {
             val note = "Generation error: ${category.rootCauseLabel}. ${category.userSuggestion}"
             val errorMessage = ChatMessage(id = botId, text = note, isUser = false, timestamp = timeNow(), state = BotMessageState.SYSTEM_NOTE)
             upsertBotMessage(botId, errorMessage)
             persistMessage(activeSessionId, errorMessage)
+            return botId
         }
     }
 
@@ -1052,8 +1162,25 @@ class ChatViewModel(
      * actually happen; this only re-paces the reveal of already-real,
      * already-finished work (Rule 1/10 - no fake state, only real state
      * shown with real timing instead of all at once).
+     *
+     * Bug fix (user request) - Packaging used to be a pure animation step
+     * with no real ZIP ever built behind it; the user had to separately
+     * tap "Download All" to get one. Now, once a real multi-file build
+     * genuinely passes ([verifyArtifactSyntax]), Packaging also does the
+     * real work: [ArtifactFileManager.createZip] over the exact same real
+     * files already on disk, persisted the same way any other artifact is
+     * ([ArtifactRepository.save] - no second persistence mechanism
+     * invented), and appended to the returned message's own artifact list
+     * so the zip shows up as a real, already-downloadable artifact without
+     * an extra manual step. A failed build still returns early with no
+     * zip attempted - packaging a build that just failed its own check
+     * would misrepresent a real failure as success (Rule 17), same as
+     * before this fix. Returns the real, possibly zip-augmented message so
+     * the caller persists/displays the same final artifact set the user
+     * actually sees.
      */
-    private suspend fun animateAppCreationPipeline(botId: Long, prompt: String, finalMessage: ChatMessage) {
+    private suspend fun animateAppCreationPipeline(botId: Long, activeSessionId: String, prompt: String, finalMessage: ChatMessage): ChatMessage {
+        var resultMessage = finalMessage
         val fileNames = finalMessage.artifacts.map { it.fileName }
         val steps = mutableListOf<ProcessStep>()
         var nextStepId = 1L
@@ -1115,14 +1242,57 @@ class ChatViewModel(
             delay(280)
             // Real early stop - Packaging a build that just failed its own
             // check would misrepresent a real failure as success (Rule 17).
-            return
+            // No zip attempted, [resultMessage] returned unchanged.
+            return resultMessage
         }
 
         // PACKAGING - only when there's genuinely more than one real file,
-        // same real condition [buildArtifactSteps] already uses above.
+        // same real condition [buildArtifactSteps] already uses above. Now
+        // also does the real zip work (see doc above), not just the
+        // animation - a real build failure above already returned before
+        // this point, so a zip is only ever built from a genuinely
+        // verified real file set.
         if (fileNames.size > 1) {
             pushRunning(ProcessMarking.PACKAGING)
-            completeLast()
+            val zipInfo = runCatching {
+                val zipFile = artifactFileManager.createZip(
+                    resultMessage.artifacts.map { File(it.storedPath) },
+                    "project_$botId.zip"
+                )
+                val info = ArtifactInfo(
+                    id = UUID.randomUUID().toString(),
+                    fileName = zipFile.name,
+                    sizeBytes = zipFile.length(),
+                    kind = classifyArtifact(zipFile.name),
+                    mimeType = mimeTypeForArtifact(zipFile.name),
+                    storedPath = zipFile.absolutePath
+                )
+                artifactRepository.save(
+                    ArtifactEntity(
+                        id = info.id,
+                        sessionId = activeSessionId,
+                        messageId = botId,
+                        fileName = info.fileName,
+                        mimeType = info.mimeType,
+                        kind = info.kind.name,
+                        sizeBytes = info.sizeBytes,
+                        storedPath = info.storedPath,
+                        createdAt = System.currentTimeMillis()
+                    )
+                )
+                info
+            }.getOrNull()
+            if (zipInfo != null) {
+                resultMessage = resultMessage.copy(artifacts = resultMessage.artifacts + zipInfo)
+                completeLast()
+            } else {
+                // Real failure (disk/IO) - reported as a real FAILED step,
+                // never a fabricated "packaged" success (Rule 1/10). The
+                // individual files are still real and still in
+                // [resultMessage]'s own artifact list either way.
+                val last = steps.removeAt(steps.lastIndex)
+                steps.add(last.copy(status = ProcessStepStatus.FAILED, label = "Packaging failed"))
+            }
         }
 
         upsertBotMessage(
@@ -1130,6 +1300,7 @@ class ChatViewModel(
             ChatMessage(id = botId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.PROCESS, processSteps = steps.toList())
         )
         delay(220)
+        return resultMessage
     }
 
     /**
@@ -1261,6 +1432,40 @@ class ChatViewModel(
                 state = state, generationProgress = tokenCount
             )
         }
+    }
+
+    /**
+     * Bug fix (user request) - the model's own prose before a fenced code
+     * block and the code itself now render as two genuinely separate
+     * cards, never one card that morphs and hides the earlier part. This
+     * is the shared split logic both the live streaming path (in
+     * [streamRealResponse]'s `.collect`) and the final-completion path
+     * use, so both see the exact same real fence/intro boundary.
+     *
+     * [SplitContent.codeLines] is null until a real fence has actually
+     * appeared in [text] so far - a null result means "still just prose,
+     * don't create a code card yet", not "no code exists".
+     */
+    private data class SplitContent(val introText: String, val codeLines: List<String>?)
+
+    private fun splitIntroAndCode(text: String): SplitContent {
+        if (!text.contains("```")) return SplitContent(text, null)
+        val introText = text.substringBefore("```").trim()
+        val afterFence = text.substringAfter("```")
+        val firstLine = afterFence.substringBefore('\n')
+        val body = if (firstLine.isNotBlank() && !afterFence.startsWith("\n")) {
+            afterFence.substringAfter('\n', "")
+        } else afterFence
+        val codeBody = body.substringBefore("```").lines()
+        return SplitContent(introText, codeBody)
+    }
+
+    /** Real removal - used when a message never actually had any real prose
+     *  of its own (the model went straight into a fence with nothing
+     *  before it), so no empty/ghost text card is left behind once its
+     *  content has moved to a real, separate code card. */
+    private fun removeBotMessage(id: Long) {
+        messages.value = messages.value.filterNot { it.id == id }
     }
 
     private suspend fun postSystemNote(activeSessionId: String, text: String) {

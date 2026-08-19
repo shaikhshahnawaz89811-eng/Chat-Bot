@@ -32,27 +32,43 @@ fun ChatScreen(
     openSessionId: String? = null,
     viewModel: ChatViewModel = run {
         val context = LocalContext.current
-        // Bug fix: this used to re-read CurrentChatSessionStore on every
-        // recomposition. ChatViewModel.ensureSession() writes a brand-new
-        // session id into that same store the instant the FIRST message of
-        // a fresh chat is sent - while generation is still streaming. That
-        // write used to change `restoredSessionId` on the next
-        // recomposition, which changed the `key` passed to viewModel(...)
-        // below, which made Compose throw away the in-flight ChatViewModel
-        // and create a brand-new one (openSessionId now non-null) that
-        // never actually sent anything - explaining both the silent first
-        // message and the frozen "Thinking" card on the second one (both
-        // instances then race the single shared BrainEngine native
-        // context). `remember(openSessionId)` captures the restored id
-        // exactly once per real navigation into this screen, so a later
-        // CurrentChatSessionStore.set() from inside an already-running
-        // ChatViewModel can never re-key this composable mid-generation.
+        // Bug fix #1 (still needed): don't re-read CurrentChatSessionStore
+        // on every recomposition - ChatViewModel.ensureSession() writes a
+        // brand-new session id into that same store the instant the FIRST
+        // message of a fresh chat is sent, while generation is still
+        // streaming. remember(openSessionId) captures the restored id once
+        // per real entry into this composable instead of tracking that
+        // live write.
         val restoredSessionId = remember(openSessionId) {
             openSessionId ?: CurrentChatSessionStore.get(context)
         }
         val application = context.applicationContext as android.app.Application
+        // Bug fix #2: the viewModel() `key` must depend ONLY on the real
+        // nav-route argument (`openSessionId` - null for the bottom-nav
+        // Chat tab, a fixed sessionId for Screen.ChatSession), never on
+        // `restoredSessionId`. This screen's whole Composable function gets
+        // disposed the moment you navigate to another bottom-nav
+        // destination (only the current NavHost entry stays composed), so
+        // fix #1's `remember` is thrown away too - and re-entering the Chat
+        // tab used to recompute restoredSessionId fresh, now finding the
+        // *same* session id ensureSession() had already written to the
+        // store mid-generation. That changed the key from "current" to a
+        // real session id, so viewModel(key=...) couldn't find the
+        // existing (still-running, ViewModelStore-preserved) instance under
+        // "current" and created a second, orphaned one instead - the
+        // in-flight generation kept running invisibly, so returning to Chat
+        // looked "refreshed" (only whatever was already persisted showed),
+        // and opening the same session from History showed only the user's
+        // message if the orphaned instance hadn't persisted the bot reply
+        // yet. Keying purely on `openSessionId` keeps "current" stable for
+        // the whole lifetime of the Chat tab's NavBackStackEntry, so
+        // switching tabs and back reliably finds and reattaches to the same
+        // ChatViewModel - restoredSessionId is still passed to the Factory
+        // so a truly fresh process launch still restores the last session's
+        // history, just without ever changing which ViewModel instance
+        // that is once created.
         viewModel(
-            key = restoredSessionId ?: "current",
+            key = openSessionId ?: "current",
             factory = ChatViewModel.Factory(application, restoredSessionId)
         )
     }

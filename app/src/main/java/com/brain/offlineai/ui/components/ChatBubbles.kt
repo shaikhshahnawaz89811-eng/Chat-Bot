@@ -169,6 +169,14 @@ private fun ThinkingStepRow(step: ThinkingStep) {
     }
 }
 
+/**
+ * Bug-fix history: this card used to also render the model's pre-fence
+ * prose (as a stop-gap before the two were split into genuinely separate
+ * cards). Now that [ChatViewModel.streamRealResponse] emits that prose as
+ * its own, separate finished [BotTextBubble]-style card, this one goes
+ * back to rendering only the real code it owns - showing the intro here
+ * too would just duplicate the other card.
+ */
 @Composable
 fun BotCodingBubble(message: ChatMessage) {
     BotCardShell {
