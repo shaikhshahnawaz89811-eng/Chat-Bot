@@ -70,6 +70,7 @@ import com.brain.offlineai.ui.tasks.TaskStatus
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -1771,21 +1772,53 @@ class ChatViewModel(
             ProcessMarking.PLANNING,
             "Planning project files with the local model"
         )
-        val planningPrompt = PlanningEngine.buildPlanningPrompt(originalRequest, extraContextBlock)
+        // Bug fix (user request - planning step hangs forever with no way
+        // to stop it). Same reasoning as [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP]
+        // below: the full [extraContextBlock] (web-search results, etc.)
+        // going into the planning prompt uncapped was making the prompt
+        // genuinely large, which made prefill on-device slow enough to
+        // look and feel stuck. Trimmed here the same honest way per-file
+        // prompts already are, just with a larger real cap since planning
+        // genuinely needs more of the original context than a single file
+        // does.
+        val trimmedPlanningExtraContext = if (extraContextBlock.length > PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
+            extraContextBlock.take(PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for planning)"
+        } else extraContextBlock
+        val planningPrompt = PlanningEngine.buildPlanningPrompt(originalRequest, trimmedPlanningExtraContext)
+        // Bug fix (user request - "kaam yahin ruk jata hai, rokne ki
+        // koshish kar raha hu ho nahin raha"). [generateOnce] previously
+        // had no real ceiling on how long it could take, and cancelling
+        // [generationJob] only takes effect once the native decode loop
+        // actually calls back for a token - which never happens during a
+        // long prompt-eval (prefill) pass on a big prompt, so Stop looked
+        // like it did nothing. [withTimeoutOrNull] now gives this one real
+        // call a fixed, honest ceiling: past it, the coroutine is
+        // cancelled the same way a real user Stop would cancel it (see
+        // [BrainEngine.generate]'s own cancellation doc), so the planning
+        // step can never again run indefinitely with no way out.
+        var planningTimedOut = false
         val (planningRaw, _) = try {
-            generateOnce(planningPrompt)
+            withTimeoutOrNull(PLANNING_GENERATION_TIMEOUT_MS) { generateOnce(planningPrompt) }
+                ?: run { planningTimedOut = true; "" to "timeout" }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             "" to "error"
         }
-        val plan = PlanningEngine.parsePlan(planningRaw)
+        val plan = if (planningTimedOut) null else PlanningEngine.parsePlan(planningRaw)
         if (plan == null) {
             // Real, honest "not confident enough" outcome - remove the
             // planning-only card entirely (Rule 17 - never leave a
             // half-finished real card behind) and let the caller fall
             // back to the existing, unaffected single-response flow.
             removeBotMessage(planBotId)
+            if (planningTimedOut) {
+                completeStep(planningStepId, failed = true, label = "Planning timed out")
+                postSystemNote(
+                    activeSessionId,
+                    "Planning took too long on-device and was stopped after ${PLANNING_GENERATION_TIMEOUT_MS / 1000}s - continuing with a single-response reply instead."
+                )
+            }
             return false
         }
         completeStep(planningStepId, label = "Planning complete")
@@ -2228,6 +2261,32 @@ class ChatViewModel(
          * signature - never the full original dump).
          */
         private const val FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 600
+
+        /**
+         * Bug fix (user request - planning step could hang forever with no
+         * way to stop it). Real, fixed ceiling on the one-shot planning
+         * [generateOnce] call - same "bounded, never infinite" posture as
+         * every other cap in this file. Generous enough for genuine
+         * on-device prefill + a short file-list reply to finish under
+         * normal conditions, but never unbounded: past this, the call is
+         * honestly cancelled and the caller falls back to the existing
+         * single-response flow instead of sitting stuck with a Stop button
+         * that cannot reach a still-prefilling native call.
+         */
+        private const val PLANNING_GENERATION_TIMEOUT_MS = 45_000L
+
+        /**
+         * Bug fix (user request) - same real reasoning as
+         * [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP], applied to the planning
+         * prompt itself. The planning prompt previously carried the full,
+         * uncapped [extraContextBlock] (e.g. entire web-search results
+         * text) - genuinely large enough on its own to make on-device
+         * prefill slow. Capped higher than the per-file cap since planning
+         * genuinely needs more of the original context to name a sensible
+         * file list, but still a real, bounded snippet rather than the
+         * whole thing.
+         */
+        private const val PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 1500
     }
 
     /**

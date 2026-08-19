@@ -3821,3 +3821,25 @@ app/src/main/java/.../data/github/GitHubPublishRepository.kt (publish() customDo
 app/src/main/java/.../ui/screens/github/GitHubPublishViewModel.kt (customDomain state + setCustomDomain())
 app/src/main/java/.../ui/screens/github/GitHubPublishScreen.kt    (custom-domain field; DnsInstructionsCard; SettingCustomDomain progress row)
 ```
+
+## Bug fix (user request) - planning step hangs forever, Stop doesn't work
+- Root cause: [ChatViewModel.buildMultiFileProject]'s planning-step call to
+  `BrainEngine.generate` (via `generateOnce`) had no timeout. Cancelling
+  `generationJob` (Stop button) only takes effect once the native decode
+  loop calls back per generated token - during a long prompt-eval
+  (prefill) pass on a large prompt, that never happens, so Stop appeared
+  to do nothing and the "Planning project files with the local model"
+  step could sit at 0/1 indefinitely.
+- Also: the planning prompt carried the full, uncapped `extraContextBlock`
+  (e.g. entire web-search results text), making prefill on-device slower
+  than necessary.
+- Fix: added `PLANNING_GENERATION_TIMEOUT_MS` (45s) real ceiling via
+  `withTimeoutOrNull` around the planning `generateOnce` call - on
+  timeout, the planning card is honestly removed, a system note explains
+  what happened, and the caller falls back to the existing single-response
+  flow, exactly like the existing `plan == null` case. Also added
+  `PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP` (1500 chars) to trim
+  `extraContextBlock` before it goes into the planning prompt, same
+  pattern `FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP` already uses for per-file
+  prompts. No existing function removed or renamed; only additive changes
+  inside `buildMultiFileProject`.
