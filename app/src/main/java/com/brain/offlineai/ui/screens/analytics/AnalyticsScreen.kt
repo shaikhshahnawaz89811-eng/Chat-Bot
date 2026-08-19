@@ -65,6 +65,7 @@ fun AnalyticsScreen(viewModel: AnalyticsViewModel = viewModel()) {
                 is EngineState.Loading -> "Loading model..." to BrainWarningAmber
                 is EngineState.Error -> "Error" to BrainDangerRed
                 is EngineState.Unloaded -> "No model loaded" to BrainTextMuted
+                is EngineState.ThermalPaused -> "Paused - device cooling down" to BrainWarningAmber
             }
             InfoLine("Status", label, color)
             InfoLine(

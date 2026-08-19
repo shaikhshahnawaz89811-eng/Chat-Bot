@@ -132,6 +132,7 @@ private fun EngineStateCard(state: EngineState) {
         is EngineState.Loading -> "Loading ${state.modelName}..." to BrainPurplePrimary
         is EngineState.Loaded -> "Loaded - ${state.modelName} (ctx ${state.contextSize})" to BrainSuccessGreen
         is EngineState.Error -> "Error" to BrainDangerRed
+        is EngineState.ThermalPaused -> "Paused - device cooling down" to BrainWarningAmber
     }
     Row(
         modifier = Modifier

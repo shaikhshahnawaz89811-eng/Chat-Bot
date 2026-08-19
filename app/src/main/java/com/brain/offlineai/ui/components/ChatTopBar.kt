@@ -41,6 +41,7 @@ fun ChatTopBar(title: String, onMenuClick: () -> Unit) {
         is EngineState.Loading -> "Loading..." to BrainWarningAmber
         is EngineState.Error -> "Error" to BrainDangerRed
         is EngineState.Unloaded -> "No model" to BrainTextMuted
+        is EngineState.ThermalPaused -> "Cooling down..." to BrainWarningAmber
     }
 
     Row(

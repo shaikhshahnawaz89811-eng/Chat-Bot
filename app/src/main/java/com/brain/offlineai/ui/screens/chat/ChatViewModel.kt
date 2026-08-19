@@ -1544,7 +1544,7 @@ class ChatViewModel(
                     sessionId = activeSessionId,
                     continuationPrompt = continuationPrompt,
                     pausedAtStatus = pausedStatus,
-                    now = timeNow()
+                    now = System.currentTimeMillis()
                 )
                 BrainEngine.pauseForThermal()
                 postSystemNote(
@@ -1998,7 +1998,7 @@ class ChatViewModel(
      * model's own reply on top of the prompt itself.
      */
     /** Real, fixed cap on how many earlier files' full content one per-file prompt can carry - same bounded-not-unbounded posture every other real cap in this file already holds itself to. */
-    private const val MAX_RELATED_FILES_IN_CONTEXT = 3
+    private val MAX_RELATED_FILES_IN_CONTEXT = 3
 
     /**
      * Weakness-review fix ("jis chiz ke liye kaam kar raha hoon us file ko
