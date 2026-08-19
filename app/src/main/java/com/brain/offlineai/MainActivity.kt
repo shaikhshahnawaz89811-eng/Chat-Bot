@@ -1,6 +1,10 @@
 package com.brain.offlineai
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -12,6 +16,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
@@ -34,6 +39,7 @@ import com.brain.offlineai.ui.screens.apikeys.CreateApiKeyScreen
 import com.brain.offlineai.ui.screens.apikeys.KeyDetailsScreen
 import com.brain.offlineai.ui.screens.apikeys.KeyOptionsScreen
 import com.brain.offlineai.ui.screens.chat.ChatScreen
+import com.brain.offlineai.ui.screens.chat.CurrentChatSessionStore
 import com.brain.offlineai.ui.screens.history.HistoryScreen
 import com.brain.offlineai.ui.screens.localapi.LocalApiScreen
 import com.brain.offlineai.ui.screens.modelsettings.ModelSettingsScreen
@@ -73,10 +79,34 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun BrainApp() {
     val navController = rememberNavController()
+    val context = LocalContext.current
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = backStackEntry?.destination?.route ?: Screen.Chat.route
+
+    // Bug fix (user request) - "app kill na ho": the single most effective
+    // real, programmatic protection Android actually offers against the OS
+    // killing this process in the background is exempting it from Doze/
+    // App Standby battery restrictions (on top of ChatTaskForegroundService
+    // already raising this process's priority while a reply is actively
+    // generating - see that class's own doc). This shows the REAL system
+    // dialog once per install (skipped instantly if already granted, e.g.
+    // on every later launch) - it can't be silently auto-granted, Android
+    // requires the user to explicitly approve it.
+    LaunchedEffect(Unit) {
+        val powerManager = context.getSystemService(PowerManager::class.java)
+        val alreadyIgnoring = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        if (!alreadyIgnoring) {
+            runCatching {
+                context.startActivity(
+                    Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                        data = Uri.parse("package:${context.packageName}")
+                    }
+                )
+            }
+        }
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -109,7 +139,27 @@ fun BrainApp() {
                     ChatScreen(onMenuClick = { scope.launch { drawerState.open() } })
                 }
                 composable(Screen.History.route) {
-                    HistoryScreen(onOpenSession = { sessionId -> navController.navigate(Screen.ChatSession.routeFor(sessionId)) })
+                    HistoryScreen(onOpenSession = { sessionId ->
+                        // Bug fix (user request) - the bottom-nav Chat tab
+                        // (Screen.Chat) and Screen.ChatSession are two
+                        // genuinely separate NavBackStackEntries, each with
+                        // its own ChatViewModel instance. Screen.ChatSession
+                        // only ever loads what's already persisted in the
+                        // DB, so opening the CURRENTLY-active session that
+                        // way (e.g. while it's still generating a reply)
+                        // showed a disconnected, stale copy that never saw
+                        // the real live stream - looked like "the work isn't
+                        // shown happening". If the tapped session really is
+                        // the live one, route back into the same Chat tab
+                        // instance instead of spinning up a second, orphaned
+                        // ChatViewModel for it.
+                        val activeSessionId = CurrentChatSessionStore.get(context)
+                        if (sessionId == activeSessionId) {
+                            navController.navigateSingleTop(Screen.Chat.route)
+                        } else {
+                            navController.navigate(Screen.ChatSession.routeFor(sessionId))
+                        }
+                    })
                 }
                 composable(
                     route = Screen.ChatSession.route,

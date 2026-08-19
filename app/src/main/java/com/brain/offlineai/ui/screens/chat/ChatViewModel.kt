@@ -158,6 +158,18 @@ class ChatViewModel(
 
     private var nextId = 1L
 
+    /**
+     * Bug fix (user request) - the real Job behind [sendMessage]'s
+     * `viewModelScope.launch { ... }`, captured so [stopGeneration] can
+     * actually cancel a real, in-flight generation instead of only being
+     * able to stop it by leaving the screen (which cleared the ViewModel).
+     * [streamRealResponse]'s `onCompletion` cancellation branch already
+     * persists whatever partial text had genuinely streamed so far, so
+     * cancelling this Job here reuses that same real, existing save path -
+     * nothing about a stopped reply is silently thrown away.
+     */
+    private var generationJob: Job? = null
+
     init {
         if (openSessionId != null) {
             viewModelScope.launch { loadExistingSession(openSessionId) }
@@ -313,7 +325,7 @@ class ChatViewModel(
         messages.value = messages.value + userMessage
         analyticsStore.incrementMessagesSent()
 
-        viewModelScope.launch {
+        generationJob = viewModelScope.launch {
             ChatTaskForegroundService.start(getApplication())
             // Real bug fix: everything below this point used to run inside a
             // try { ... } finally { ... } with NO catch. Any genuine throw
@@ -494,9 +506,27 @@ class ChatViewModel(
                 }
             } finally {
                 isBusy.value = false
+                generationJob = null
                 ChatTaskForegroundService.stop(getApplication())
             }
         }
+    }
+
+    /**
+     * Bug fix (user request) - real "Stop" action, wired to the spot that
+     * used to be the Send button while a real generation is in flight.
+     * Cancelling [generationJob] cancels the real coroutine collecting
+     * [BrainEngine.generate]'s flow, which - per
+     * [BrainEngine.generate]'s own doc - genuinely stops the underlying
+     * llama.cpp decode loop too, not just the UI collection. Whatever text
+     * had actually streamed so far is still saved: [streamRealResponse]'s
+     * `onCompletion` cancellation branch runs regardless of *why* the Job
+     * was cancelled (leaving the screen or this explicit stop), so a
+     * stopped reply is persisted the same honest way a genuinely
+     * interrupted one always was.
+     */
+    fun stopGeneration() {
+        generationJob?.cancel()
     }
 
     /** Real session creation on first send only - see class doc above for why this stays lazy. */
@@ -585,6 +615,26 @@ class ChatViewModel(
 
         val settings = settingsRepository.getSettings()
         var tokenCount = 0
+        // Bug fix (user request) - this is a memory-heavy, largeHeap,
+        // on-device LLM app: Android's low-memory killer genuinely
+        // reclaims this whole process while it's backgrounded far more
+        // often than a typical app, not just an Activity destroy/recreate.
+        // A hard process kill runs none of onCompletion's cancellation
+        // cleanup (that only fires for a graceful coroutine cancellation,
+        // e.g. leaving the screen while the process stays alive) - so
+        // without this, a reply that was still streaming when the OS
+        // killed the process was NEVER written to disk at all, and came
+        // back missing entirely (both from the Chat tab and from History,
+        // since both only ever read what's actually in the DB).
+        // [ChatHistoryDao.upsertMessage]'s own doc already says it exists
+        // for exactly this ("called on every token update while a
+        // response streams in") but nothing here was actually calling it
+        // during the live stream - only once, at the very end. Persisting
+        // every few tokens (not literally every single one, to avoid a DB
+        // write per token) keeps a real, recent on-disk copy so even a
+        // genuine kill mid-stream leaves whatever the model had actually
+        // produced so far, instead of the whole reply vanishing.
+        val persistEveryNTokens = 8
 
         upsertBotMessage(
             botId,
@@ -711,6 +761,20 @@ class ChatViewModel(
                         codeId = nextId++
                     }
                     upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
+                }
+                // Bug fix (user request) - real, periodic on-disk copy of
+                // whatever has genuinely streamed so far, keyed to the
+                // same id the final message will use (botId while still
+                // plain prose, codeId once a fence has appeared) so this
+                // upsert and the final persistMessage() write the same
+                // row - never a stray leftover partial row under a
+                // different id. See [persistEveryNTokens]'s doc above for
+                // why this exists.
+                if (tokenCount % persistEveryNTokens == 0) {
+                    persistMessage(
+                        activeSessionId,
+                        ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                    )
                 }
             }
         // Reached only after the whole real flow above has genuinely

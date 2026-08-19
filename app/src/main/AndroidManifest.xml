@@ -24,6 +24,18 @@
          approach the Phase 4 permissions above already use). -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
 
+    <!-- Chat Bot fix bundle: lets the app show the real system "Ignore
+         battery optimizations" dialog (Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+         instead of only linking the user to the general battery settings
+         list. Without this exemption, Android's Doze/App Standby can pause
+         or kill this process in the background even while its foreground
+         service is running - this is the single most common real-world
+         cause of a backgrounded app "disappearing" on stock Android and
+         especially on OEM skins (MIUI/ColorOS/FuntouchOS/OneUI) that add
+         their own, stricter battery managers on top. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+
     <application
         android:name=".BrainApplication"
         android:allowBackup="false"

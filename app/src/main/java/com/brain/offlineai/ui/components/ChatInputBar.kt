@@ -39,6 +39,7 @@ fun ChatInputBar(
     value: String,
     onValueChange: (String) -> Unit,
     onSend: () -> Unit,
+    onStop: () -> Unit = {},
     isBusy: Boolean = false,
     pendingAttachments: List<PendingAttachment> = emptyList(),
     onAttachClick: () -> Unit = {},
@@ -159,11 +160,33 @@ fun ChatInputBar(
                 contentAlignment = Alignment.Center
             ) {
                 if (isBusy) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        color = BrainPurplePrimary,
-                        strokeWidth = 2.dp
-                    )
+                    // Bug fix (user request) - this used to be a purely
+                    // decorative CircularProgressIndicator with no click
+                    // handler at all, so there was genuinely no way to
+                    // stop a real in-flight generation from here (the spot
+                    // that used to hold Send). Now a real tap target: the
+                    // spinner still shows real progress is happening, and
+                    // tapping it calls the real [onStop] (wired to
+                    // ChatViewModel.stopGeneration()), which actually
+                    // cancels the in-flight generation Job.
+                    IconButton(
+                        onClick = onStop,
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(28.dp),
+                                color = BrainPurplePrimary,
+                                strokeWidth = 2.dp
+                            )
+                            Box(
+                                modifier = Modifier
+                                    .size(10.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(Color.White)
+                            )
+                        }
+                    }
                 } else {
                     IconButton(
                         onClick = onSend,

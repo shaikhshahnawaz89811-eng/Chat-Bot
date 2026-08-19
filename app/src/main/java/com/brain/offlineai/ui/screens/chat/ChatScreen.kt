@@ -289,6 +289,7 @@ fun ChatScreen(
             value = input,
             onValueChange = viewModel::onInputChange,
             onSend = viewModel::sendMessage,
+            onStop = viewModel::stopGeneration,
             isBusy = isBusy,
             pendingAttachments = pendingAttachments,
             onAttachClick = {
