@@ -83,7 +83,12 @@ fun BotTextBubble(
     artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
     onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
     onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {},
-    onCancelDownload: (String) -> Unit = {}
+    onCancelDownload: (String) -> Unit = {},
+    onPreviewArtifact: (ArtifactInfo) -> Unit = {},
+    // GitHub Hosting feature - same additive, safe no-op default
+    // convention as every other param on this function.
+    onPublishArtifact: (ArtifactInfo) -> Unit = {},
+    onPublishAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
 ) {
     BotCardShell {
         Text(message.text, color = BrainTextPrimary, style = MaterialTheme.typography.bodyLarge)
@@ -98,7 +103,10 @@ fun BotTextBubble(
                 zipDownloadId = "zip-${message.id}",
                 onDownload = onDownloadArtifact,
                 onDownloadAll = onDownloadAllArtifacts,
-                onCancelDownload = onCancelDownload
+                onCancelDownload = onCancelDownload,
+                onPreview = onPreviewArtifact,
+                onPublish = onPublishArtifact,
+                onPublishAll = onPublishAllArtifacts
             )
         }
     }
@@ -227,7 +235,12 @@ fun BotCodeDoneBubble(
     artifactDownloadStates: Map<String, ArtifactDownloadUiState> = emptyMap(),
     onDownloadArtifact: (ArtifactInfo, ArtifactDownloadTarget) -> Unit = { _, _ -> },
     onDownloadAllArtifacts: (List<ArtifactInfo>) -> Unit = {},
-    onCancelDownload: (String) -> Unit = {}
+    onCancelDownload: (String) -> Unit = {},
+    onPreviewArtifact: (ArtifactInfo) -> Unit = {},
+    // GitHub Hosting feature - same additive, safe no-op default
+    // convention as every other param on this function.
+    onPublishArtifact: (ArtifactInfo) -> Unit = {},
+    onPublishAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
 ) {
     BotCardShell {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -272,7 +285,10 @@ fun BotCodeDoneBubble(
                 zipDownloadId = "zip-${message.id}",
                 onDownload = onDownloadArtifact,
                 onDownloadAll = onDownloadAllArtifacts,
-                onCancelDownload = onCancelDownload
+                onCancelDownload = onCancelDownload,
+                onPreview = onPreviewArtifact,
+                onPublish = onPublishArtifact,
+                onPublishAll = onPublishAllArtifacts
             )
         }
     }

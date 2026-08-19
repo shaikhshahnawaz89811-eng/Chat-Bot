@@ -12,6 +12,17 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import com.brain.offlineai.agent.AgentClarificationGate
+import com.brain.offlineai.agent.AgentTaskRepository
+import com.brain.offlineai.agent.ContextManager
+import com.brain.offlineai.agent.FileValidator
+import com.brain.offlineai.agent.PlanningEngine
+import com.brain.offlineai.agent.ProjectTypeGate
+import com.brain.offlineai.agent.ProjectTypePauseRepository
+import com.brain.offlineai.agent.ThermalPauseRepository
+import com.brain.offlineai.agent.ToolGateway
+import com.brain.offlineai.agent.WebSearchContextBuilder
+import com.brain.offlineai.agent.WebSearchTrigger
 import com.brain.offlineai.data.analytics.AnalyticsStore
 import com.brain.offlineai.data.artifacts.ArtifactCandidate
 import com.brain.offlineai.data.artifacts.ArtifactDownloadTarget
@@ -34,8 +45,14 @@ import com.brain.offlineai.data.attachments.classifyAttachment
 import com.brain.offlineai.data.history.ChatHistoryRepository
 import com.brain.offlineai.data.settings.ModelSettingsRepository
 import com.brain.offlineai.data.settings.ModelSettings
+import com.brain.offlineai.data.websearch.WebSearchOutcome
+import com.brain.offlineai.data.websearch.WebSearchRepository
 import com.brain.offlineai.engine.BrainEngine
 import com.brain.offlineai.engine.EngineState
+import com.brain.offlineai.engine.ModelFileManager
+import com.brain.offlineai.engine.thermal.ThermalAction
+import com.brain.offlineai.engine.thermal.ThermalMonitor
+import com.brain.offlineai.engine.thermal.ThermalPolicy
 import com.brain.offlineai.ui.multimodal.AttachmentPromptBuilder
 import com.brain.offlineai.ui.multimodal.AttachmentRoute
 import com.brain.offlineai.ui.multimodal.ZipEditResolver
@@ -104,6 +121,59 @@ class ChatViewModel(
     private val attachmentRepository = AttachmentRepository(application)
     private val artifactFileManager = ArtifactFileManager(application)
     private val artifactRepository = ArtifactRepository(application)
+
+    /**
+     * Phase 19 (Master Plan v2 - Foundation order step 3, "Task State +
+     * persistence/resume") - real, Room-backed store for a paused
+     * clarification question (see [AgentClarificationGate]) so it
+     * genuinely survives process death, not just an in-memory flag.
+     */
+    private val agentTaskRepository = AgentTaskRepository(application)
+
+    /**
+     * Phase 21 (Master Plan v2 - Permission/Risk Gate + Tool Registry/
+     * Gateway) - single, real, uniform entry point for every real read/
+     * write tool this app has. Reads (LOW risk) still delegate to the
+     * exact same real functions ([AttachmentContentReader]/
+     * [com.brain.offlineai.agent.ProjectContextLoader]) every earlier
+     * phase already used directly; writes (HIGH risk - a real ZIP-entry
+     * patch or a real new artifact file) now also get a real, persisted
+     * audit row and a real copy-first staged patch - see [ToolGateway]'s
+     * own doc.
+     */
+    private val toolGateway = ToolGateway(application)
+
+    /**
+     * Phase 22 (Master Plan v2, revised scope - real, user-supplied
+     * Tavily web-search provider). Offline-first by construction - see
+     * [WebSearchRepository]'s own doc: with no stored key or no real
+     * connectivity, [WebSearchRepository.search] returns
+     * [WebSearchOutcome.Unavailable] immediately, and this ViewModel adds
+     * zero extra work/UI for the overwhelming majority of users who never
+     * configure a key, exactly like every other real, optional secret in
+     * this app (Phase 3's API keys, Phase 2's imported model).
+     */
+    private val webSearchRepository = WebSearchRepository(application)
+
+    /**
+     * Phase 23 (Appendix - Mobile Thermal Management, integrated with
+     * Phase 19's Task State) - real, Room-backed store for a generation
+     * genuinely paused mid-answer because the real device thermal status
+     * reached SEVERE+ (see [com.brain.offlineai.engine.thermal.ThermalPolicy]),
+     * same "survives process death, not just an in-memory flag" reasoning
+     * [agentTaskRepository] above already documents for its own paused-
+     * clarification case.
+     */
+    private val thermalPauseRepository = ThermalPauseRepository(application)
+
+    /**
+     * Phase 24 (real "confirm project type/platform/language" gate) - real,
+     * Room-backed store for a paused "which platform?" question (see
+     * [ProjectTypeGate]), same "survives process death, not just an
+     * in-memory flag" reasoning [agentTaskRepository] already documents for
+     * its own paused-clarification case.
+     */
+    private val projectTypePauseRepository = ProjectTypePauseRepository(application)
 
     var messages = mutableStateOf(listOf<ChatMessage>())
         private set
@@ -175,8 +245,93 @@ class ChatViewModel(
     private var generationJob: Job? = null
 
     init {
+        // Phase 23 - real, idempotent (safe if another ViewModel instance
+        // already started it) registration of the real device thermal
+        // listener - see [ThermalMonitor]'s own doc.
+        ThermalMonitor.start(application.applicationContext)
         if (openSessionId != null) {
             viewModelScope.launch { loadExistingSession(openSessionId) }
+        }
+        // Phase 23 - real, automatic resume: whenever the real device
+        // thermal status genuinely drops back to a safe level (see
+        // [ThermalPolicy.safeToResume]), this checks whether *this*
+        // session has a real, still-open thermal pause (see
+        // [attemptThermalResume]'s own doc) and, if so, genuinely
+        // reloads the model and continues the paused reply - the user
+        // never has to send another message or manually reload for a
+        // task that was only ever interrupted by real device heat, not
+        // by anything the user did.
+        viewModelScope.launch {
+            ThermalMonitor.state.collect { reading ->
+                if (ThermalPolicy.safeToResume(reading)) {
+                    attemptThermalResume()
+                }
+            }
+        }
+    }
+
+    /**
+     * Real, guarded auto-resume for a thermally paused reply - see this
+     * function's call site in [init] above for when it's actually
+     * invoked. Deliberately re-reads
+     * [com.brain.offlineai.engine.ModelFileManager.getLastInstalledModel]
+     * and the live [settingsRepository] rather than trusting any stale
+     * copy (Rule 4/9 - one real, current source of truth for "which
+     * model / which settings", never a second, possibly-drifted copy
+     * persisted alongside the paused prompt).
+     */
+    private var thermalResumeInFlight = false
+
+    private suspend fun attemptThermalResume() {
+        val sid = sessionId ?: return
+        if (thermalResumeInFlight || isBusy.value) return
+        val paused = thermalPauseRepository.getPaused(sid) ?: return
+        thermalResumeInFlight = true
+        try {
+            // Marked resumed immediately (not after generation finishes) -
+            // this is a real, one-shot resume attempt: if the reload or
+            // the resumed generation itself later hits a *different* real
+            // stop condition (another genuine thermal pause, a real
+            // error, context_full), that path handles/persists its own
+            // outcome on its own terms rather than this row being
+            // double-claimed by two concurrent resume attempts.
+            thermalPauseRepository.markResumed(paused.id)
+            val installedModel = ModelFileManager(getApplication()).getLastInstalledModel()
+            if (installedModel == null) {
+                postSystemNote(
+                    sid,
+                    "The device has cooled down, but the previously loaded model " +
+                        "file is no longer available to reload automatically - open " +
+                        "Models and load it manually to pick this reply back up."
+                )
+                return
+            }
+            isBusy.value = true
+            postSystemNote(
+                sid,
+                "The device has cooled back down to a safe temperature - " +
+                    "reloading the model and resuming this reply automatically " +
+                    "from exactly where it paused."
+            )
+            val settings = settingsRepository.getSettings()
+            BrainEngine.loadModel(
+                installedModel.file.absolutePath,
+                installedModel.name,
+                nCtx = settings.contextLength,
+                nThreads = settings.threads
+            )
+            if (BrainEngine.state.value is EngineState.Loaded) {
+                streamRealResponse(sid, paused.continuationPrompt)
+            } else {
+                postSystemNote(
+                    sid,
+                    "Reloading the model after cooling down didn't succeed - open " +
+                        "Models and load it manually to pick this reply back up."
+                )
+            }
+        } finally {
+            isBusy.value = false
+            thermalResumeInFlight = false
         }
     }
 
@@ -465,6 +620,80 @@ class ChatViewModel(
                     return@launch
                 }
 
+                // Phase 24 (real "confirm project type/platform/language"
+                // gate, PROGRESS.md's own recorded open gap) - only
+                // considered for a brand-new request (no ZIP attached this
+                // turn - an existing attached project already carries its
+                // own real language/platform signal, see ProjectContextLoader).
+                // Resume check runs first: a genuinely still-open question
+                // for this session takes priority over evaluating this new
+                // message as a fresh request.
+                val hasZipThisTurn = readyAttachments.any { it.kind == AttachmentKind.ZIP }
+                if (!hasZipThisTurn) {
+                    val pendingProjectType = projectTypePauseRepository.getAwaiting(activeSessionId)
+                    if (pendingProjectType != null) {
+                        if (ProjectTypeGate.answerNamesPlatform(normalizedText)) {
+                            projectTypePauseRepository.markResumed(pendingProjectType.id)
+                            val combined = "${pendingProjectType.originalRequest}\n\nPlatform/language: $normalizedText"
+                            postSystemNote(activeSessionId, "Resuming with platform/language: $normalizedText")
+                            streamRealResponse(activeSessionId, combined)
+                            return@launch
+                        } else {
+                            // Same "a genuinely different message means the
+                            // user moved on" reasoning AgentTaskStatus.ABANDONED
+                            // already documents - never re-ask the same
+                            // question unprompted, just say it was dropped
+                            // and continue with this message as a fresh
+                            // request below.
+                            projectTypePauseRepository.markAbandoned(pendingProjectType.id)
+                            postSystemNote(
+                                activeSessionId,
+                                "(Dropping the earlier platform/language question - this " +
+                                    "message didn't name one. Continuing with this message " +
+                                    "as a new request instead.)"
+                            )
+                        }
+                    } else {
+                        val ambiguity = ProjectTypeGate.detectAmbiguity(normalizedText)
+                        if (ambiguity != null) {
+                            projectTypePauseRepository.saveAwaiting(
+                                id = UUID.randomUUID().toString(),
+                                sessionId = activeSessionId,
+                                originalRequest = normalizedText,
+                                question = ambiguity.question,
+                                now = System.currentTimeMillis()
+                            )
+                            postSystemNote(activeSessionId, ambiguity.question)
+                            return@launch
+                        }
+                    }
+                }
+
+                // Phase 20 (Context Manager - Universal 5-Chunk workflow,
+                // Master Plan §3) - real check, per attached ZIP, for
+                // whether its own real entry listing genuinely exceeds a
+                // single safe read (see [ContextManager]'s own doc for the
+                // exact, non-guessed bound). Only a real hit here changes
+                // anything - an ordinary small ZIP/file message takes the
+                // exact same path Phase 14 always has.
+                val chunkedZipSummaries = mutableMapOf<String, String>()
+                for (zipInfo in readyAttachments.filter { it.kind == AttachmentKind.ZIP }) {
+                    if (ContextManager.needsChunking(zipInfo.storedPath)) {
+                        val plan = ContextManager.buildChunkPlan(zipInfo.storedPath, zipInfo.fileName)
+                        postSystemNote(activeSessionId, ContextManager.buildContextInfoBox(plan))
+                        plan.chunks.forEach { chunk ->
+                            postSystemNote(activeSessionId, "Chunk ${chunk.index}/${chunk.total} - ${chunk.title}\n${chunk.body}")
+                        }
+                        postSystemNote(activeSessionId, ContextManager.buildCompleteNote(plan))
+                        // Real, bounded replacement for this one ZIP's
+                        // context-block section below - Chunk 1's own
+                        // structure summary only, never the unbounded raw
+                        // entry-name dump [AttachmentPromptBuilder] would
+                        // otherwise build for a ZIP this large.
+                        chunkedZipSummaries[zipInfo.id] = plan.chunks.first().body
+                    }
+                }
+
                 // Phase 14 (Multimodal input use-case routing, spec section
                 // 8) - real, bounded content (a readable text file's own
                 // bytes, a ZIP's own real entry list) for this message's
@@ -477,9 +706,179 @@ class ChatViewModel(
                 // internal decision (spec §8 - "route before acting").
                 val attachmentContextBlock = if (readyAttachments.isNotEmpty()) {
                     postSystemNote(activeSessionId, AttachmentPromptBuilder.buildRoutingSummary(attachmentRoutes))
-                    AttachmentPromptBuilder.buildContextBlock(attachmentRoutes, readyAttachments.associateBy { it.id })
+                    AttachmentPromptBuilder.buildContextBlock(attachmentRoutes, readyAttachments.associateBy { it.id }, chunkedZipSummaries)
                 } else {
                     ""
+                }
+
+                // Phase 22 (Master Plan v2, revised scope - real,
+                // user-supplied Tavily web-search provider). Real,
+                // narrow, deterministic trigger check only - see
+                // [WebSearchTrigger]'s own doc for the exact two real
+                // cases and why neither is a model guess. A hit here
+                // still needs a real stored key AND real connectivity
+                // (see [WebSearchRepository]) - so an ordinary message,
+                // or any message when no key is configured, does zero
+                // extra work and stays fully offline, silently.
+                val hasZipAttachment = readyAttachments.any { it.kind == AttachmentKind.ZIP }
+                val searchQuery = WebSearchTrigger.newProjectSearchQuery(normalizedText)
+                    ?: WebSearchTrigger.existingProjectSearchQuery(normalizedText, hasZipAttachment)
+                    ?: WebSearchTrigger.buildTargetSearchQuery(normalizedText)
+                val webSearchContextBlock = if (searchQuery != null) {
+                    runWebSearch(activeSessionId, searchQuery)
+                } else {
+                    ""
+                }
+
+                var zipEditTarget: ZipEditTarget? = null
+                var zipEditContext = ""
+                val zipAttachments = readyAttachments.filter { it.kind == AttachmentKind.ZIP }
+
+                // Phase 19 (Master Plan v2 - Task State persistence/resume)
+                // - real check for a clarification question this session is
+                // already genuinely waiting on (see [AgentClarificationGate]
+                // below). Only considered when this message brought no new
+                // ZIP itself - a fresh ZIP attachment is real, different
+                // context that always takes priority over an old pending
+                // question.
+                val pendingClarification = if (zipAttachments.isEmpty()) {
+                    agentTaskRepository.getAwaitingClarification(activeSessionId)
+                } else {
+                    null
+                }
+                if (pendingClarification != null && pendingClarification.kind.startsWith("zip_edit_intent:")) {
+                    // Weakness-review fix - resume for the *intent*
+                    // clarification below (not the existing file-target
+                    // one): the target file was already genuinely
+                    // resolved before we stopped to ask "explain or
+                    // change?", so this resume never re-matches a
+                    // filename from the short reply text (which usually
+                    // has none, e.g. "explain" or "change karo") - it
+                    // reads the exact entry name encoded in [kind] at ask
+                    // time instead.
+                    val resumeEntryName = pendingClarification.kind.removePrefix("zip_edit_intent:")
+                    val entryContent = toolGateway.readZipEntry(pendingClarification.resumeStoredPath, resumeEntryName)
+                    if (entryContent != null) {
+                        agentTaskRepository.markResumed(pendingClarification.id)
+                        // Still genuinely unclear on the second try -
+                        // never loop forever asking the same question;
+                        // fall back to the safe default (explain, not a
+                        // silent rewrite - Rule 10, no ungrounded action).
+                        val isDiagnoseOnly = !editIntentWords.any { normalizedText.lowercase().contains(it) }
+                        postSystemNote(
+                            activeSessionId,
+                            "Resuming: " + (if (isDiagnoseOnly) "reviewing" else "editing target resolved") +
+                                " inside ${pendingClarification.resumeDisplayName}: $resumeEntryName"
+                        )
+                        if (isDiagnoseOnly) {
+                            zipEditContext = "\n\n--- Current content of $resumeEntryName (inside ${pendingClarification.resumeDisplayName}) ---\n" +
+                                entryContent +
+                                "\n--- End current content ---\n" +
+                                "Explain what real issue(s) exist in this file, if any. Do NOT rewrite or " +
+                                "output the whole file - this is a review/explanation only, not a change."
+                        } else {
+                            zipEditTarget = ZipEditTarget(
+                                pendingClarification.resumeAttachmentId,
+                                pendingClarification.resumeStoredPath,
+                                pendingClarification.resumeDisplayName,
+                                resumeEntryName
+                            )
+                            zipEditContext = "\n\n--- Current content of $resumeEntryName (inside ${pendingClarification.resumeDisplayName}) ---\n" +
+                                entryContent +
+                                "\n--- End current content ---\n" +
+                                "Make ONLY the specific change requested above - keep every other real line " +
+                                "of this file exactly as it already is. Reply with the complete modified " +
+                                "file in exactly one fenced code block, and nothing else outside that block."
+                        }
+                    } else {
+                        agentTaskRepository.markAbandoned(pendingClarification.id)
+                        postSystemNote(activeSessionId, "Couldn't re-read $resumeEntryName from ${pendingClarification.resumeDisplayName} - it may have moved or been deleted. Please re-attach the ZIP.")
+                    }
+                } else if (pendingClarification != null) {
+                    val resumeEntries = toolGateway.listZipEntries(pendingClarification.resumeStoredPath)
+                    val resumeMatch = ZipEditResolver.resolveEditTarget(resumeEntries, normalizedText)
+                    if (resumeMatch != null) {
+                        val entryContent = toolGateway.readZipEntry(pendingClarification.resumeStoredPath, resumeMatch.name)
+                        if (entryContent != null) {
+                            // Weakness-review fix - same real diagnose-vs-edit
+                            // check as the fresh-target path above, so
+                            // resuming a clarification never force-patches
+                            // a file the user only asked to be reviewed.
+                            val isDiagnoseOnly = isDiagnoseOnlyIntent(normalizedText)
+                            // Real resume - the user's own next message
+                            // genuinely answered the question, so this
+                            // task is done, not abandoned/guessed.
+                            agentTaskRepository.markResumed(pendingClarification.id)
+                            postSystemNote(
+                                activeSessionId,
+                                "Resuming: " + (if (isDiagnoseOnly) "reviewing" else "editing target resolved") +
+                                    " inside ${pendingClarification.resumeDisplayName}: ${resumeMatch.name}"
+                            )
+                            if (isDiagnoseOnly) {
+                                zipEditContext = "\n\n--- Current content of ${resumeMatch.name} (inside ${pendingClarification.resumeDisplayName}) ---\n" +
+                                    entryContent +
+                                    "\n--- End current content ---\n" +
+                                    "Explain what real issue(s) exist in this file, if any. Do NOT rewrite or " +
+                                    "output the whole file - this is a review/explanation only, not a change."
+                            } else {
+                                zipEditTarget = ZipEditTarget(
+                                    pendingClarification.resumeAttachmentId,
+                                    pendingClarification.resumeStoredPath,
+                                    pendingClarification.resumeDisplayName,
+                                    resumeMatch.name
+                                )
+                                zipEditContext = "\n\n--- Current content of ${resumeMatch.name} (inside ${pendingClarification.resumeDisplayName}) ---\n" +
+                                    entryContent +
+                                    "\n--- End current content ---\n" +
+                                    "Make ONLY the specific change requested above - keep every other real line " +
+                                    "of this file exactly as it already is. Reply with the complete modified " +
+                                    "file in exactly one fenced code block, and nothing else outside that block."
+                            }
+                        } else {
+                            // Bug fix (user request - "zip na mile toh")
+                            // - the file name genuinely matched but its
+                            // real bytes could not be read back (the
+                            // original ZIP was moved/deleted from
+                            // [pendingClarification.resumeStoredPath]
+                            // since the question was asked). This is the
+                            // same honest "genuinely can't do this, don't
+                            // pretend" case, not a silent no-op - same
+                            // ABANDONED counterpart as the "no match at
+                            // all" case below.
+                            agentTaskRepository.markAbandoned(pendingClarification.id)
+                            postSystemNote(
+                                activeSessionId,
+                                "(Can't resume editing ${resumeMatch.name} inside " +
+                                    "${pendingClarification.resumeDisplayName} - that ZIP " +
+                                    "isn't available anymore. Attach it again and ask once more.)"
+                            )
+                        }
+                    }
+                    // Bug fix (user request) - a real match still not found
+                    // here used to leave the task silently sitting in
+                    // AWAITING_CLARIFICATION forever with zero signal to the
+                    // user that their old question was ever dropped - Master
+                    // Plan Rule 2 ("asks once, does not repeat itself
+                    // unprompted") correctly says don't loop the SAME
+                    // question again, but that's not the same as never
+                    // telling the user it's gone. Same "a genuinely
+                    // different message means the user moved on" reasoning
+                    // [PendingContinuation] already uses for its own stale
+                    // state: mark it ABANDONED (a real, honest DB status,
+                    // not just leaving a stale row) and say so in one short
+                    // line, then fall through to ordinary generation for
+                    // this message exactly as before.
+                    else {
+                        agentTaskRepository.markAbandoned(pendingClarification.id)
+                        postSystemNote(
+                            activeSessionId,
+                            "(Dropping the earlier question about which file in " +
+                                "${pendingClarification.resumeDisplayName} to edit - this " +
+                                "message didn't name one of its files. Continuing with " +
+                                "this message instead; re-attach and ask again if you " +
+                                "still need that edit.)"
+                        )
+                    }
                 }
 
                 // Phase 16 (Real ZIP content edit) - real, deterministic
@@ -491,26 +890,101 @@ class ChatViewModel(
                 // plausibly name several different files across different
                 // tasks, which this phase's scope deliberately does not
                 // attempt to resolve automatically.
-                val zipAttachments = readyAttachments.filter { it.kind == AttachmentKind.ZIP }
-                var zipEditTarget: ZipEditTarget? = null
-                var zipEditContext = ""
-                if (zipAttachments.size == 1) {
+                if (zipEditTarget == null && zipAttachments.size == 1) {
                     val zipInfo = zipAttachments.first()
-                    val entries = AttachmentContentReader.listZipEntries(zipInfo.storedPath)
+                    val entries = toolGateway.listZipEntries(zipInfo.storedPath)
+                    // Weakness-review fix - a real filename match was the
+                    // only way to resolve a target before; a message that
+                    // instead names a function/class ("fix calculateTotal",
+                    // "bug in LoginActivity") never resolved to anything.
+                    // Falls back to the real, bounded declaration scan (see
+                    // [ZipEditResolver.resolveEditTargetByDeclaration]'s own
+                    // doc) only when the filename match itself found
+                    // nothing - never overrides a real filename hit.
                     val match = ZipEditResolver.resolveEditTarget(entries, normalizedText)
+                        ?: ZipEditResolver.resolveEditTargetByDeclaration(entries, zipInfo.storedPath, normalizedText)
                     if (match != null) {
-                        val entryContent = AttachmentContentReader.readZipEntryText(zipInfo.storedPath, match.name)
+                        val entryContent = toolGateway.readZipEntry(zipInfo.storedPath, match.name)
                         if (entryContent != null) {
-                            zipEditTarget = ZipEditTarget(zipInfo.id, zipInfo.storedPath, zipInfo.fileName, match.name)
+                            // Weakness-review fix - a resolved target used
+                            // to always get the same "reply with the
+                            // complete modified file" instruction, even
+                            // when the user's own message only asked to
+                            // find/explain a bug, not change anything. A
+                            // real, deterministic keyword check (same
+                            // "no model guess" posture every other gate in
+                            // this file already holds itself to) decides
+                            // which real prompt this actually is; only a
+                            // genuine edit intent sets [zipEditTarget], so
+                            // [attachArtifactsOrPatchZip] can only ever
+                            // patch the real ZIP on a request that
+                            // genuinely asked for a change.
+                            if (isIntentUnclear(normalizedText)) {
+                                // Weakness-review fix - stop and ask
+                                // instead of silently defaulting to a
+                                // full-file rewrite when the message named
+                                // a real target file but never actually
+                                // said whether to explain or change it
+                                // (e.g. just "look at this" / "isko dekho").
+                                val question = "${match.name} mila - kya karna hai isme: sirf explain/review karu, ya isme change/fix karu? Reply 'explain' ya 'change karo'."
+                                agentTaskRepository.saveAwaitingClarification(
+                                    id = UUID.randomUUID().toString(),
+                                    sessionId = activeSessionId,
+                                    kind = "zip_edit_intent:${match.name}",
+                                    question = question,
+                                    attachmentId = zipInfo.id,
+                                    storedPath = zipInfo.storedPath,
+                                    displayName = zipInfo.fileName,
+                                    now = System.currentTimeMillis()
+                                )
+                                postSystemNote(activeSessionId, question)
+                                return@launch
+                            }
+                            val isDiagnoseOnly = isDiagnoseOnlyIntent(normalizedText)
                             postSystemNote(
                                 activeSessionId,
-                                "Editing target resolved inside ${zipInfo.fileName}: ${match.name}"
+                                (if (isDiagnoseOnly) "Reviewing" else "Editing target resolved") +
+                                    " inside ${zipInfo.fileName}: ${match.name}"
                             )
-                            zipEditContext = "\n\n--- Current content of ${match.name} (inside ${zipInfo.fileName}) ---\n" +
-                                entryContent +
-                                "\n--- End current content ---\n" +
-                                "Reply with the complete modified file in exactly one fenced code block, " +
-                                "and nothing else outside that block."
+                            if (isDiagnoseOnly) {
+                                zipEditContext = "\n\n--- Current content of ${match.name} (inside ${zipInfo.fileName}) ---\n" +
+                                    entryContent +
+                                    "\n--- End current content ---\n" +
+                                    "Explain what real issue(s) exist in this file, if any. Do NOT rewrite or " +
+                                    "output the whole file - this is a review/explanation only, not a change."
+                            } else {
+                                zipEditTarget = ZipEditTarget(zipInfo.id, zipInfo.storedPath, zipInfo.fileName, match.name)
+                                zipEditContext = "\n\n--- Current content of ${match.name} (inside ${zipInfo.fileName}) ---\n" +
+                                    entryContent +
+                                    "\n--- End current content ---\n" +
+                                    "Make ONLY the specific change requested above - keep every other real line " +
+                                    "of this file exactly as it already is. Reply with the complete modified " +
+                                    "file in exactly one fenced code block, and nothing else outside that block."
+                            }
+                        }
+                    } else {
+                        // Phase 19 (Master Plan v2, section 2 -
+                        // Clarification Gate, mandatory) - genuinely
+                        // ambiguous (2+ real candidate files) real
+                        // edit-intent request against this ZIP: stop and
+                        // ask instead of silently falling back to a
+                        // generic reply about the whole archive. See
+                        // [AgentClarificationGate] for the exact,
+                        // conservative real check (no model guess).
+                        val clarification = AgentClarificationGate.evaluateZipEditAmbiguity(entries, normalizedText, zipInfo.fileName)
+                        if (clarification != null) {
+                            agentTaskRepository.saveAwaitingClarification(
+                                id = UUID.randomUUID().toString(),
+                                sessionId = activeSessionId,
+                                kind = "zip_edit_target",
+                                question = clarification.question,
+                                attachmentId = zipInfo.id,
+                                storedPath = zipInfo.storedPath,
+                                displayName = zipInfo.fileName,
+                                now = System.currentTimeMillis()
+                            )
+                            postSystemNote(activeSessionId, clarification.question)
+                            return@launch
                         }
                     }
                 }
@@ -529,10 +1003,52 @@ class ChatViewModel(
                 // (and, per Phase 14 above, may now also carry the real
                 // attachment context block appended after it).
                 val taskTexts = TaskSplitter.split(normalizedText)
+                // Phase 22 - the real web-search context (empty string
+                // when [searchQuery] was null or the real search didn't
+                // succeed) rides along with the attachment context block
+                // to both the multi-task and single-task paths, same
+                // "applies to the whole turn, not one split-out task"
+                // reasoning [runMultiTaskMessage]'s own doc already gives
+                // for [attachmentContextBlock].
+                // Weakness-review fix - real, bounded reminder of what this
+                // *same session* already genuinely changed (see
+                // [ToolGateway.recentSessionChanges]'s own doc for its
+                // real scope - this session's own audit rows only, never
+                // claimed across sessions/app restarts). So a later
+                // message in the same conversation ("also fix the login
+                // bug") doesn't risk the model re-touching or contradicting
+                // a real edit it already made a few turns ago.
+                val recentChanges = toolGateway.recentSessionChanges(activeSessionId)
+                val recentChangesBlock = if (recentChanges.isEmpty()) "" else {
+                    "\n\n--- Real changes already made earlier this session (most recent first) ---\n" +
+                        recentChanges.joinToString("\n") { row ->
+                            "- ${row.tool} on ${row.target}: ${row.outcome} (${row.detail})"
+                        } +
+                        "\n--- End earlier changes ---"
+                }
+                val extraContextBlock = attachmentContextBlock + webSearchContextBlock + recentChangesBlock
                 if (taskTexts.size > 1) {
-                    runMultiTaskMessage(activeSessionId, taskTexts, attachmentContextBlock)
+                    runMultiTaskMessage(activeSessionId, taskTexts, extraContextBlock)
                 } else {
-                    streamRealResponse(activeSessionId, normalizedText + attachmentContextBlock + zipEditContext, zipEditTarget)
+                    // Phase 25 (real multi-file plan -> per-file generate ->
+                    // validate -> fix pipeline, user-requested). Only
+                    // attempted for a genuinely brand-new build request (no
+                    // ZIP this turn, not a ZIP edit, single task, real
+                    // creation+build-target intent - [ProjectTypeGate.isCreationRequest]).
+                    // A false/low-confidence result here (planning itself
+                    // returns null, or the model's real plan came back with
+                    // fewer than 2 real files) means [runMultiFileBuild]
+                    // returns false and this falls straight through to the
+                    // exact same existing [streamRealResponse] call every
+                    // earlier phase already used - completely unaffected,
+                    // same safe-default posture every other real gate in
+                    // this app already holds itself to.
+                    val triedMultiFile = zipAttachments.isEmpty() && zipEditTarget == null &&
+                        ProjectTypeGate.isCreationRequest(normalizedText) &&
+                        runMultiFileBuild(activeSessionId, normalizedText, extraContextBlock)
+                    if (!triedMultiFile) {
+                        streamRealResponse(activeSessionId, normalizedText + extraContextBlock + zipEditContext, zipEditTarget)
+                    }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e // real cancellation (screen left, process reclaimed) must keep propagating, never swallowed
@@ -691,6 +1207,24 @@ class ChatViewModel(
             ChatMessage(id = botId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = 0)
         )
 
+        // Bug fix (endpoint-correctness gap, Rule 17) - a real row for this
+        // bot reply now exists in Room from the very first moment streaming
+        // starts, not only from the first `persistEveryNTokens` checkpoint
+        // (token 8) or the final write. Before this, a genuine kill in the
+        // first few tokens (the exact window "kaam gayab, history me sirf
+        // user ka message" happens in, since the user's own message is
+        // already persisted above at send-time) left literally zero bot
+        // row on disk - the reply had genuinely started but its endpoint
+        // had not actually been reached yet (Rule 17: existence != what's
+        // reliably reflected on disk). This costs one small, cheap write
+        // (empty text) and every later persistMessage() call for the same
+        // botId/codeId is still a real upsert on top of it, so nothing
+        // about the periodic or final persistence below changes.
+        persistMessage(
+            activeSessionId,
+            ChatMessage(id = botId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+        )
+
         // Bug fix (user request - "chota kaam kar pa raha he, bada nahin,
         // bich me he ruk gaya") - real root cause was that every call here
         // used [BrainEngine.generate]'s hardcoded maxTokens=512 default (it
@@ -728,6 +1262,28 @@ class ChatViewModel(
         try {
             while (stopReason == "max_tokens" && chunkIndex < MAX_CONTINUATION_CHUNKS) {
                 chunkIndex++
+
+                // Phase 23 (Appendix - Mobile Thermal Management) - real,
+                // live device thermal check before asking the native
+                // engine for another chunk (never mid-decode - the native
+                // loop itself isn't interruptible from here, so this is
+                // the one real, safe checkpoint between chunks). A
+                // genuine SEVERE+ reading stops the loop honestly instead
+                // of pushing the hardware through another real decode
+                // pass; a genuine MODERATE reading just adds a short real
+                // pause (model stays loaded - not yet hot enough to
+                // justify the real reload cost) before the next chunk.
+                when (ThermalPolicy.decide(ThermalMonitor.state.value)) {
+                    ThermalAction.UNLOAD_AND_PAUSE -> {
+                        stopReason = "thermal_pause"
+                    }
+                    ThermalAction.COOLING_BREAK -> {
+                        delay(THERMAL_COOLING_BREAK_MS)
+                    }
+                    ThermalAction.CONTINUE -> { /* real, normal-temperature path - unchanged */ }
+                }
+                if (stopReason == "thermal_pause") break
+
                 val chunkBudget = chunkTokenBudget(loadedContextSize, continuationPrompt)
                 if (chunkBudget <= 0) {
                     // The real prompt-so-far (original prompt + everything
@@ -967,6 +1523,39 @@ class ChatViewModel(
                         "Raise Context Length in Model Settings (up to 8192) and send " +
                         "the request again for a longer reply."
                 )
+            } else if (stopReason == "thermal_pause") {
+                // Phase 23 (Appendix - Mobile Thermal Management) - the
+                // real device thermal status genuinely reached SEVERE+
+                // mid-answer (see [ThermalPolicy]). Whatever was actually
+                // generated before the pause is already the visible
+                // card above (same "nothing real is discarded"
+                // handling every other early-stop path in this function
+                // already gives) - this branch's only real job is the
+                // genuine unload + the real, persisted resume record,
+                // reusing Task State exactly the way Phase 19's
+                // [AgentTaskRepository] already established for a paused
+                // clarification question (Rule 4). [pendingContinuation]
+                // is deliberately NOT armed here - resume is automatic
+                // (see [attemptThermalResume]), not a typed "continue".
+                val pauseId = java.util.UUID.randomUUID().toString()
+                val pausedStatus = (ThermalMonitor.state.value as? com.brain.offlineai.engine.thermal.ThermalReading.Level)?.status ?: -1
+                thermalPauseRepository.savePaused(
+                    id = pauseId,
+                    sessionId = activeSessionId,
+                    continuationPrompt = continuationPrompt,
+                    pausedAtStatus = pausedStatus,
+                    now = timeNow()
+                )
+                BrainEngine.pauseForThermal()
+                postSystemNote(
+                    activeSessionId,
+                    "Pausing here - the device is genuinely running hot, and " +
+                        "continuing to run the on-device model right now isn't " +
+                        "safe for the hardware. The model has been unloaded to " +
+                        "let it cool down; nothing generated so far was lost, " +
+                        "and this reply will resume automatically the moment " +
+                        "the device's real thermal status drops back to a safe level."
+                )
             }
         }
         // Reached only after the whole real chunk loop above has genuinely
@@ -974,6 +1563,417 @@ class ChatViewModel(
         // already finished, so messages.value already holds both real
         // card(s)' final state here.
         return codeId ?: botId
+    }
+
+    /**
+     * Phase 25 (real multi-file plan -> per-file generate -> validate ->
+     * fix pipeline, user-requested: "pehle plan banaye, phir tukdo me
+     * tode, phir file line to line likhe, har file create ke baad check
+     * kare, galat ho toh fix kare, ek helper aisa rakhe jo dummy code
+     * pakde"). Real, honest scope (Rule 10/17 - stated plainly, not
+     * hidden): every step below is a genuine on-device operation - real
+     * [PlanningEngine] prompt/parse, a real, auto-continuing
+     * [BrainEngine.generate] chunk loop per file (see
+     * [MAX_FILE_CONTINUATION_CHUNKS]), real [FileValidator] static checks,
+     * up to [MAX_FIX_ATTEMPTS] real regenerate passes on a genuine
+     * validation failure, and a real ZIP bundle (via the same
+     * [ArtifactFileManager.createZip] the older [animateAppCreationPipeline]
+     * path already used) once there's more than one real file. What this
+     * deliberately is NOT: a real compiler/build run. There is no
+     * javac/kotlinc/gradle toolchain reachable from inside this running
+     * app on a phone, so "testing" here is [FileValidator]'s own real
+     * static checks (brace/paren balance, a real XML parse, placeholder-
+     * text detection) - never a fabricated "build succeeded" claim. Real
+     * compile validation is still only the existing GitHub Actions run
+     * after `git push`, same as every earlier phase.
+     *
+     * Returns true only once it has genuinely posted a real, complete
+     * multi-file result message (so the caller must not also call
+     * [streamRealResponse]). Returns false the moment planning itself
+     * isn't confident (no real plan, or fewer than 2 real files) -
+     * whatever was posted for the planning attempt is removed first, so
+     * the caller's own fallback to [streamRealResponse] is the only real
+     * bot reply the user ends up seeing, never two.
+     */
+    private suspend fun runMultiFileBuild(activeSessionId: String, originalRequest: String, extraContextBlock: String): Boolean {
+        val settings = settingsRepository.getSettings()
+        val loadedContextSize = (BrainEngine.state.value as? EngineState.Loaded)?.contextSize ?: settings.contextLength
+
+        val planBotId = nextId++
+        val steps = mutableListOf<ProcessStep>()
+        var nextStepId = 1L
+
+        suspend fun pushRunning(marking: ProcessMarking, label: String? = null): Long {
+            val id = nextStepId++
+            steps.add(ProcessStep(id, marking, ProcessStepStatus.RUNNING, label))
+            upsertBotMessage(planBotId, ChatMessage(id = planBotId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.PROCESS, processSteps = steps.toList()))
+            return id
+        }
+        fun completeStep(id: Long, failed: Boolean = false, label: String? = null) {
+            val index = steps.indexOfFirst { it.id == id }
+            if (index < 0) return
+            val existing = steps[index]
+            steps[index] = existing.copy(status = if (failed) ProcessStepStatus.FAILED else ProcessStepStatus.COMPLETE, label = label ?: existing.label)
+        }
+
+        // Real single generation call, budgeted the same way
+        // [chunkTokenBudget] already sizes every other real call in this
+        // file - never a second, separately-invented budget calculation.
+        // Still used as-is for the planning call itself (a real file list
+        // is always short output, never realistically needs a second
+        // chunk).
+        suspend fun generateOnce(prompt: String): Pair<String, String> {
+            val budget = chunkTokenBudget(loadedContextSize, prompt)
+            if (budget <= 0) return "" to "context_full"
+            var reason = "max_tokens"
+            val builder = StringBuilder()
+            BrainEngine.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it })
+                .collect { builder.append(it) }
+            return builder.toString() to reason
+        }
+
+        // Weakness-review fix, issue 2 - real, bounded auto-continue for a
+        // single file's own generation, same genuine "re-send prompt +
+        // everything real generated so far, ask for another real chunk"
+        // shape [streamRealResponse]'s own main loop already uses, just
+        // capped at [MAX_FILE_CONTINUATION_CHUNKS] instead of
+        // [MAX_CONTINUATION_CHUNKS] - one planned file that stops on
+        // "max_tokens" now keeps genuinely asking for more of itself
+        // instead of silently being handed back to [FileValidator] as if
+        // it were finished. Returns the real, concatenated content plus
+        // the real final stop reason ("end_of_generation", "context_full",
+        // "chunk_cap", or "error").
+        suspend fun generateFileContent(prompt: String): Pair<String, String> {
+            val builder = StringBuilder()
+            var continuationPrompt = prompt
+            var reason = "max_tokens"
+            var chunk = 0
+            while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
+                chunk++
+                if (ThermalPolicy.decide(ThermalMonitor.state.value) == ThermalAction.UNLOAD_AND_PAUSE) {
+                    reason = "thermal_pause"
+                    break
+                }
+                val budget = chunkTokenBudget(loadedContextSize, continuationPrompt)
+                if (budget <= 0) {
+                    reason = "context_full"
+                    break
+                }
+                var chunkReason = "max_tokens"
+                try {
+                    BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it })
+                        .collect { builder.append(it) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    reason = if (e.message?.contains("context window") == true) "context_full" else "error"
+                    break
+                }
+                reason = chunkReason
+                continuationPrompt = prompt + "\n\n" + builder.toString()
+            }
+            if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
+            return builder.toString() to reason
+        }
+
+        // Weakness-review fix, issue 3 - "context sirf pichli 2 files yaad
+        // rakhta hai". Full real content of the last 2 files is still kept
+        // verbatim (unchanged - see [recentFilesContext] below), but every
+        // earlier real file this build already wrote also leaves behind a
+        // short, real "signature" line (its own top-level class/
+        // function/object declarations, taken straight from its own real
+        // generated text - never invented) so a later file that depends on
+        // an *older* one (e.g. file 10 referencing file 2's class name)
+        // still sees a real, if compact, trace of it instead of the model
+        // having to guess. Deliberately cheap: no new model call, just a
+        // real regex read over content this build already produced.
+        // Reuses the same class-level [extractDeclarationNames] the
+        // zip-patch safety check below also uses - not a second, separate
+        // regex definition.
+        fun extractSignature(fileName: String, code: String): String {
+            val names = extractDeclarationNames(code).take(8).toList()
+            return if (names.isEmpty()) "" else "$fileName defines: ${names.joinToString(", ")}"
+        }
+
+        val planningStepId = pushRunning(ProcessMarking.PLANNING)
+        val planningPrompt = PlanningEngine.buildPlanningPrompt(originalRequest, extraContextBlock)
+        val (planningRaw, _) = try {
+            generateOnce(planningPrompt)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            "" to "error"
+        }
+        val plan = PlanningEngine.parsePlan(planningRaw)
+        if (plan == null) {
+            // Real, honest "not confident enough" outcome - remove the
+            // planning-only card entirely (Rule 17 - never leave a
+            // half-finished real card behind) and let the caller fall
+            // back to the existing, unaffected single-response flow.
+            removeBotMessage(planBotId)
+            return false
+        }
+        completeStep(planningStepId, label = "Planning complete")
+        postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(plan))
+        // Weakness-review fix - real, honest heads-up when the model's own
+        // plan is missing a real file a project of this platform
+        // genuinely needs (see [PlanningEngine.missingEssentialFiles]'s
+        // own doc) - reported once, plainly, never silently generated
+        // around.
+        val missingEssentials = PlanningEngine.missingEssentialFiles(originalRequest, plan)
+        if (missingEssentials.isNotEmpty()) {
+            postSystemNote(
+                activeSessionId,
+                "Heads up: this plan doesn't include ${missingEssentials.joinToString(", ")} - " +
+                    "this project likely won't run/build without ${if (missingEssentials.size == 1) "it" else "them"}. " +
+                    "Ask me to add ${if (missingEssentials.size == 1) "it" else "them"} if you need a complete project."
+            )
+        }
+
+        val artifactInfos = mutableListOf<ArtifactInfo>()
+        val fileSummaries = mutableListOf<String>()
+        val generatedSoFar = mutableListOf<Pair<String, String>>() // fileName to content, for later files' own real context
+        val olderFileSignatures = mutableListOf<String>() // real signature lines for files that have aged out of recentFilesContext
+        var contextFullHit = false
+
+        for (planned in plan.files) {
+            if (contextFullHit) {
+                fileSummaries += "- ${planned.fileName}: skipped (context window filled by earlier files this turn)"
+                continue
+            }
+            val creatingStepId = pushRunning(ProcessMarking.CREATING, "Creating ${planned.fileName}")
+
+            val planListText = plan.files.joinToString("\n") { "- ${it.fileName} (${it.language}): ${it.purpose}" }
+            // Real, bounded context from real earlier files this same
+            // build already produced (last 2 in full - same "bounded, not
+            // unbounded" posture [ContextManager]'s own SAFE_CHUNK_CHARS
+            // already documents) - so a dependent file (e.g. a layout
+            // XML referencing an Activity class name) genuinely matches
+            // what was actually written, not a guess. Anything older than
+            // that still contributes its own real, compact signature line
+            // (see [extractSignature] above) so a file depending on an
+            // earlier-aged-out file isn't left with zero real trace of it.
+            val recentFilesContext = selectRelatedFiles(planned, generatedSoFar).joinToString("\n\n") { (name, code) ->
+                "--- Already-written ${name} ---\n${code.take(1500)}${if (code.length > 1500) "\n... (truncated)" else ""}"
+            }
+            val olderSignaturesBlock = olderFileSignatures.joinToString("\n")
+            // Weakness-review fix, issue 4 - the real, full extra-context
+            // block ([extraContextBlock] - attachment + web-search text)
+            // already went into the planning prompt once above; repeating
+            // it in full on every one of N per-file prompts is what was
+            // genuinely exhausting a real 2048-token window by file 6-7.
+            // Capped here to [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP] real
+            // characters instead - still a real, load-bearing snippet, not
+            // the whole thing every time.
+            val trimmedExtraContext = if (extraContextBlock.length > FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
+                extraContextBlock.take(FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this file - see plan summary above for full context)"
+            } else extraContextBlock
+            val filePrompt = buildString {
+                append("Project request: ").append(originalRequest).append("\n")
+                if (trimmedExtraContext.isNotBlank()) append(trimmedExtraContext).append("\n")
+                append("\nFull real file plan for this project:\n").append(planListText).append("\n")
+                if (olderSignaturesBlock.isNotBlank()) append("\nEarlier files already written this build (name + declarations only):\n").append(olderSignaturesBlock).append("\n")
+                if (recentFilesContext.isNotBlank()) append("\n").append(recentFilesContext).append("\n")
+                append(
+                    "\nNow write ONLY the complete, real content of this one file: ${planned.fileName} " +
+                        "(${planned.language}) - ${planned.purpose}\n" +
+                        "Reply with exactly one fenced code block containing the complete file, and nothing else."
+                )
+            }
+
+            // Weakness-review fix, issue 2 - real, auto-continuing
+            // per-file generation (see [generateFileContent] above)
+            // instead of a single bounded call, so a large file (e.g. a
+            // long Activity class) genuinely keeps going across chunks
+            // instead of being handed to [FileValidator] mid-answer.
+            val (rawOutput, stopReason) = try {
+                generateFileContent(filePrompt)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                completeStep(creatingStepId, failed = true, label = "Failed: ${planned.fileName}")
+                fileSummaries += "- ${planned.fileName}: generation failed (${e.message ?: e::class.java.simpleName})"
+                continue
+            }
+            if (stopReason == "context_full") contextFullHit = true
+
+            val extracted = ArtifactExtractor.extract(rawOutput)
+            var content = extracted.firstOrNull()?.content ?: rawOutput.trim()
+            if (content.isBlank()) {
+                completeStep(creatingStepId, failed = true, label = "Failed: ${planned.fileName}")
+                fileSummaries += "- ${planned.fileName}: model returned no real content"
+                continue
+            }
+            completeStep(creatingStepId, label = "Created ${planned.fileName}")
+
+            // Phase 25's own real "helper" (user-requested) - see
+            // [FileValidator]'s own doc for exactly what it does and does
+            // not check.
+            val verifyStepId = pushRunning(ProcessMarking.VERIFYING, "Verifying ${planned.fileName}")
+            var result = FileValidator.validate(planned.fileName, content, wasTruncated = stopReason == "max_tokens" || stopReason == "chunk_cap")
+            if (result.passed) {
+                completeStep(verifyStepId, label = "Verified ${planned.fileName}")
+            } else {
+                completeStep(verifyStepId, failed = true, label = "Issues found: ${planned.fileName}")
+                // Weakness-review fix, issue 6 - real, bounded multi-attempt
+                // fix loop (up to [MAX_FIX_ATTEMPTS], was a single attempt
+                // before). Each real regenerate call is fed the *fresh*
+                // issues [FileValidator] found on the previous real
+                // attempt's own output, never a stale or repeated prompt,
+                // and the loop stops the moment a real attempt genuinely
+                // passes. The real, honest outcome (fixed after N attempts,
+                // or still has known issues after the ceiling) is reported
+                // either way, never silently upgraded.
+                var attempt = 0
+                var fixStepId = -1L
+                while (!result.passed && attempt < MAX_FIX_ATTEMPTS) {
+                    attempt++
+                    fixStepId = pushRunning(ProcessMarking.FIXING, "Fixing ${planned.fileName} (attempt $attempt/$MAX_FIX_ATTEMPTS)")
+                    val fixPrompt = buildString {
+                        append("This file (").append(planned.fileName).append(") has real issues:\n")
+                        result.issues.forEach { append("- ").append(it).append("\n") }
+                        append("\nCurrent content:\n```\n").append(content).append("\n```\n\n")
+                        append("Reply with exactly one fenced code block containing the complete, corrected file, and nothing else.")
+                    }
+                    val (fixedRaw, fixStopReason) = try {
+                        generateFileContent(fixPrompt)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        "" to "error"
+                    }
+                    val fixedExtracted = ArtifactExtractor.extract(fixedRaw).firstOrNull()?.content
+                    if (!fixedExtracted.isNullOrBlank()) {
+                        content = fixedExtracted
+                        result = FileValidator.validate(planned.fileName, content, wasTruncated = fixStopReason == "max_tokens" || fixStopReason == "chunk_cap")
+                    }
+                    if (result.passed) {
+                        completeStep(fixStepId, label = "Fixed ${planned.fileName} (attempt $attempt/$MAX_FIX_ATTEMPTS)")
+                    } else if (attempt >= MAX_FIX_ATTEMPTS) {
+                        completeStep(fixStepId, failed = true, label = "Saved with known issues: ${planned.fileName} ($attempt/$MAX_FIX_ATTEMPTS attempts)")
+                    } else {
+                        completeStep(fixStepId, failed = true, label = "Still has issues: ${planned.fileName} - retrying")
+                    }
+                }
+            }
+
+            val signature = extractSignature(planned.fileName, content)
+            if (signature.isNotBlank()) olderFileSignatures += signature
+            generatedSoFar += planned.fileName to content
+            fileSummaries += if (result.passed) {
+                "- ${planned.fileName}: OK"
+            } else {
+                "- ${planned.fileName}: saved with known issues - ${result.issues.joinToString("; ")}"
+            }
+
+            val file = when (val write = toolGateway.writeArtifactFile(activeSessionId, planned.fileName, content)) {
+                is ToolGateway.GatewayResult.Success -> write.value
+                is ToolGateway.GatewayResult.Denied -> {
+                    fileSummaries[fileSummaries.lastIndex] = "- ${planned.fileName}: could not be saved (${write.reason})"
+                    continue
+                }
+            }
+            val info = ArtifactInfo(
+                id = java.util.UUID.randomUUID().toString(),
+                fileName = file.name,
+                sizeBytes = file.length(),
+                kind = classifyArtifact(file.name),
+                mimeType = mimeTypeForArtifact(file.name),
+                storedPath = file.absolutePath
+            )
+            artifactRepository.save(
+                ArtifactEntity(
+                    id = info.id,
+                    sessionId = activeSessionId,
+                    messageId = planBotId,
+                    fileName = info.fileName,
+                    mimeType = info.mimeType,
+                    kind = info.kind.name,
+                    sizeBytes = info.sizeBytes,
+                    storedPath = info.storedPath,
+                    createdAt = System.currentTimeMillis()
+                )
+            )
+            artifactInfos += info
+        }
+
+        val testingStepId = pushRunning(ProcessMarking.TESTING, "Checking all files against the plan")
+        val passCount = fileSummaries.count { it.endsWith(": OK") }
+        val totalReal = plan.files.size
+        completeStep(testingStepId, failed = passCount < totalReal, label = "$passCount/$totalReal files passed real checks")
+
+        // Weakness-review fix, issue 1 - "naya multi-file path files ko ek
+        // combined .zip me bundle nahi karta". Real zip, built the exact
+        // same way the older [animateAppCreationPipeline] path already
+        // does it ([ArtifactFileManager.createZip] over the real files
+        // just written to disk) - only skipped when there's genuinely
+        // just one real file, same condition that path already uses,
+        // since a 1-file zip has nothing real to bundle.
+        var zipCreated = false
+        if (artifactInfos.size > 1) {
+            val packagingStepId = pushRunning(ProcessMarking.PACKAGING)
+            val zipInfo = runCatching {
+                val zipFile = artifactFileManager.createZip(
+                    artifactInfos.map { File(it.storedPath) },
+                    "project_$planBotId.zip"
+                )
+                val info = ArtifactInfo(
+                    id = java.util.UUID.randomUUID().toString(),
+                    fileName = zipFile.name,
+                    sizeBytes = zipFile.length(),
+                    kind = classifyArtifact(zipFile.name),
+                    mimeType = mimeTypeForArtifact(zipFile.name),
+                    storedPath = zipFile.absolutePath
+                )
+                artifactRepository.save(
+                    ArtifactEntity(
+                        id = info.id,
+                        sessionId = activeSessionId,
+                        messageId = planBotId,
+                        fileName = info.fileName,
+                        mimeType = info.mimeType,
+                        kind = info.kind.name,
+                        sizeBytes = info.sizeBytes,
+                        storedPath = info.storedPath,
+                        createdAt = System.currentTimeMillis()
+                    )
+                )
+                info
+            }.getOrNull()
+            if (zipInfo != null) {
+                artifactInfos += zipInfo
+                zipCreated = true
+                completeStep(packagingStepId, label = "Packaged ${artifactInfos.size - 1} files into ${zipInfo.fileName}")
+            } else {
+                // Real failure (disk/IO) - reported honestly (Rule 1/10),
+                // the individual real files are still saved and still in
+                // [artifactInfos] either way.
+                completeStep(packagingStepId, failed = true, label = "Packaging failed - individual files still saved")
+            }
+        }
+
+        val completeStepId = pushRunning(ProcessMarking.COMPLETE)
+        completeStep(completeStepId)
+
+        val summaryText = buildString {
+            append("Built ${artifactInfos.size - if (zipCreated) 1 else 0} of $totalReal planned files ($passCount passed real static checks").also {
+                if (contextFullHit) append(", stopped early - context window filled")
+            }
+            append(").\n\n").append(fileSummaries.joinToString("\n"))
+            if (zipCreated) append("\n\nAll files packaged into a single ZIP for download.")
+            append(
+                "\n\n(Static checks only - brace/bracket balance, a real XML parse, placeholder-text " +
+                    "detection. This device has no compiler, so a real build/compile check still only " +
+                    "happens via GitHub Actions after you push.)"
+            )
+        }
+        val finalMessage = ChatMessage(
+            id = planBotId, text = summaryText, isUser = false, timestamp = timeNow(),
+            state = BotMessageState.CODE_DONE, processSteps = steps.toList(), artifacts = artifactInfos
+        )
+        upsertBotMessage(planBotId, finalMessage)
+        persistMessage(activeSessionId, finalMessage)
+        return true
     }
 
     /**
@@ -997,6 +1997,58 @@ class ChatViewModel(
      * [RESERVED_OUTPUT_MARGIN_TOKENS] keeps a real floor of room for the
      * model's own reply on top of the prompt itself.
      */
+    /** Real, fixed cap on how many earlier files' full content one per-file prompt can carry - same bounded-not-unbounded posture every other real cap in this file already holds itself to. */
+    private const val MAX_RELATED_FILES_IN_CONTEXT = 3
+
+    /**
+     * Weakness-review fix ("jis chiz ke liye kaam kar raha hoon us file ko
+     * yaad rakhe, jaise theme ke liye 3 file toh 3 file yaad rakhe") - the
+     * old `generatedSoFar.takeLast(2)` carried whichever 2 files were
+     * generated most recently, regardless of whether they were actually
+     * related to the file currently being written. This picks real,
+     * already-generated files that are genuinely related to [planned] -
+     * same directory (a real path-prefix match) or a real shared word
+     * between the two files' own PURPOSE/name text - up to
+     * [MAX_RELATED_FILES_IN_CONTEXT], ranked by relatedness (directory
+     * match first, then purpose-word overlap count). Falls back to the
+     * most recent files when nothing in the plan is genuinely related, so
+     * a file with no real relation to anything earlier is never left with
+     * zero context - same safe default the old code always had.
+     */
+    private fun selectRelatedFiles(
+        planned: PlanningEngine.PlannedFile,
+        generatedSoFar: List<Pair<String, String>>
+    ): List<Pair<String, String>> {
+        if (generatedSoFar.isEmpty()) return emptyList()
+        val plannedDir = planned.fileName.substringBeforeLast('/', "")
+        val plannedWords = (planned.fileName + " " + planned.purpose)
+            .lowercase()
+            .split(Regex("""[^a-z0-9]+"""))
+            .filter { it.length > 2 }
+            .toSet()
+
+        data class Scored(val entry: Pair<String, String>, val score: Int, val order: Int)
+
+        val scored = generatedSoFar.mapIndexed { index, entry ->
+            val (name, _) = entry
+            val sameDir = plannedDir.isNotEmpty() && name.substringBeforeLast('/', "") == plannedDir
+            val nameWords = name.lowercase().split(Regex("""[^a-z0-9]+""")).filter { it.length > 2 }.toSet()
+            val overlap = plannedWords.intersect(nameWords).size
+            val score = (if (sameDir) 100 else 0) + overlap
+            Scored(entry, score, index)
+        }
+
+        val related = scored.filter { it.score > 0 }.sortedWith(compareByDescending<Scored> { it.score }.thenByDescending { it.order })
+        return if (related.isNotEmpty()) {
+            related.take(MAX_RELATED_FILES_IN_CONTEXT).map { it.entry }
+        } else {
+            // Real fallback - nothing genuinely related found, so behave
+            // like the old code did (most recent files) rather than
+            // sending zero context.
+            generatedSoFar.takeLast(2)
+        }
+    }
+
     private fun chunkTokenBudget(contextSize: Int, promptSoFar: String): Int {
         val estimatedPromptTokens = (promptSoFar.length / 3) + 1
         val remaining = contextSize - estimatedPromptTokens - RESERVED_OUTPUT_MARGIN_TOKENS
@@ -1029,6 +2081,17 @@ class ChatViewModel(
          */
         private const val MAX_CONTINUATION_CHUNKS = 64
 
+        /**
+         * Phase 23 - real, short pause between chunks once the real
+         * device thermal status reaches MODERATE (see [ThermalPolicy]) -
+         * long enough to let a mild real temperature rise actually settle
+         * before the next real decode pass, short enough that an
+         * ordinary reply on a device that only ever brushes MODERATE
+         * still finishes in a reasonable, visibly-progressing time
+         * rather than stalling.
+         */
+        private const val THERMAL_COOLING_BREAK_MS = 4000L
+
         /** Per-chunk cap - large on-device models on a phone are already slow; asking for one giant chunk risks a very long unresponsive stretch instead of visible streaming progress. */
         private const val CHUNK_MAX_TOKENS = 1024
 
@@ -1051,6 +2114,45 @@ class ChatViewModel(
             "continue", "keep going", "go on", "next",
             "continue karo", "aage badho", "aage badhao", "jari rakho", "jaari rakho"
         )
+
+        /**
+         * Weakness-review fix (Phase 25 follow-up, issue 2 - "har file
+         * sirf ek generate() call, bada file beech me kat sakti hai").
+         * Same real, bounded auto-continue posture [MAX_CONTINUATION_CHUNKS]
+         * already documents for [streamRealResponse], just a smaller real
+         * ceiling - one planned file is never realistically as large as a
+         * whole multi-turn chat reply, so a lower cap here still leaves
+         * generous real headroom while keeping a single pathological file
+         * from starving every other file still queued in the same build.
+         */
+        private const val MAX_FILE_CONTINUATION_CHUNKS = 8
+
+        /**
+         * Weakness-review fix, issue 6 - "fix sirf ek attempt". Real, fixed
+         * safety ceiling (same "bounded, never infinite" posture as every
+         * other cap in this file) - a genuine second real regenerate pass
+         * fed [FileValidator]'s fresh, specific issues from the first fix's
+         * own real output, not a blind repeat of the same prompt. Still
+         * only ever 2 total real attempts (original + up to 2 fixes) so a
+         * model that genuinely won't converge doesn't stall the rest of
+         * the build.
+         */
+        private const val MAX_FIX_ATTEMPTS = 2
+
+        /**
+         * Weakness-review fix, issue 4 - "har file ke prompt me poora
+         * web-search result dobara jaata hai". [PlanningEngine] already
+         * saw the real, full extra-context block once, while deciding the
+         * real file list itself - repeating that same full block on every
+         * single per-file prompt was real, genuine waste of the same
+         * bounded [loadedContextSize] every other call in this file has to
+         * share, and is exactly what was genuinely exhausting the context
+         * budget by file 6-7 on a real 2048-token window. Per-file prompts
+         * now carry only this many real characters of it (still enough
+         * for a short, load-bearing snippet - a URL, a key fact, a code
+         * signature - never the full original dump).
+         */
+        private const val FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 600
     }
 
     /**
@@ -1326,6 +2428,13 @@ class ChatViewModel(
 
         val newContent = candidates.first().content
         val info = patchZipAndPersist(activeSessionId, rendered.id, zipEditTarget, newContent)
+        // Phase 21 (Risk Gate) - a genuine gateway denial (source ZIP no
+        // longer exists, or the real staged patch itself threw) is
+        // reported honestly rather than silently swallowed: fall back to
+        // the ordinary plain-artifact path so the model's real generated
+        // text is still saved as a file, just not claimed as a successful
+        // ZIP patch that didn't actually happen.
+        if (info == null) return attachArtifactsIfAny(activeSessionId, rendered)
         return rendered.copy(artifacts = listOf(info), artifactSteps = buildZipEditSteps(zipEditTarget.entryName))
     }
 
@@ -1333,18 +2442,94 @@ class ChatViewModel(
      * Phase 16 - the real work: patches exactly the one real ZIP entry
      * [zipEditTarget] resolved to with [newContent] (a real, complete file
      * the model just genuinely generated), streaming every other real
-     * entry through byte-for-byte unchanged ([ArtifactFileManager.patchZip]),
-     * then persists the resulting real ZIP the same way any other artifact
-     * is persisted (Document-Editing Convention - reuses [ArtifactRepository],
-     * no second persistence mechanism invented).
+     * entry through byte-for-byte unchanged. Phase 21 (Master Plan v2 -
+     * Permission/Risk Gate) routes this through [toolGateway] instead of
+     * calling [ArtifactFileManager.patchZip] directly: the gateway stages
+     * a real copy-first patch ([com.brain.offlineai.agent.EditSandbox]),
+     * computes a real diff summary of the real old vs new content, and
+     * records one real, persisted audit row - see [ToolGateway]'s own
+     * doc. Persists the resulting real ZIP the same way any other
+     * artifact is persisted (Document-Editing Convention - reuses
+     * [ArtifactRepository], no second persistence mechanism invented).
+     * Returns null only on a genuine, real gateway denial (see call site).
      */
-    private suspend fun patchZipAndPersist(activeSessionId: String, messageId: Long, zipEditTarget: ZipEditTarget, newContent: String): ArtifactInfo {
+    /**
+     * Weakness-review fix (user request - "extra function/code delete toh
+     * nahin karta, funsion banane ka rule follow hota hai ki nahi") - the
+     * real gap this closes: a ZIP-entry patch only ever *asked* the model
+     * (in the prompt) to keep every other real line as-is; nothing
+     * actually verified the model's own reply honored that before the
+     * patch was written to disk. Same real, cheap, no-model-guess
+     * declaration extraction [extractSignature] already uses for
+     * multi-file context (a plain regex over the file's own real text,
+     * never invented) - reused here (not duplicated) as a class-level
+     * function so both call sites share one real definition.
+     */
+    private val topLevelDeclarationPattern = Regex("""(?m)^\s*(?:public |private |internal |open |abstract |final |data |sealed )*(class|interface|object|enum class|fun)\s+(\w+)""")
+
+    private fun extractDeclarationNames(code: String): Set<String> =
+        topLevelDeclarationPattern.findAll(code).map { "${it.groupValues[1]} ${it.groupValues[2]}" }.toSet()
+
+    /**
+     * Real, deterministic check: which top-level declarations [oldContent]
+     * genuinely had that [newContent] no longer has. Empty for file types
+     * this regex doesn't match anything in (XML/JSON/Gradle/etc - both
+     * sides yield an empty set, so nothing is ever falsely flagged) and
+     * empty for a genuinely clean edit that kept every declaration -
+     * never a guess, only real names that were actually there before and
+     * genuinely aren't there now.
+     */
+    private fun detectRemovedDeclarations(oldContent: String, newContent: String): List<String> {
+        val oldNames = extractDeclarationNames(oldContent)
+        if (oldNames.isEmpty()) return emptyList()
+        val newNames = extractDeclarationNames(newContent)
+        return (oldNames - newNames).sorted()
+    }
+
+    private suspend fun patchZipAndPersist(activeSessionId: String, messageId: Long, zipEditTarget: ZipEditTarget, newContent: String): ArtifactInfo? {
         val sourceZip = File(zipEditTarget.zipStoredPath)
-        val patchedZip = artifactFileManager.patchZip(
-            sourceZip,
-            mapOf(zipEditTarget.entryName to newContent),
-            zipName = zipEditTarget.zipDisplayName
+        // Real, bounded re-read of this entry's current content for the
+        // gateway's real diff summary - the same real, already-proven
+        // read [toolGateway.readZipEntry] uses elsewhere in this file
+        // (same safe-but-slightly-redundant precedent [ContextManager]'s
+        // own doc already documents for itself).
+        val oldContent = toolGateway.readZipEntry(zipEditTarget.zipStoredPath, zipEditTarget.entryName) ?: ""
+        // Weakness-review fix - real pre-flight safety check, before any
+        // write: block a patch that genuinely dropped a real function/
+        // class/object the file had before, instead of writing it and
+        // only showing a line-count diff after the fact. This is the one
+        // real, conservative case this app can actually detect (a named
+        // declaration that existed and now doesn't) - it does not attempt
+        // to detect a genuine, intentional rename, which would need real
+        // semantic understanding this app doesn't have; a deliberate
+        // rename/removal can still go through as a *second* message after
+        // this real, honest warning.
+        val removedDeclarations = detectRemovedDeclarations(oldContent, newContent)
+        if (removedDeclarations.isNotEmpty()) {
+            postSystemNote(
+                activeSessionId,
+                "Blocked patch to ${zipEditTarget.entryName} - it would remove " +
+                    "${removedDeclarations.size} existing declaration${if (removedDeclarations.size > 1) "s" else ""} " +
+                    "that weren't part of the requested change: ${removedDeclarations.joinToString(", ")}. " +
+                    "If this removal is genuinely intended, ask again saying so explicitly."
+            )
+            return null
+        }
+        val result = toolGateway.patchZipEntry(
+            sessionId = activeSessionId,
+            sourceZip = sourceZip,
+            entryName = zipEditTarget.entryName,
+            oldContent = oldContent,
+            newContent = newContent,
+            zipDisplayName = zipEditTarget.zipDisplayName
         )
+        val patchedZip = when (result) {
+            is ToolGateway.GatewayResult.Success -> result.value
+            is ToolGateway.GatewayResult.Denied -> {
+                postSystemNote(activeSessionId, "Could not patch ${zipEditTarget.zipDisplayName}: ${result.reason}")
+                return null
+            }
+        }
         val info = ArtifactInfo(
             id = UUID.randomUUID().toString(),
             fileName = patchedZip.name,
@@ -1385,7 +2570,20 @@ class ChatViewModel(
     }
 
     private suspend fun writeAndPersistArtifact(activeSessionId: String, messageId: Long, candidate: ArtifactCandidate): ArtifactInfo {
-        val file = artifactFileManager.writeArtifact(candidate.fileName, candidate.content)
+        // Phase 21 (Master Plan v2 - Permission/Risk Gate) - routed
+        // through [toolGateway] instead of calling
+        // [ArtifactFileManager.writeArtifact] directly, so this real
+        // write also gets a real, persisted audit row (see
+        // [ToolGateway]'s own doc). A genuine write failure (e.g. real
+        // disk-full) is re-thrown honestly rather than silently
+        // swallowed - same propagate-to-the-caller behavior this
+        // function already had before this phase, since the direct
+        // [ArtifactFileManager.writeArtifact] call it replaces could
+        // itself throw and was never caught here either.
+        val file = when (val result = toolGateway.writeArtifactFile(activeSessionId, candidate.fileName, candidate.content)) {
+            is ToolGateway.GatewayResult.Success -> result.value
+            is ToolGateway.GatewayResult.Denied -> throw IllegalStateException(result.reason)
+        }
         val info = ArtifactInfo(
             id = UUID.randomUUID().toString(),
             fileName = file.name,
@@ -1561,9 +2759,16 @@ class ChatViewModel(
         // to just work. A real imbalance is reported as a real FAILED step
         // (Rule 1/10 - no fake success state).
         val buildOk = verifyArtifactSyntax(finalMessage.artifacts)
-        pushRunning(ProcessMarking.BUILDING, "Building ${fileNames.size} file${if (fileNames.size == 1) "" else "s"}...")
+        // Weakness-review fix - the marking's own default labels
+        // ("Building APK... " / "Build successful") genuinely misread as a
+        // real compile, which this device can never do (see the real doc
+        // above). Both the running and completed labels are overridden
+        // here with the actually-true wording so the UI never implies a
+        // real APK/compile step happened.
+        pushRunning(ProcessMarking.BUILDING, "Running static build check on ${fileNames.size} file${if (fileNames.size == 1) "" else "s"} (no on-device compiler)...")
         if (buildOk) {
-            completeLast()
+            val last = steps.removeAt(steps.lastIndex)
+            steps.add(last.copy(status = ProcessStepStatus.COMPLETE, label = "Static check passed - braces/parens balanced (not a real compile)"))
         } else {
             val last = steps.removeAt(steps.lastIndex)
             steps.add(last.copy(status = ProcessStepStatus.FAILED, label = "Build check failed - unbalanced braces/parens detected"))
@@ -1824,6 +3029,113 @@ class ChatViewModel(
      *  content has moved to a real, separate code card. */
     private fun removeBotMessage(id: Long) {
         messages.value = messages.value.filterNot { it.id == id }
+    }
+
+    /**
+     * Phase 22 (Master Plan v2, revised scope - real, user-supplied
+     * Tavily web-search provider). Calls [WebSearchRepository.search]
+     * (already real, offline-first - see its own doc) and turns a
+     * genuine outcome into either:
+     *  - [WebSearchOutcome.Unavailable] (no stored key, or no real
+     *    connectivity) - returns "" silently, no chat message at all.
+     *    This is the normal path for every user who never configures a
+     *    key, same "zero extra work when the feature isn't configured"
+     *    standard Phase 3's own missing-API-key handling already sets.
+     *  - [WebSearchOutcome.Success] - posts a real [ProcessMarking.SEARCHING]
+     *    step (COMPLETE only once the real HTTP call has genuinely
+     *    returned, never shown as "searching" for a fixed fake duration)
+     *    and returns the real, bounded context block built by
+     *    [WebSearchContextBuilder] from the actual response.
+     *  - [WebSearchOutcome.Failed] - a real key + real connectivity were
+     *    both present but the real call genuinely failed (bad key,
+     *    network error, Tavily-side error). Reported honestly via a real
+     *    [BotMessageState.SYSTEM_NOTE] rather than silently swallowed -
+     *    same "a real failure is shown as a real failure" standard
+     *    Phase 15's error-recovery flow already holds itself to -
+     *    generation still proceeds afterward, fully offline, exactly as
+     *    it would with no key configured at all.
+     */
+    private suspend fun runWebSearch(activeSessionId: String, query: String): String {
+        return when (val outcome = webSearchRepository.search(query)) {
+            is WebSearchOutcome.Unavailable -> {
+                // Weakness-review fix - staying silent when no key is even
+                // configured is still the right default (zero noise for
+                // the overwhelming majority who never set one up - see
+                // this function's own doc). But a user who genuinely DID
+                // configure a real key deserves to know a search they'd
+                // expect to run was skipped this turn, rather than just
+                // getting a reply that quietly has no web context at all.
+                if (webSearchRepository.hasStoredKey()) {
+                    postSystemNote(activeSessionId, "Web search skipped this turn (${outcome.reason}) - continuing offline.")
+                }
+                ""
+            }
+            is WebSearchOutcome.Success -> {
+                val botId = nextId++
+                val step = ProcessStep(
+                    id = 1L,
+                    marking = ProcessMarking.SEARCHING,
+                    status = ProcessStepStatus.COMPLETE,
+                    label = "Search complete (${outcome.results.size} result${if (outcome.results.size == 1) "" else "s"})"
+                )
+                val message = ChatMessage(
+                    id = botId, text = "", isUser = false, timestamp = timeNow(),
+                    state = BotMessageState.PROCESS, processSteps = listOf(step)
+                )
+                upsertBotMessage(botId, message)
+                persistMessage(activeSessionId, message)
+                postSystemNote(activeSessionId, WebSearchContextBuilder.buildSearchingSummary(query, outcome.results.size))
+                WebSearchContextBuilder.buildContextBlock(query, outcome.results, outcome.answer)
+            }
+            is WebSearchOutcome.Failed -> {
+                postSystemNote(activeSessionId, "Web search failed (${outcome.reason}) - continuing offline.")
+                ""
+            }
+        }
+    }
+
+    /**
+     * Weakness-review fix - real, deterministic (no model guess) check for
+     * whether a resolved ZIP-edit message is genuinely only asking to
+     * find/explain/review an issue, not to change anything. Same
+     * conservative posture every other real gate in this file already
+     * holds itself to ([ProjectTypeGate], [ZipEditResolver]): a hit on a
+     * real diagnose-only phrase only counts when no real edit-intent word
+     * is also present - "find the bug and fix it" still resolves to a
+     * genuine edit, never mis-read as review-only just because "find" is
+     * in there too.
+     */
+    /** Shared, real edit-intent keyword set - reused by [isDiagnoseOnlyIntent] and the "resume, still unclear" fallback above so both never drift out of sync. */
+    private val editIntentWords = listOf(
+        "fix", "change", "update", "modify", "banao", "bana do", "badal", "replace",
+        "add", "remove", "delete", "implement", "rewrite", "correct kar", "theek kar", "sudhar"
+    )
+
+    private val diagnoseIntentWords = listOf(
+        "find the bug", "find bug", "what's wrong", "whats wrong", "why is", "why does",
+        "explain", "review", "diagnose", "what error", "any bug", "any issue", "kya galat",
+        "kya error", "kya bug", "kya problem", "dhoondo", "dhundo", "batao kya",
+        "check for bug", "check for error", "is there a bug", "is there an issue"
+    )
+
+    private fun isDiagnoseOnlyIntent(text: String): Boolean {
+        val lower = text.lowercase()
+        return diagnoseIntentWords.any { lower.contains(it) } && editIntentWords.none { lower.contains(it) }
+    }
+
+    /**
+     * Weakness-review fix - the real gap this closes: a message with
+     * NEITHER a real diagnose word NOR a real edit word used to silently
+     * fall through [isDiagnoseOnlyIntent] as "not diagnose-only", which
+     * meant the resolved target file got the full-rewrite prompt by
+     * default even though the user never actually said "change" anything.
+     * Real, deterministic, same no-model-guess posture as every other
+     * gate here - a genuinely unclear message now stops and asks instead
+     * of guessing "edit" was meant.
+     */
+    private fun isIntentUnclear(text: String): Boolean {
+        val lower = text.lowercase()
+        return diagnoseIntentWords.none { lower.contains(it) } && editIntentWords.none { lower.contains(it) }
     }
 
     private suspend fun postSystemNote(activeSessionId: String, text: String) {

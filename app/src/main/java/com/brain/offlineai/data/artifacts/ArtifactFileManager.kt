@@ -48,6 +48,22 @@ class ArtifactFileManager(private val context: Context) {
         val destDir = File(artifactsDir, UUID.randomUUID().toString()).apply { mkdirs() }
         val destFile = File(destDir, sanitizeFileName(fileName))
         destFile.writeText(content)
+        // Weakness-review fix ("file sach me ban rahi hai ya nahi check
+        // kare") - writeText() normally throws on a real IO failure, but a
+        // partial/interrupted write (e.g. disk full mid-write) can still
+        // leave a file that exists with the wrong byte count without ever
+        // throwing. A real, cheap post-write check - re-read the file's
+        // own real length and compare to the real content that was meant
+        // to be written - so a silently-truncated save is reported as a
+        // genuine failure instead of the caller assuming success just
+        // because no exception was thrown.
+        val expectedBytes = content.toByteArray(Charsets.UTF_8).size.toLong()
+        if (!destFile.exists() || destFile.length() != expectedBytes) {
+            throw java.io.IOException(
+                "Write verification failed for ${destFile.name}: expected $expectedBytes bytes, " +
+                    "found ${if (destFile.exists()) destFile.length() else -1}."
+            )
+        }
         return destFile
     }
 

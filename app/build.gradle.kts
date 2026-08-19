@@ -13,7 +13,7 @@ android {
         applicationId = "com.brain.offlineai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 15
+        versionCode = 21
         versionName = "1.0.0"
 
         vectorDrawables.useSupportLibrary = true
@@ -111,6 +111,12 @@ dependencies {
     // Holds the random SQLCipher passphrase itself behind Android Keystore
     // (AES256-GCM), so the encryption key isn't just sitting in plain
     // SharedPreferences next to the DB it protects.
+    // Phase 22 (real, user-supplied Tavily web-search provider) reuses
+    // this same security-crypto dependency for WebSearchKeyStore's
+    // EncryptedSharedPreferences, and org.json (already pulled in by
+    // Phase 4 below) for parsing Tavily's real JSON response - no new
+    // Gradle dependency needed for outbound HTTPS either, since
+    // HttpURLConnection ships with the JDK/Android itself (Rule 20).
     implementation("androidx.security:security-crypto:1.1.0-alpha06")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
@@ -127,4 +133,15 @@ dependencies {
     // androidx.core, already pulled in transitively by core-ktx above -
     // no extra line needed for it.
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+
+    // Phase 24 - real PDF text extraction (PROGRESS.md's own recorded open
+    // gap: "PDF/Word/any document content is never actually read"). This
+    // is a real, offline, on-device Android port of Apache PDFBox - no
+    // network call at runtime, same offline-only posture every other real
+    // capability in this app already holds itself to. Only PDF is wired
+    // this phase (see AttachmentContentReader.readPdfTextPreview) - Word
+    // (.doc/.docx) reading is still a real, separate, not-yet-started gap
+    // (different real format, would need a different real library
+    // decision - not silently bundled in under the same claim).
+    implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 }

@@ -3,6 +3,7 @@ package com.brain.offlineai
 import android.app.Application
 import android.os.Environment
 import android.util.Log
+import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import java.io.File
 import java.io.PrintWriter
 import java.io.StringWriter
@@ -13,6 +14,12 @@ import java.util.Locale
 class BrainApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+
+        // Phase 24 - real, one-time PDFBox-Android resource init (loads its
+        // bundled font/encoding resources from assets). Required before any
+        // real PDDocument.load call - see
+        // AttachmentContentReader.readPdfTextPreview.
+        PDFBoxResourceLoader.init(applicationContext)
 
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
 

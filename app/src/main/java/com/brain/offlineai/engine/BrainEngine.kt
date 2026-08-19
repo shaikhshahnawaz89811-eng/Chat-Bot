@@ -14,6 +14,20 @@ sealed class EngineState {
     data class Loading(val modelName: String) : EngineState()
     data class Loaded(val modelName: String, val contextSize: Int) : EngineState()
     data class Error(val message: String) : EngineState()
+    /**
+     * Phase 23 (Appendix - Mobile Thermal Management) - a real, distinct
+     * state from plain [Unloaded]: the model was genuinely unloaded by
+     * [BrainEngine.pauseForThermal] because the real device thermal
+     * status reached SEVERE+ (see
+     * [com.brain.offlineai.engine.thermal.ThermalPolicy]), not because
+     * the user ever chose to unload it or never loaded one in the first
+     * place. Kept separate so the AI Engine Status card (and
+     * [com.brain.offlineai.ui.screens.chat.ChatViewModel]'s own resume
+     * check) can tell "genuinely nothing to reload" apart from "there is
+     * a real model to reload, and a real paused task waiting on it, the
+     * moment the device cools down".
+     */
+    data class ThermalPaused(val modelName: String, val contextSize: Int) : EngineState()
 }
 
 /**
@@ -34,7 +48,7 @@ object BrainEngine {
      * (mmap + metadata parse) is CPU/IO-bound and can take several seconds
      * for a multi-hundred-MB GGUF file - never on the main thread.
      */
-    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 2048, nThreads: Int = 4) {
+    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 4096, nThreads: Int = 4) {
         _state.value = EngineState.Loading(modelDisplayName)
         withContext(Dispatchers.Default) {
             if (!backendReady) {
@@ -54,6 +68,24 @@ object BrainEngine {
             BrainNative.nativeUnloadModel()
         }
         _state.value = EngineState.Unloaded
+    }
+
+    /**
+     * Phase 23 (Appendix - Mobile Thermal Management) - the real, same
+     * native unload [unloadModel] already does (Rule 4 - one real
+     * implementation, not a second reimplementation of the native
+     * teardown call), but landing on [EngineState.ThermalPaused] instead
+     * of plain [EngineState.Unloaded] so the rest of the app can tell
+     * this genuinely wasn't the user's own choice - see that state's own
+     * doc. No-ops (returns without touching native state) if nothing was
+     * actually loaded, since there's nothing real to pause.
+     */
+    suspend fun pauseForThermal() {
+        val loaded = _state.value as? EngineState.Loaded ?: return
+        withContext(Dispatchers.Default) {
+            BrainNative.nativeUnloadModel()
+        }
+        _state.value = EngineState.ThermalPaused(loaded.modelName, loaded.contextSize)
     }
 
     val isLoaded: Boolean

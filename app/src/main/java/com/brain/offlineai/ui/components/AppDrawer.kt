@@ -68,6 +68,9 @@ private fun DrawerHeader() {
         is EngineState.Loading -> "Loading ${state.modelName}..."
         is EngineState.Error -> "No model loaded - import + load a .gguf in Models"
         is EngineState.Unloaded -> "No model loaded - import + load a .gguf in Models"
+        // Phase 23 - genuinely different from plain Unloaded, see
+        // EngineState.ThermalPaused's own doc.
+        is EngineState.ThermalPaused -> "Paused - device cooling down, will auto-resume"
     }
 
     Row(
@@ -139,8 +142,17 @@ private fun AiEngineStatusCard() {
         is EngineState.Loading -> "Loading model..." to BrainWarningAmber
         is EngineState.Error -> "Engine error" to BrainDangerRed
         is EngineState.Unloaded -> "No model loaded" to BrainTextMuted
+        // Phase 23 - real, distinct "cooling down" status, not the same
+        // amber used for a genuine in-progress Loading state below.
+        is EngineState.ThermalPaused -> "Cooling down..." to BrainWarningAmber
     }
-    val modelName = (engineState as? EngineState.Loaded)?.modelName ?: "No model imported yet"
+    // Phase 23 - a thermally-paused model is still genuinely the model
+    // the user has installed, so its real name stays shown instead of
+    // falling back to "No model imported yet" (which would be honest for
+    // Unloaded but false here).
+    val modelName = (engineState as? EngineState.Loaded)?.modelName
+        ?: (engineState as? EngineState.ThermalPaused)?.modelName
+        ?: "No model imported yet"
 
     Column(
         modifier = Modifier

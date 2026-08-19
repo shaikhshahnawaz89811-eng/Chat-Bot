@@ -16,6 +16,15 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- Phase 22: real, user-supplied Tavily web-search provider.
+         ACCESS_NETWORK_STATE is the real permission
+         ConnectivityChecker.hasInternet() needs to genuinely read the
+         device's current network capabilities before ever attempting a
+         real outbound call to api.tavily.com - INTERNET above already
+         covers the outbound HTTPS call itself (same permission Phase 4's
+         Local API server already declared). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Phase 11: Artifact card + ZIP/file output + download flow. Only
          needed for the real legacy (API 26-28) "Save to Device" path in
          ArtifactFileManager.exportToDownloads - API 29+ uses scoped-storage

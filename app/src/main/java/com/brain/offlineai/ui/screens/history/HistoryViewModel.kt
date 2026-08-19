@@ -3,6 +3,10 @@ package com.brain.offlineai.ui.screens.history
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.brain.offlineai.agent.AgentAuditRepository
+import com.brain.offlineai.agent.AgentTaskRepository
+import com.brain.offlineai.agent.ProjectTypePauseRepository
+import com.brain.offlineai.agent.ThermalPauseRepository
 import com.brain.offlineai.data.artifacts.ArtifactRepository
 import com.brain.offlineai.data.attachments.AttachmentRepository
 import com.brain.offlineai.data.history.ChatHistoryRepository
@@ -32,6 +36,27 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
     // real generated-file rows/files would otherwise also become orphans.
     private val artifactRepository = ArtifactRepository(application)
 
+    // Phase 19 - same real cleanup for any pending agent task (see
+    // AgentClarificationGate): a deleted session's paused clarification
+    // question would otherwise become an orphan row with no session left
+    // to resume it.
+    private val agentTaskRepository = AgentTaskRepository(application)
+
+    // Phase 21 - same real cleanup for the tool-call audit trail (see
+    // ToolGateway): a deleted session's real audit rows would otherwise
+    // become orphans with no session left to reference them.
+    private val agentAuditRepository = AgentAuditRepository(application)
+
+    // Phase 23 - same real cleanup for a paused thermal-throttled
+    // generation (see ThermalPauseEntity): a deleted session's paused
+    // task would otherwise become an orphan row with no session left to
+    // resume it, same reasoning agentTaskRepository's own cleanup above
+    // already follows.
+    private val thermalPauseRepository = ThermalPauseRepository(application)
+
+    // Phase 24 - real cleanup for a deleted session's real project-type-gate row.
+    private val projectTypePauseRepository = ProjectTypePauseRepository(application)
+
     val sessions = repository.observeSessions()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -40,6 +65,10 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             attachmentRepository.deleteForSession(sessionId)
             artifactRepository.deleteForSession(sessionId)
+            agentTaskRepository.deleteForSession(sessionId)
+            agentAuditRepository.deleteForSession(sessionId)
+            thermalPauseRepository.deleteForSession(sessionId)
+            projectTypePauseRepository.deleteForSession(sessionId)
             repository.deleteSession(sessionId)
         }
     }

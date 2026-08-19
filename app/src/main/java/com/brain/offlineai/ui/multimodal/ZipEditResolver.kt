@@ -55,4 +55,55 @@ object ZipEditResolver {
         // Exactly one real, unambiguous match only - see class doc above.
         return candidates.singleOrNull()
     }
+
+    /** Real, bounded set of file extensions this fallback will actually open and scan - same "readable text only" boundary [AttachmentContentReader.isTextReadable] already enforces elsewhere. */
+    private val SCANNABLE_EXTENSIONS = setOf("kt", "kts", "java", "js", "jsx", "ts", "tsx", "py", "go", "rs", "swift", "c", "cpp", "h", "hpp", "cs", "php", "rb", "dart")
+
+    /** Real declaration shapes this fallback recognizes - a symbol is only treated as "defined here" when it appears after one of these real keywords, never a bare-word text match that could hit a comment, a call site, or an unrelated string. */
+    private val declarationKeyword = Regex("""\b(fun|function|def|class|interface|object|struct|void|int|String|const|let|var)\s+(\w+)\s*[(<{]""")
+
+    /**
+     * Weakness-review fix - [resolveEditTarget] above only ever matches a
+     * real *file* name against the message; a message that names a
+     * *function/class* instead ("fix calculateTotal", "there's a bug in
+     * the LoginActivity class") never resolved to anything, so the caller
+     * fell back to no real edit target at all even though the user
+     * genuinely pointed at something specific.
+     *
+     * Real, bounded fallback: pulls identifier-shaped words out of the
+     * user's own message (plain regex - never a model guess at what they
+     * meant), then genuinely reads each real, text-scannable entry's
+     * content (bounded to [maxEntriesScanned] entries, same real
+     * [AttachmentContentReader.readZipEntryText] this project already
+     * uses elsewhere) looking for a real declaration of that exact
+     * identifier. Only resolves when the identifier is genuinely declared
+     * in **exactly one** real entry - the same "zero or ambiguous means no
+     * target, never a guess" posture [resolveEditTarget] already holds
+     * itself to above.
+     */
+    suspend fun resolveEditTargetByDeclaration(
+        entries: List<AttachmentContentReader.ZipEntrySummary>,
+        storedPath: String,
+        messageText: String,
+        maxEntriesScanned: Int = 40
+    ): AttachmentContentReader.ZipEntrySummary? {
+        val identifiers = Regex("""\b[A-Za-z_][A-Za-z0-9_]{2,}\b""").findAll(messageText)
+            .map { it.value }
+            .filter { it[0].isUpperCase() || it.any { c -> c.isUpperCase() } || it.contains('_') }
+            .toList()
+        if (identifiers.isEmpty()) return null
+
+        val scannable = entries.filter { entry ->
+            !entry.isDirectory && entry.name.substringAfterLast('.', "").lowercase() in SCANNABLE_EXTENSIONS
+        }.take(maxEntriesScanned)
+
+        val matches = mutableListOf<AttachmentContentReader.ZipEntrySummary>()
+        for (entry in scannable) {
+            val content = AttachmentContentReader.readZipEntryText(storedPath, entry.name) ?: continue
+            val declaredHere = declarationKeyword.findAll(content).map { it.groupValues[2] }.toSet()
+            if (identifiers.any { it in declaredHere }) matches += entry
+            if (matches.size > 1) break // already ambiguous - no need to keep scanning
+        }
+        return matches.singleOrNull()
+    }
 }

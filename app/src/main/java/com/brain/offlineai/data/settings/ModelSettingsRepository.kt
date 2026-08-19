@@ -45,7 +45,7 @@ class ModelSettingsRepository(context: Context) {
         private const val KEY_TOP_P = "top_p"
         private const val KEY_THREADS = "threads"
 
-        const val DEFAULT_CONTEXT_LENGTH = 2048
+        const val DEFAULT_CONTEXT_LENGTH = 4096
         const val MIN_CONTEXT_LENGTH = 512
         const val MAX_CONTEXT_LENGTH = 8192
 

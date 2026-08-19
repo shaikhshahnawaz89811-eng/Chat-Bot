@@ -11,6 +11,8 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Preview
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.*
@@ -31,6 +33,18 @@ private fun iconFor(kind: ArtifactKind): ImageVector = when (kind) {
     ArtifactKind.ZIP -> Icons.Filled.FolderZip
     ArtifactKind.CODE -> Icons.Filled.InsertDriveFile
     ArtifactKind.TEXT -> Icons.Filled.InsertDriveFile
+}
+
+/**
+ * Real, extension-only check (same "never guessed from what the user
+ * typed" convention [classifyArtifact] already documents for itself) -
+ * true only for a real `.html`/`.htm` file actually written to disk, the
+ * one real case [com.brain.offlineai.ui.screens.preview.WebPreviewScreen]
+ * can genuinely render on its own without resolving sibling files first.
+ */
+fun isPreviewableArtifact(artifact: ArtifactInfo): Boolean {
+    val ext = artifact.fileName.substringAfterLast('.', "").lowercase()
+    return ext == "html" || ext == "htm"
 }
 
 /** Real human-readable size, same convention as [formatAttachmentSize]. */
@@ -60,7 +74,21 @@ fun ArtifactCard(
     zipDownloadId: String,
     onDownload: (ArtifactInfo, ArtifactDownloadTarget) -> Unit,
     onDownloadAll: (List<ArtifactInfo>) -> Unit,
-    onCancelDownload: (String) -> Unit = {}
+    onCancelDownload: (String) -> Unit = {},
+    // Web Preview feature - additive, safe no-op default so every existing
+    // call site (both real ones in ChatBubbles.kt) keeps compiling
+    // unchanged until wired (Document-Editing Convention, same as every
+    // other additive param already on this function).
+    onPreview: (ArtifactInfo) -> Unit = {},
+    // GitHub Hosting feature - same additive, safe no-op default
+    // convention. onPublish handles one file's own "Publish to GitHub"
+    // row action; onPublishAll handles the group action (shown only when
+    // there's more than one artifact, same gating [ArtifactZipRow]
+    // already uses for "Download All") so a multi-file generated site
+    // (html + its own css/js siblings) can be published together in one
+    // real repo/commit set.
+    onPublish: (ArtifactInfo) -> Unit = {},
+    onPublishAll: (List<ArtifactInfo>) -> Unit = {}
 ) {
     if (artifacts.isEmpty()) return
 
@@ -88,7 +116,9 @@ fun ArtifactCard(
                     artifact = artifact,
                     state = downloadStates[artifact.id] ?: ArtifactDownloadUiState.Idle,
                     onDownload = { target -> onDownload(artifact, target) },
-                    onCancel = { onCancelDownload(artifact.id) }
+                    onCancel = { onCancelDownload(artifact.id) },
+                    onPreview = { onPreview(artifact) },
+                    onPublish = { onPublish(artifact) }
                 )
                 if (index != artifacts.lastIndex) Spacer(Modifier.height(8.dp))
             }
@@ -102,6 +132,15 @@ fun ArtifactCard(
                     onCancel = { onCancelDownload(zipDownloadId) }
                 )
             }
+
+            // GitHub Hosting feature - only shown when at least one real
+            // HTML/HTM artifact is present (same [isPreviewableArtifact]
+            // check the per-row Publish button uses), since a repo with no
+            // entry file has nothing for GitHub Pages to actually serve.
+            if (artifacts.any { isPreviewableArtifact(it) }) {
+                Spacer(Modifier.height(8.dp))
+                ArtifactPublishAllRow(fileCount = artifacts.size, onPublishAll = { onPublishAll(artifacts) })
+            }
         }
     }
 }
@@ -111,7 +150,9 @@ private fun ArtifactRow(
     artifact: ArtifactInfo,
     state: ArtifactDownloadUiState,
     onDownload: (ArtifactDownloadTarget) -> Unit,
-    onCancel: () -> Unit
+    onCancel: () -> Unit,
+    onPreview: () -> Unit = {},
+    onPublish: () -> Unit = {}
 ) {
     var showOptions by remember { mutableStateOf(false) }
 
@@ -128,6 +169,22 @@ private fun ArtifactRow(
             Column(modifier = Modifier.weight(1f)) {
                 Text(artifact.fileName, color = BrainTextPrimary, style = MaterialTheme.typography.bodyMedium, maxLines = 1)
                 Text(formatArtifactSize(artifact.sizeBytes), color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+            }
+            // Web Preview - only a real .html/.htm artifact gets this
+            // button (see isPreviableArtifact's own doc); shown even
+            // while a download is exporting since preview and download
+            // are two independent, non-conflicting real actions.
+            if (isPreviewableArtifact(artifact)) {
+                IconButton(onClick = onPreview, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Filled.Preview, contentDescription = "Preview ${artifact.fileName}", tint = BrainCyanAccent, modifier = Modifier.size(18.dp))
+                }
+                // GitHub Hosting feature - same real-file-only gating as
+                // the Preview button right above it: only a genuine
+                // HTML/HTM artifact already on disk can become a repo's
+                // "index.html" entry point.
+                IconButton(onClick = onPublish, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Filled.Public, contentDescription = "Publish ${artifact.fileName} to GitHub", tint = BrainSuccessGreen, modifier = Modifier.size(18.dp))
+                }
             }
             if (state !is ArtifactDownloadUiState.Exporting) {
                 IconButton(onClick = { showOptions = !showOptions }, modifier = Modifier.size(28.dp)) {
@@ -249,6 +306,36 @@ private fun ArtifactZipRow(
                 }
             }
         }
+    }
+}
+
+/**
+ * GitHub Hosting feature - the group "Publish to GitHub" row, same shape
+ * as [ArtifactZipRow] right above it. A tap here publishes every artifact
+ * of this message together (the html one becomes the repo's real
+ * "index.html", every other one keeps its own real name - see
+ * [com.brain.offlineai.data.github.GitHubPublishRepository.buildRepoPathPlan]),
+ * so a generated site whose html references a real sibling
+ * `style.css`/`script.js` artifact publishes as one working real site
+ * instead of requiring a separate publish per file.
+ */
+@Composable
+private fun ArtifactPublishAllRow(fileCount: Int, onPublishAll: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(BrainBgCardAlt)
+            .clickable(onClick = onPublishAll)
+            .padding(10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(Icons.Filled.Public, contentDescription = null, tint = BrainSuccessGreen, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(
+            if (fileCount > 1) "Publish All to GitHub ($fileCount files)" else "Publish to GitHub",
+            color = BrainSuccessGreen, style = MaterialTheme.typography.bodyMedium
+        )
     }
 }
 

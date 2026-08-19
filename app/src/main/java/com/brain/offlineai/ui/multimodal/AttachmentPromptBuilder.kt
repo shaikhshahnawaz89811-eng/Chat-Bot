@@ -20,7 +20,8 @@ object AttachmentPromptBuilder {
 
     suspend fun buildContextBlock(
         routes: List<AttachmentRoute>,
-        attachmentsById: Map<String, AttachmentInfo>
+        attachmentsById: Map<String, AttachmentInfo>,
+        chunkedZipSummaries: Map<String, String> = emptyMap()
     ): String {
         if (routes.isEmpty()) return ""
 
@@ -34,10 +35,29 @@ object AttachmentPromptBuilder {
                         val preview = AttachmentContentReader.readTextPreview(info.storedPath)
                         if (preview != null) "Content:\n$preview" else "(file content could not be read as text)"
                     }
+                    // Phase 24 - real PDF text extraction (PROGRESS.md's
+                    // own recorded open gap). A scanned/image-only PDF
+                    // with no real text layer honestly falls through to
+                    // the same "could not be read" message below - this
+                    // app has no OCR, so it never fabricates text for one.
+                    AttachmentContentReader.isPdfReadable(route.fileName) -> {
+                        val preview = AttachmentContentReader.readPdfTextPreview(info.storedPath)
+                        if (preview != null) "Content:\n$preview" else "(PDF content could not be extracted - it may be a scanned/image-only PDF with no real text layer)"
+                    }
                     else -> "(binary file - content is not readable by this app)"
                 }
                 AttachmentKind.ZIP -> when {
                     info == null -> "(attachment metadata unavailable)"
+                    // Phase 20 (Context Manager) - this ZIP's real entry
+                    // listing was too large for a single safe read; the
+                    // caller already ran the real Chunk 1-5 sequence as
+                    // its own visible SYSTEM_NOTEs (see ChatViewModel) and
+                    // hands back only Chunk 1's own bounded structure
+                    // summary here, instead of the unbounded raw entry
+                    // dump below - never both at once.
+                    chunkedZipSummaries.containsKey(route.attachmentId) ->
+                        "Project structure (full entry list shown separately via the chunked context above):\n" +
+                            chunkedZipSummaries.getValue(route.attachmentId)
                     else -> {
                         val entries = AttachmentContentReader.listZipEntries(info.storedPath)
                         if (entries.isEmpty()) {

@@ -25,6 +25,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.core.content.ContextCompat
 import androidx.navigation.navArgument
+import com.brain.offlineai.data.artifacts.ArtifactInfo
 import com.brain.offlineai.data.settings.AppSettingsRepository
 import com.brain.offlineai.data.settings.AppSettingsState
 import com.brain.offlineai.navigation.Screen
@@ -33,6 +34,7 @@ import com.brain.offlineai.ui.components.AppDrawerContent
 import com.brain.offlineai.ui.components.BrainBottomNavBar
 import com.brain.offlineai.ui.screens.about.AboutScreen
 import com.brain.offlineai.ui.screens.analytics.AnalyticsScreen
+import com.brain.offlineai.ui.screens.preview.WebPreviewScreen
 import com.brain.offlineai.ui.screens.apikeys.ApiKeysListScreen
 import com.brain.offlineai.ui.screens.apikeys.CopyKeyScreen
 import com.brain.offlineai.ui.screens.apikeys.CreateApiKeyScreen
@@ -46,6 +48,9 @@ import com.brain.offlineai.ui.screens.modelsettings.ModelSettingsScreen
 import com.brain.offlineai.ui.screens.models.ModelsScreen
 import com.brain.offlineai.ui.screens.settings.GeneralSettingsScreen
 import com.brain.offlineai.ui.screens.storage.StorageScreen
+import com.brain.offlineai.ui.screens.github.GitHubPublishScreen
+import com.brain.offlineai.ui.screens.github.GitHubSettingsScreen
+import com.brain.offlineai.ui.screens.websearch.WebSearchSettingsScreen
 import com.brain.offlineai.ui.theme.BrainOfflineAITheme
 import kotlinx.coroutines.launch
 
@@ -136,7 +141,18 @@ fun BrainApp() {
                 modifier = Modifier.padding(innerPadding)
             ) {
                 composable(Screen.Chat.route) {
-                    ChatScreen(onMenuClick = { scope.launch { drawerState.open() } })
+                    ChatScreen(
+                        onMenuClick = { scope.launch { drawerState.open() } },
+                        onPreviewArtifact = { artifact ->
+                            navController.navigate(Screen.WebPreview.routeFor(artifact.fileName, artifact.storedPath))
+                        },
+                        onPublishArtifact = { artifact ->
+                            navController.navigate(Screen.GitHubPublish.routeFor(listOf(artifact.fileName to artifact.storedPath)))
+                        },
+                        onPublishAllArtifacts = { artifacts ->
+                            navController.navigate(Screen.GitHubPublish.routeFor(artifacts.map { it.fileName to it.storedPath }))
+                        }
+                    )
                 }
                 composable(Screen.History.route) {
                     HistoryScreen(onOpenSession = { sessionId ->
@@ -157,7 +173,36 @@ fun BrainApp() {
                         if (sessionId == activeSessionId) {
                             navController.navigateSingleTop(Screen.Chat.route)
                         } else {
-                            navController.navigate(Screen.ChatSession.routeFor(sessionId))
+                            // Bug fix (repeated History-open memory leak) - this
+                            // used to be a bare navigate() with no popUpTo/
+                            // launchSingleTop, so every single tap on a History
+                            // row (even the same one re-opened, even after
+                            // pressing back) pushed one more NavBackStackEntry
+                            // onto the graph - and each entry keeps its own
+                            // real ChatViewModel alive (own loaded message/
+                            // attachment/artifact list, own ThermalMonitor
+                            // collector coroutine - see ChatViewModel.init).
+                            // Two or three opens went unnoticed; doing it
+                            // repeatedly grew that retained memory without
+                            // bound until the process genuinely ran out and
+                            // crashed/got reclaimed - which throws away
+                            // anything not yet actually written to Room,
+                            // matching "kaam gayab ho gaya, history me sirf
+                            // user ka message" exactly. Every other detail
+                            // screen in this graph (ApiKeyDetails, KeyOptions,
+                            // ModelSettings, Storage, ...) already stays one
+                            // level deep the same way - popUpTo(History) here
+                            // just gives ChatSession the same real ceiling: at
+                            // most one ChatSession entry (and one real
+                            // ChatViewModel for a past session) ever alive at
+                            // once, no matter how many times a user opens
+                            // history items. Back from it still lands on
+                            // History exactly as before - no visible
+                            // navigation behavior changes.
+                            navController.navigate(Screen.ChatSession.routeFor(sessionId)) {
+                                launchSingleTop = true
+                                popUpTo(Screen.History.route) { inclusive = false }
+                            }
                         }
                     })
                 }
@@ -166,7 +211,19 @@ fun BrainApp() {
                     arguments = listOf(navArgument("sessionId") { type = NavType.StringType })
                 ) { backStackEntry ->
                     val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
-                    ChatScreen(onMenuClick = { scope.launch { drawerState.open() } }, openSessionId = sessionId)
+                    ChatScreen(
+                        onMenuClick = { scope.launch { drawerState.open() } },
+                        openSessionId = sessionId,
+                        onPreviewArtifact = { artifact ->
+                            navController.navigate(Screen.WebPreview.routeFor(artifact.fileName, artifact.storedPath))
+                        },
+                        onPublishArtifact = { artifact ->
+                            navController.navigate(Screen.GitHubPublish.routeFor(listOf(artifact.fileName to artifact.storedPath)))
+                        },
+                        onPublishAllArtifacts = { artifacts ->
+                            navController.navigate(Screen.GitHubPublish.routeFor(artifacts.map { it.fileName to it.storedPath }))
+                        }
+                    )
                 }
                 composable(Screen.Models.route) {
                     ModelsScreen(onOpenSettings = { navController.navigate(Screen.ModelSettings.route) })
@@ -177,11 +234,36 @@ fun BrainApp() {
                 composable(Screen.Settings.route) {
                     GeneralSettingsScreen(
                         onOpenStorage = { navController.navigate(Screen.Storage.route) },
-                        onOpenAbout = { navController.navigate(Screen.About.route) }
+                        onOpenAbout = { navController.navigate(Screen.About.route) },
+                        onOpenWebSearch = { navController.navigate(Screen.WebSearchSettings.route) },
+                        onOpenGitHub = { navController.navigate(Screen.GitHubSettings.route) }
+                    )
+                }
+                composable(Screen.GitHubSettings.route) {
+                    GitHubSettingsScreen(onBack = { navController.popBackStack() })
+                }
+                composable(
+                    route = Screen.GitHubPublish.route,
+                    arguments = listOf(navArgument("encodedFiles") { type = NavType.StringType })
+                ) { backStackEntry ->
+                    // NavType.StringType already URL-decodes the route
+                    // placeholder once on the way in (same convention
+                    // Screen.WebPreview's own composable below relies on),
+                    // matching the real encode Screen.GitHubPublish.routeFor()
+                    // did going out - no double-decode needed here.
+                    val encodedFiles = backStackEntry.arguments?.getString("encodedFiles") ?: return@composable
+                    val files = Screen.GitHubPublish.parseFiles(encodedFiles)
+                    GitHubPublishScreen(
+                        files = files,
+                        onBack = { navController.popBackStack() },
+                        onOpenSettings = { navController.navigate(Screen.GitHubSettings.route) }
                     )
                 }
                 composable(Screen.Storage.route) {
                     StorageScreen(onBack = { navController.popBackStack() })
+                }
+                composable(Screen.WebSearchSettings.route) {
+                    WebSearchSettingsScreen(onBack = { navController.popBackStack() })
                 }
                 composable(Screen.ApiKeys.route) {
                     ApiKeysListScreen(
@@ -236,6 +318,27 @@ fun BrainApp() {
                 }
                 composable(Screen.LocalApi.route) {
                     LocalApiScreen(onBack = { navController.popBackStack() })
+                }
+                composable(
+                    route = Screen.WebPreview.route,
+                    arguments = listOf(
+                        navArgument("fileName") { type = NavType.StringType },
+                        navArgument("encodedPath") { type = NavType.StringType }
+                    )
+                ) { backStackEntry ->
+                    val fileName = backStackEntry.arguments?.getString("fileName") ?: return@composable
+                    // NavType.StringType already URL-decodes route placeholders once
+                    // on the way in, matching the real encode Screen.WebPreview.routeFor()
+                    // did going out - no double-decode needed here.
+                    val storedPath = backStackEntry.arguments?.getString("encodedPath") ?: return@composable
+                    WebPreviewScreen(
+                        fileName = fileName,
+                        storedPath = storedPath,
+                        onBack = { navController.popBackStack() },
+                        onPublish = {
+                            navController.navigate(Screen.GitHubPublish.routeFor(listOf(fileName to storedPath)))
+                        }
+                    )
                 }
                 composable(Screen.Analytics.route) { AnalyticsScreen() }
                 composable(Screen.About.route) { AboutScreen() }

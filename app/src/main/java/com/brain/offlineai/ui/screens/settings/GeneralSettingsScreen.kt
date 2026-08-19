@@ -8,7 +8,9 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ChevronRight
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
@@ -32,7 +34,13 @@ import com.brain.offlineai.ui.theme.*
 fun GeneralSettingsScreen(
     viewModel: GeneralSettingsViewModel = viewModel(),
     onOpenStorage: () -> Unit,
-    onOpenAbout: () -> Unit
+    onOpenAbout: () -> Unit,
+    onOpenWebSearch: () -> Unit,
+    // GitHub Hosting feature - additive, safe no-op default (same
+    // Document-Editing Convention as every other additive param already
+    // on this function) so this composable keeps compiling until
+    // MainActivity wires it to a real navController.navigate(Screen.GitHubSettings...).
+    onOpenGitHub: () -> Unit = {}
 ) {
     Column(
         modifier = Modifier
@@ -80,6 +88,10 @@ fun GeneralSettingsScreen(
 
         SettingsSection(title = "More") {
             NavRow(icon = Icons.Filled.Storage, label = "Storage", onClick = onOpenStorage)
+            Spacer(Modifier.height(4.dp))
+            NavRow(icon = Icons.Filled.Public, label = "Web Search", onClick = onOpenWebSearch)
+            Spacer(Modifier.height(4.dp))
+            NavRow(icon = Icons.Filled.Cloud, label = "GitHub Publishing", onClick = onOpenGitHub)
             Spacer(Modifier.height(4.dp))
             NavRow(icon = Icons.Filled.Info, label = "About", onClick = onOpenAbout)
         }

@@ -30,6 +30,16 @@ import kotlinx.coroutines.launch
 fun ChatScreen(
     onMenuClick: () -> Unit,
     openSessionId: String? = null,
+    // Web Preview - additive, safe no-op default (Document-Editing
+    // Convention, same as every other additive param this file already
+    // has) so both real callers below compile unchanged until MainActivity
+    // wires this to a real navController.navigate(Screen.WebPreview...).
+    onPreviewArtifact: (ArtifactInfo) -> Unit = {},
+    // GitHub Hosting feature - same additive, safe no-op default
+    // convention as onPreviewArtifact above, until MainActivity wires
+    // these to real navController.navigate(Screen.GitHubPublish...) calls.
+    onPublishArtifact: (ArtifactInfo) -> Unit = {},
+    onPublishAllArtifacts: (List<ArtifactInfo>) -> Unit = {},
     viewModel: ChatViewModel = run {
         val context = LocalContext.current
         // Bug fix #1 (still needed): don't re-read CurrentChatSessionStore
@@ -231,7 +241,10 @@ fun ChatScreen(
                             onDownloadAllArtifacts = { artifacts ->
                                 viewModel.onDownloadAllArtifacts(message.id, artifacts)
                             },
-                            onCancelDownload = { id -> viewModel.onCancelDownload(id) }
+                            onCancelDownload = { id -> viewModel.onCancelDownload(id) },
+                            onPreviewArtifact = onPreviewArtifact,
+                            onPublishArtifact = onPublishArtifact,
+                            onPublishAllArtifacts = onPublishAllArtifacts
                         )
 
                     message.state == BotMessageState.GENERATING ->
@@ -248,7 +261,10 @@ fun ChatScreen(
                             onDownloadAllArtifacts = { artifacts ->
                                 viewModel.onDownloadAllArtifacts(message.id, artifacts)
                             },
-                            onCancelDownload = { id -> viewModel.onCancelDownload(id) }
+                            onCancelDownload = { id -> viewModel.onCancelDownload(id) },
+                            onPreviewArtifact = onPreviewArtifact,
+                            onPublishArtifact = onPublishArtifact,
+                            onPublishAllArtifacts = onPublishAllArtifacts
                         )
                 }
             }

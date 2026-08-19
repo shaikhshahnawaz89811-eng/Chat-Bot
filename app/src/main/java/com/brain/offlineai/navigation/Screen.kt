@@ -29,12 +29,63 @@ sealed class Screen(val route: String, val label: String) {
     // ModelSettings above, so it's not in drawerItems/bottomNavItems.
     data object Storage : Screen("storage", "Storage")
 
+    // Phase 22 sub-destination ("Web Search") - reached only from the
+    // General Settings screen's own "Web Search" row, same pattern as
+    // Storage above, so it's not in drawerItems/bottomNavItems.
+    data object WebSearchSettings : Screen("web_search_settings", "Web Search")
+
+    // GitHub Hosting feature sub-destination ("GitHub Publishing") -
+    // reached only from the General Settings screen's own "GitHub
+    // Publishing" row, same pattern as WebSearchSettings above. Holds the
+    // user's own GitHub Personal Access Token.
+    data object GitHubSettings : Screen("github_settings", "GitHub Publishing")
+
     // Phase 7 sub-destination - reached only from a row on the real
     // History screen (Screen.History above), reopening one persisted
     // chat session in ChatScreen. Not in drawerItems/bottomNavItems,
     // same pattern as ModelSettings/Storage above.
     data object ChatSession : Screen("chat_session/{sessionId}", "Conversation") {
         fun routeFor(sessionId: String) = "chat_session/$sessionId"
+    }
+
+    // Web Preview - reached only from the real "Preview" action on an
+    // ArtifactCard (ui/components/ArtifactCard.kt) for a real HTML/HTM
+    // artifact already written to app-private storage by
+    // ArtifactFileManager. Not in drawerItems/bottomNavItems, same
+    // sub-destination pattern as ModelSettings/Storage/ChatSession above.
+    // The real file path is passed URL-encoded as a nav argument (a plain
+    // filesystem path contains '/' characters that would otherwise be
+    // parsed as extra route segments); fileName is passed separately only
+    // for the top bar title, never used to resolve the file itself.
+    data object WebPreview : Screen("web_preview/{fileName}/{encodedPath}", "Preview") {
+        fun routeFor(fileName: String, storedPath: String) =
+            "web_preview/${android.net.Uri.encode(fileName)}/${android.net.Uri.encode(storedPath)}"
+    }
+
+    // GitHub Hosting feature - reached from the real "Publish to GitHub"
+    // action on an ArtifactCard row (single file) or its "Publish All"
+    // group action (every artifact of that message), and from
+    // WebPreviewScreen's own top-bar action for the file already open
+    // there. Same URL-encoded-path reasoning as WebPreview above; more
+    // than one file is packed into a single route segment using control
+    // characters that can never legally appear in a file name or path, so
+    // no real fileName/storedPath value can ever collide with the
+    // separators themselves.
+    data object GitHubPublish : Screen("github_publish/{encodedFiles}", "Publish to GitHub") {
+        private const val FILE_SEPARATOR = "\u0001"
+        private const val FIELD_SEPARATOR = "\u0002"
+
+        fun routeFor(files: List<Pair<String, String>>): String {
+            val payload = files.joinToString(FILE_SEPARATOR) { (fileName, storedPath) -> "$fileName$FIELD_SEPARATOR$storedPath" }
+            return "github_publish/${android.net.Uri.encode(payload)}"
+        }
+
+        /** Real decode counterpart of [routeFor] - reconstructs the exact (fileName, storedPath) pairs that were encoded, in the same order. */
+        fun parseFiles(encodedFiles: String): List<Pair<String, String>> =
+            encodedFiles.split(FILE_SEPARATOR).mapNotNull { entry ->
+                val parts = entry.split(FIELD_SEPARATOR)
+                if (parts.size == 2) parts[0] to parts[1] else null
+            }
     }
 
     // Phase 3 sub-destinations (screens 6-9) - reached only from within the

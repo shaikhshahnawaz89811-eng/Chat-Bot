@@ -1,5 +1,7 @@
 package com.brain.offlineai.data.attachments
 
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -43,9 +45,45 @@ object AttachmentContentReader {
 
     private const val MAX_TEXT_PREVIEW_BYTES = 8_000
     private const val MAX_ZIP_ENTRIES = 200
+    private const val MAX_PDF_PREVIEW_CHARS = 8_000
 
     fun isTextReadable(fileName: String): Boolean =
         fileName.substringAfterLast('.', "").lowercase() in TEXT_EXTENSIONS
+
+    /** Real, fixed check - only ".pdf" is handled by [readPdfTextPreview] this phase. */
+    fun isPdfReadable(fileName: String): Boolean =
+        fileName.substringAfterLast('.', "").lowercase() == "pdf"
+
+    /**
+     * Phase 24 - real, bounded text extraction from an already-copied real
+     * PDF file, via PDFBox-Android's real [PDDocument]/[PDFTextStripper]
+     * (see [com.brain.offlineai.BrainApplication] for the required
+     * one-time `PDFBoxResourceLoader.init` call). Returns null when the
+     * file genuinely can't be opened/parsed as a PDF (e.g. it's a scanned
+     * image-only PDF with no real embedded text layer) - this app has no
+     * OCR capability, so a scanned PDF is honestly reported as unreadable
+     * rather than a fabricated description standing in for text that was
+     * never actually extracted.
+     */
+    suspend fun readPdfTextPreview(storedPath: String, maxChars: Int = MAX_PDF_PREVIEW_CHARS): String? =
+        withContext(Dispatchers.IO) {
+            val file = File(storedPath)
+            if (!file.exists() || !file.isFile) return@withContext null
+            try {
+                PDDocument.load(file).use { document ->
+                    val fullText = PDFTextStripper().getText(document)
+                    if (fullText.isBlank()) {
+                        null
+                    } else if (fullText.length > maxChars) {
+                        "${fullText.take(maxChars)}\n... (truncated - ${fullText.length} characters total)"
+                    } else {
+                        fullText
+                    }
+                }
+            } catch (e: Exception) {
+                null
+            }
+        }
 
     /**
      * Real bounded read of the real file at [storedPath]. Returns null if
