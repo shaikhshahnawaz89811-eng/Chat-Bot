@@ -1356,53 +1356,64 @@ class ChatViewModel(
 
                 var chunkStopReason = "max_tokens"
                 var chunkFailed = false
+                // Bug fix (user request - "working card aata hai fir ruk
+                // jata hai") - see [GENERATION_CHUNK_TIMEOUT_MS]'s own doc.
+                // [withTimeoutOrNull] cancels *this* coroutine's wait once
+                // the real ceiling passes; a null result means it genuinely
+                // timed out (as opposed to the block finishing/throwing on
+                // its own), so [chunkTimedOut] - not an exception - is what
+                // signals it below.
+                var chunkTimedOut = false
                 try {
-                    BrainEngine.generate(
-                        continuationPrompt,
-                        maxTokens = chunkBudget,
-                        temperature = settings.temperature,
-                        topP = settings.topP,
-                        onStopReason = { chunkStopReason = it }
-                    ).collect { piece ->
-                        builder.append(piece)
-                        tokenCount++
-                        val full = builder.toString()
-                        val split = splitIntroAndCode(full)
-                        if (split.codeLines == null) {
-                            // Still just prose - this stays the one live card, same
-                            // GENERATING bubble as before any fence ever appears.
-                            upsertBotMessage(botId, ChatMessage(id = botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = tokenCount))
-                        } else {
-                            if (codeId == null) {
-                                // The fence just appeared for the first time - the
-                                // prose card is done changing now, freeze it as its
-                                // own real, separate finished card (or remove it
-                                // entirely if there was no real prose before the
-                                // fence at all).
-                                if (split.introText.isNotBlank()) {
-                                    upsertBotMessage(botId, ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
-                                } else {
-                                    removeBotMessage(botId)
+                    val timedOutOrNull = withTimeoutOrNull(GENERATION_CHUNK_TIMEOUT_MS) {
+                        BrainEngine.generate(
+                            continuationPrompt,
+                            maxTokens = chunkBudget,
+                            temperature = settings.temperature,
+                            topP = settings.topP,
+                            onStopReason = { chunkStopReason = it }
+                        ).collect { piece ->
+                            builder.append(piece)
+                            tokenCount++
+                            val full = builder.toString()
+                            val split = splitIntroAndCode(full)
+                            if (split.codeLines == null) {
+                                // Still just prose - this stays the one live card, same
+                                // GENERATING bubble as before any fence ever appears.
+                                upsertBotMessage(botId, ChatMessage(id = botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.GENERATING, generationProgress = tokenCount))
+                            } else {
+                                if (codeId == null) {
+                                    // The fence just appeared for the first time - the
+                                    // prose card is done changing now, freeze it as its
+                                    // own real, separate finished card (or remove it
+                                    // entirely if there was no real prose before the
+                                    // fence at all).
+                                    if (split.introText.isNotBlank()) {
+                                        upsertBotMessage(botId, ChatMessage(id = botId, text = split.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
+                                    } else {
+                                        removeBotMessage(botId)
+                                    }
+                                    codeId = nextId++
                                 }
-                                codeId = nextId++
+                                upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
                             }
-                            upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
-                        }
-                        // Bug fix (user request) - real, periodic on-disk copy of
-                        // whatever has genuinely streamed so far, keyed to the
-                        // same id the final message will use (botId while still
-                        // plain prose, codeId once a fence has appeared) so this
-                        // upsert and the final persistMessage() write the same
-                        // row - never a stray leftover partial row under a
-                        // different id. See [persistEveryNTokens]'s doc above for
-                        // why this exists.
-                        if (tokenCount % persistEveryNTokens == 0) {
-                            persistMessage(
-                                activeSessionId,
-                                ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
-                            )
+                            // Bug fix (user request) - real, periodic on-disk copy of
+                            // whatever has genuinely streamed so far, keyed to the
+                            // same id the final message will use (botId while still
+                            // plain prose, codeId once a fence has appeared) so this
+                            // upsert and the final persistMessage() write the same
+                            // row - never a stray leftover partial row under a
+                            // different id. See [persistEveryNTokens]'s doc above for
+                            // why this exists.
+                            if (tokenCount % persistEveryNTokens == 0) {
+                                persistMessage(
+                                    activeSessionId,
+                                    ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
+                                )
+                            }
                         }
                     }
+                    if (timedOutOrNull == null) chunkTimedOut = true
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -1423,8 +1434,13 @@ class ChatViewModel(
                     }
                 }
 
+                if (chunkTimedOut) {
+                    chunkStopReason = "timeout"
+                }
+
                 if (chunkFailed) break
                 stopReason = chunkStopReason
+                if (chunkStopReason == "timeout") break
                 continuationPrompt = prompt + "\n\n" + builder.toString()
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
@@ -1614,6 +1630,34 @@ class ChatViewModel(
                         "and this reply will resume automatically the moment " +
                         "the device's real thermal status drops back to a safe level."
                 )
+            } else if (stopReason == "timeout") {
+                // Bug fix (user request - "kaam ruk jata hai, koi progress
+                // nahi dikhta") - see [GENERATION_CHUNK_TIMEOUT_MS]'s own
+                // doc. Whatever was genuinely generated before the real
+                // ceiling hit is already the visible, persisted card above
+                // (same "nothing real is discarded" handling every other
+                // early-stop path here already gives) - this only ever
+                // reports the real outcome honestly instead of leaving the
+                // GENERATING card sitting there with no explanation. No
+                // false "continue" promise (same reasoning as the
+                // context_full branch above): [BrainEngine]'s native call
+                // for this chunk may genuinely still be running in the
+                // background even though this coroutine stopped waiting on
+                // it (there is no real way to interrupt mid-prefill - see
+                // [BrainEngine.generate]'s own doc), so a fresh generate()
+                // call right away isn't guaranteed safe either. Retrying
+                // the whole message after a pause is the one honest option
+                // stated here.
+                postSystemNote(
+                    activeSessionId,
+                    "This reply took longer than ${GENERATION_CHUNK_TIMEOUT_MS / 1000}s " +
+                        "on-device and was stopped so the app doesn't sit stuck. This " +
+                        "usually means the prompt going into the model got too long " +
+                        "(a long chat history, or web-search results added on top of " +
+                        "it) for this device to prefill in reasonable time. Try again " +
+                        "with a shorter message, start a new chat, or lower Context " +
+                        "Length in Model Settings."
+                )
             }
         }
         // Reached only after the whole real chunk loop above has genuinely
@@ -1733,9 +1777,21 @@ class ChatViewModel(
                     break
                 }
                 var chunkReason = "max_tokens"
+                // Bug fix (user request - same "working card hangs" issue
+                // as [streamRealResponse], see [GENERATION_CHUNK_TIMEOUT_MS]'s
+                // own doc) - this per-file call had no ceiling either, so a
+                // slow/stuck prefill on one planned file could leave the
+                // whole multi-file build (CREATING step) stuck with no way
+                // out, the same way the fixed planning call used to.
                 try {
-                    BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it })
-                        .collect { builder.append(it) }
+                    val timedOutOrNull = withTimeoutOrNull(GENERATION_CHUNK_TIMEOUT_MS) {
+                        BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it })
+                            .collect { builder.append(it) }
+                    }
+                    if (timedOutOrNull == null) {
+                        reason = "timeout"
+                        break
+                    }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -2287,6 +2343,32 @@ class ChatViewModel(
          * whole thing.
          */
         private const val PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 1500
+
+        /**
+         * Bug fix (user request - "net search karta hai fir working card
+         * aata hai fir ruk jata hai, offline me bhi"). Root cause: the
+         * earlier [PLANNING_GENERATION_TIMEOUT_MS] fix only wrapped the
+         * multi-file *planning* call - the far more common ordinary
+         * single-response path in [streamRealResponse] (every normal
+         * chat message, with or without web-search context appended)
+         * still called `BrainEngine.generate(...).collect { }` with zero
+         * ceiling. Same underlying issue as the planning bug: a long
+         * on-device prefill (prompt evaluation) pass, made slower still
+         * once real web-search result text is folded into the prompt,
+         * calls back into Kotlin zero times until the *first* token is
+         * actually decoded - so a genuinely slow or stuck prefill left
+         * the GENERATING/PROCESS card sitting there with no visible
+         * progress and no way for Stop to reach it (cancellation only
+         * takes effect once the native callback actually fires - see
+         * [BrainEngine.generate]'s own doc). This gives every real chunk
+         * call in [streamRealResponse] and [runMultiFileBuild]'s own
+         * per-file [generateFileContent] loop the same honest, bounded
+         * ceiling the planning call already had, instead of leaving
+         * those two call sites unbounded. Longer than the planning
+         * timeout since a real answer chunk is allowed to be much bigger
+         * than a short file-list.
+         */
+        private const val GENERATION_CHUNK_TIMEOUT_MS = 90_000L
     }
 
     /**
