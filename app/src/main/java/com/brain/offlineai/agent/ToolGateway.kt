@@ -96,11 +96,15 @@ class ToolGateway(private val context: Context) {
         }
     }
 
-    /** Real, audited new-artifact write - delegates to the same real [ArtifactFileManager.writeArtifact] every artifact has always used. */
-    suspend fun writeArtifactFile(sessionId: String, fileName: String, content: String): GatewayResult<File> =
+    /** Real, audited new-artifact write - delegates to the same real [ArtifactFileManager.writeArtifact] every artifact has always used. [projectDirId] (see that function's own doc) lets a multi-file build's files share one real folder instead of each getting its own; omitted (null) for every ordinary single-artifact write, completely unchanged from before. */
+    suspend fun writeArtifactFile(sessionId: String, fileName: String, content: String, projectDirId: String? = null): GatewayResult<File> =
         try {
-            val file = artifactFileManager.writeArtifact(fileName, content)
-            auditRepository.record(sessionId, AgentTool.WRITE_ARTIFACT_FILE, fileName, outcome = true, detail = "${content.length} chars written.")
+            // Stage first in the per-app sandbox.  The artifact manager still
+            // owns the published copy, but every generated file now passes
+            // through one isolated, verified working area before packaging.
+            EditSandbox.stageTextFile(File(sandboxDir, sessionId), fileName, content)
+            val file = artifactFileManager.writeArtifact(fileName, content, projectDirId)
+            auditRepository.record(sessionId, AgentTool.WRITE_ARTIFACT_FILE, fileName, outcome = true, detail = "${content.length} chars written after sandbox verification.")
             GatewayResult.Success(file)
         } catch (e: Exception) {
             auditRepository.record(sessionId, AgentTool.WRITE_ARTIFACT_FILE, fileName, outcome = false, detail = "Write failed: ${e.message}")

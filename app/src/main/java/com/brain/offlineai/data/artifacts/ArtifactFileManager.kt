@@ -43,10 +43,32 @@ class ArtifactFileManager(private val context: Context) {
     private val artifactsDir: File
         get() = File(context.filesDir, "artifacts").apply { mkdirs() }
 
-    /** Each artifact gets its own real subfolder (named by a fresh [UUID]) so two artifacts sharing a file name never collide on disk. */
-    fun writeArtifact(fileName: String, content: String): File {
-        val destDir = File(artifactsDir, UUID.randomUUID().toString()).apply { mkdirs() }
-        val destFile = File(destDir, sanitizeFileName(fileName))
+    /**
+     * Each artifact gets its own real subfolder (named by a fresh [UUID])
+     * so two artifacts sharing a file name never collide on disk.
+     *
+     * Bug fix (user report - web preview par CSS/JS load nahi hoti thi).
+     * A real multi-file build (index.html + styles.css + script.js, etc)
+     * used to give every one of its own real files a *different* random
+     * UUID folder, so `index.html`'s own real relative
+     * `<link href="styles.css">`/`<script src="script.js">` genuinely
+     * could never resolve inside [com.brain.offlineai.ui.screens.preview.WebPreviewScreen]'s
+     * real `file://` WebView load - not a preview bug, a real "the
+     * sibling file genuinely isn't in the same folder" problem.
+     * [projectDirId], when given, reuses the exact same real subfolder for
+     * every file that passes the same id - the caller (see
+     * [com.brain.offlineai.ui.screens.chat.ChatViewModel.runMultiFileBuild])
+     * generates one real UUID per build and threads it through every file
+     * in that build, so the whole project genuinely lands together in one
+     * real folder, the same way any real, ordinary multi-file project
+     * already sits on disk. Null (the default) keeps every existing
+     * single-artifact call site's behavior completely unchanged - its own
+     * fresh UUID folder, same as before this fix.
+     */
+    fun writeArtifact(fileName: String, content: String, projectDirId: String? = null): File {
+        val destDir = File(artifactsDir, projectDirId ?: UUID.randomUUID().toString()).apply { mkdirs() }
+        val destFile = File(destDir, sanitizeRelativePath(fileName))
+        destFile.parentFile?.mkdirs()
         destFile.writeText(content)
         // Weakness-review fix ("file sach me ban rahi hai ya nahi check
         // kare") - writeText() normally throws on a real IO failure, but a
@@ -83,12 +105,26 @@ class ArtifactFileManager(private val context: Context) {
      * read into memory, so this scales to genuinely large artifact sets).
      */
     fun createZip(files: List<File>, zipName: String): File {
+        return createZip(files.map { it.name to it }, zipName)
+    }
+
+    /**
+     * Project-aware ZIP packaging.  The published artifact files are stored
+     * in UUID folders and may have sanitized basenames, so using File.name
+     * loses real source paths (for example app/src/.../MainActivity.kt).
+     * This overload preserves the planned relative path inside the ZIP.
+     */
+    fun createZip(files: List<Pair<String, File>>, zipName: String): File {
         val destDir = File(artifactsDir, UUID.randomUUID().toString()).apply { mkdirs() }
         val zipFile = File(destDir, sanitizeFileName(zipName).let { if (it.endsWith(".zip")) it else "$it.zip" })
         ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
             val buffer = ByteArray(64 * 1024)
-            files.forEach { file ->
-                zipOut.putNextEntry(ZipEntry(file.name))
+            files.forEach { (entryName, file) ->
+                val safeEntry = entryName.replace('\\', '/').trimStart('/')
+                require(safeEntry.isNotBlank() && !safeEntry.split('/').contains("..")) {
+                    "Unsafe ZIP entry name: $entryName"
+                }
+                zipOut.putNextEntry(ZipEntry(safeEntry))
                 FileInputStream(file).use { input ->
                     var read: Int
                     while (input.read(buffer).also { read = it } != -1) {
@@ -244,5 +280,27 @@ class ArtifactFileManager(private val context: Context) {
     private fun sanitizeFileName(name: String): String {
         val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
         return safe.ifBlank { "artifact" }
+    }
+
+    /**
+     * Bug fix (user report - "src/index.js" jaisi file preview me apne
+     * html se link nahi hoti thi). [sanitizeFileName] flattens every '/'
+     * into '_', which is fine for a lone artifact's own file name but
+     * silently broke any real relative reference a project's own real
+     * HTML/plan gave a one-subfolder-deep file - the file that actually
+     * landed on disk ("src_index.js") never matched the real path the
+     * generated content itself pointed at ("src/index.js"). This keeps
+     * each real path segment (still sanitized on its own, same safe-
+     * character rule as [sanitizeFileName]) instead of collapsing them,
+     * so a real relative reference now genuinely resolves. A literal
+     * ".." segment is rejected outright - same "no real escape out of
+     * the artifact's own folder" rule [createZip]'s own `safeEntry` check
+     * already holds itself to - never a silent guess at "did they mean
+     * something safe".
+     */
+    private fun sanitizeRelativePath(name: String): String {
+        val segments = name.replace('\\', '/').split('/').filter { it.isNotBlank() && it != "." }
+        require(segments.none { it == ".." }) { "Unsafe artifact path: $name" }
+        return segments.map { sanitizeFileName(it) }.joinToString(File.separator).ifBlank { "artifact" }
     }
 }

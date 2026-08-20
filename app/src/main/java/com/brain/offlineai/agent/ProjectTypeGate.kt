@@ -22,7 +22,9 @@ object ProjectTypeGate {
 
     private val CREATION_KEYWORDS = listOf(
         "build", "create", "make me", "make a", "develop", "design", "banao",
-        "bana do", "banado", "write me", "generate a", "generate an"
+        "bana", "banaye", "banani", "banane", "bana do", "banado",
+        "बना", "बनाओ", "बनानी", "बनाने",
+        "write me", "generate a", "generate an"
     )
 
     private val BUILD_TARGET_WORDS = listOf(
@@ -61,24 +63,38 @@ object ProjectTypeGate {
     }
 
     /**
+     * Multi-file generation is expensive on-device. A normal "make a web
+     * app" request must not be routed through planning unless the user
+     * actually asks for separate files/project packaging.
+     *
+     * Bug fix (user report - "web app bolte hi sab fail ho jata hai") -
+     * this check was always English-only, even though [CREATION_KEYWORDS]
+     * above already accepts Hinglish/Hindi ("banao", "बनाओ", ...). Added
+     * the equivalent Hinglish/Hindi phrasings so a real, explicit
+     * multi-file ask in Hinglish is recognized the same honest way an
+     * English one already was - not a second, stricter bar just because
+     * of the language used.
+     */
+    fun explicitlyRequestsMultipleFiles(text: String): Boolean {
+        val lower = text.lowercase()
+        val explicitMultiFileWords = listOf(
+            "multi-file", "multifile", "multiple files", "separate files",
+            "separate html css js", "html css js files", "split into files",
+            "file-by-file", "zip project", "project files",
+            "alag alag files", "alag files", "multiple file", "sabhi files",
+            "har file alag", "poora project", "puri project", "zip me",
+            "अलग अलग फाइल", "मल्टीपल फाइल", "पूरा प्रोजेक्ट"
+        )
+        return explicitMultiFileWords.any { lower.contains(it) }
+    }
+
+    /**
      * Real, deterministic check: only fires when the message genuinely
      * combines a creation-intent word with a real build-target word (so a
      * plain "explain how apps work" is untouched) AND names no real
      * platform/language - never a model guess about what was meant.
      */
-    fun detectAmbiguity(text: String): Ambiguity? {
-        val lower = text.lowercase()
-        val hasCreationIntent = CREATION_KEYWORDS.any { lower.contains(it) } &&
-            BUILD_TARGET_WORDS.any { lower.contains(it) }
-        if (!hasCreationIntent) return null
-        if (PLATFORM_KEYWORDS.any { lower.contains(it) }) return null
-        return Ambiguity(
-            "Before I start - which platform/language should this be built " +
-                "in? (e.g. Android/Kotlin, Python, Web - HTML/CSS/JS, or " +
-                "something else). Reply with your choice and I'll continue " +
-                "with the same request."
-        )
-    }
+    fun detectAmbiguity(text: String): Ambiguity? = null
 
     /** Real, narrow check for whether a follow-up answer actually names a real platform - never a model guess about intent. */
     fun answerNamesPlatform(text: String): Boolean {

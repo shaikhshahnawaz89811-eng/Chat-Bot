@@ -67,10 +67,14 @@ import com.brain.offlineai.ui.recovery.classifyGenerationError
 import com.brain.offlineai.ui.tasks.TaskItem
 import com.brain.offlineai.ui.tasks.TaskSplitter
 import com.brain.offlineai.ui.tasks.TaskStatus
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.atomic.AtomicLong
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -1041,7 +1045,26 @@ class ChatViewModel(
                     // validate -> fix pipeline, user-requested). Only
                     // attempted for a genuinely brand-new build request (no
                     // ZIP this turn, not a ZIP edit, single task, real
-                    // creation+build-target intent - [ProjectTypeGate.isCreationRequest]).
+                    // creation+build-target intent - [ProjectTypeGate.isCreationRequest])
+                    // AND the user explicitly asked for a real multi-file /
+                    // separate-files / project-packaged build - see
+                    // [ProjectTypeGate.explicitlyRequestsMultipleFiles].
+                    //
+                    // Bug fix (user report - "web app bolte hi sab fail ho
+                    // jata hai") - [explicitlyRequestsMultipleFiles] already
+                    // existed with exactly this stated purpose ("a normal
+                    // 'make a web app' request must not be routed through
+                    // planning unless the user actually asks for separate
+                    // files") but was never actually called here - so
+                    // literally every plain "web app banao" was silently
+                    // routed into the heaviest, most timeout-prone path in
+                    // the whole app (multi-file planning + per-file
+                    // generate/validate/fix) instead of one ordinary
+                    // single-response reply. Now wired in for real: a plain
+                    // creation request gets one normal reply; multi-file
+                    // build only runs when the user's own words genuinely
+                    // ask for it.
+                    //
                     // A false/low-confidence result here (planning itself
                     // returns null, or the model's real plan came back with
                     // fewer than 2 real files) means [runMultiFileBuild]
@@ -1052,6 +1075,7 @@ class ChatViewModel(
                     // this app already holds itself to.
                     val triedMultiFile = zipAttachments.isEmpty() && zipEditTarget == null &&
                         ProjectTypeGate.isCreationRequest(processingText) &&
+                        ProjectTypeGate.explicitlyRequestsMultipleFiles(processingText) &&
                         runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
                     if (!triedMultiFile) {
                         // Bug fix (user report - planning times out on a
@@ -1389,13 +1413,14 @@ class ChatViewModel(
                 // signals it below.
                 var chunkTimedOut = false
                 try {
-                    val timedOutOrNull = withTimeoutOrNull(GENERATION_CHUNK_TIMEOUT_MS) {
+                    val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
                         BrainEngine.generate(
                             continuationPrompt,
                             maxTokens = chunkBudget,
                             temperature = settings.temperature,
                             topP = settings.topP,
-                            onStopReason = { chunkStopReason = it }
+                            onStopReason = { chunkStopReason = it },
+                            onProgress = onProgress
                         ).collect { piece ->
                             builder.append(piece)
                             tokenCount++
@@ -1674,13 +1699,15 @@ class ChatViewModel(
                 // stated here.
                 postSystemNote(
                     activeSessionId,
-                    "This reply took longer than ${GENERATION_CHUNK_TIMEOUT_MS / 1000}s " +
-                        "on-device and was stopped so the app doesn't sit stuck. This " +
-                        "usually means the prompt going into the model got too long " +
-                        "(a long chat history, or web-search results added on top of " +
-                        "it) for this device to prefill in reasonable time. Try again " +
-                        "with a shorter message, start a new chat, or lower Context " +
-                        "Length in Model Settings."
+                    "No progress for ${GENERATION_CHUNK_TIMEOUT_MS / 1000}s on-device, " +
+                        "so this reply was stopped so the app doesn't sit stuck. A slow " +
+                        "device on its own is fine (this only stops a reply that " +
+                        "genuinely stalled, not one that's simply taking a while) - " +
+                        "this usually means the prompt going into the model got too " +
+                        "long (a long chat history, or web-search results added on top " +
+                        "of it) for this device to make any progress on. Try again with " +
+                        "a shorter message, start a new chat, or lower Context Length " +
+                        "in Model Settings."
                 )
             }
         }
@@ -1763,12 +1790,12 @@ class ChatViewModel(
         // Still used as-is for the planning call itself (a real file list
         // is always short output, never realistically needs a second
         // chunk).
-        suspend fun generateOnce(prompt: String): Pair<String, String> {
+        suspend fun generateOnce(prompt: String, onProgress: () -> Unit = {}): Pair<String, String> {
             val budget = chunkTokenBudget(loadedContextSize, prompt)
             if (budget <= 0) return "" to "context_full"
             var reason = "max_tokens"
             val builder = StringBuilder()
-            BrainEngine.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it })
+            BrainEngine.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
                 .collect { builder.append(it) }
             return builder.toString() to reason
         }
@@ -1808,8 +1835,8 @@ class ChatViewModel(
                 // whole multi-file build (CREATING step) stuck with no way
                 // out, the same way the fixed planning call used to.
                 try {
-                    val timedOutOrNull = withTimeoutOrNull(GENERATION_CHUNK_TIMEOUT_MS) {
-                        BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it })
+                    val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
+                        BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress)
                             .collect { builder.append(it) }
                     }
                     if (timedOutOrNull == null) {
@@ -1878,30 +1905,75 @@ class ChatViewModel(
         // step can never again run indefinitely with no way out.
         var planningTimedOut = false
         val (planningRaw, _) = try {
-            withTimeoutOrNull(PLANNING_GENERATION_TIMEOUT_MS) { generateOnce(planningPrompt) }
+            runWithStallWatchdog(PLANNING_GENERATION_TIMEOUT_MS) { onProgress -> generateOnce(planningPrompt, onProgress) }
                 ?: run { planningTimedOut = true; "" to "timeout" }
         } catch (e: kotlinx.coroutines.CancellationException) {
             throw e
         } catch (e: Exception) {
             "" to "error"
         }
-        val plan = if (planningTimedOut) null else PlanningEngine.parsePlan(planningRaw)
+        // Never turn a web-app build into one vague single answer just
+        // because a small local model timed out or missed one FILE: marker.
+        // The fallback is only the file list; BrainEngine still generates and
+        // validates the real content of every file.
+        val plan = if (planningTimedOut) {
+            PlanningEngine.fallbackPlan(originalRequest)
+        } else {
+            PlanningEngine.parsePlan(planningRaw)
+                ?: PlanningEngine.fallbackPlan(originalRequest)
+        }
         if (plan == null) {
-            // Real, honest "not confident enough" outcome - remove the
-            // planning-only card entirely (Rule 17 - never leave a
-            // half-finished real card behind) and let the caller fall
-            // back to the existing, unaffected single-response flow.
-            removeBotMessage(planBotId)
-            if (planningTimedOut) {
-                completeStep(planningStepId, failed = true, label = "Planning timed out")
+            // Bug fix (user report - "card fail ho gaya toh ruk ke kya
+            // matlab hai", i.e. this red card was making the user hit
+            // Stop right before the real fallback reply even started).
+            // Two real problems here, both fixed together:
+            // 1) [removeBotMessage] used to run BEFORE [completeStep] -
+            //    but [completeStep] itself calls [upsertBotMessage] on the
+            //    same [planBotId], which silently re-added the exact card
+            //    the line above had just removed. So despite the comment
+            //    below still saying "remove the planning-only card
+            //    entirely", the card was never actually gone - it's what
+            //    the user kept seeing. Reordered so completeStep's own
+            //    real status update happens first, and removal (when
+            //    nothing failed) genuinely has the last word.
+            // 2) A timed-out planning step is an expected, self-recovering
+            //    fallback (this exact function already auto-continues
+            //    into a single-response reply right after) - not a real,
+            //    unrecoverable failure. Marking it [failed = true] made
+            //    the card red with "Process needs attention", which reads
+            //    as "this whole thing broke" even though generation was
+            //    genuinely about to start normally. Now marked complete
+            //    (green, "Process completed") with a label that says
+            //    plainly what happens next, so Stop is no longer the
+            //    understandable-but-wrong reaction to a real, working
+            //    fallback.
+            if (planningTimedOut && PlanningEngine.fallbackPlan(originalRequest) == null) {
+                completeStep(planningStepId, failed = false, label = "Planning skipped (took too long) - writing directly instead")
                 postSystemNote(
                     activeSessionId,
-                    "Planning took too long on-device and was stopped after ${PLANNING_GENERATION_TIMEOUT_MS / 1000}s - continuing with a single-response reply instead."
+                    "Planning stalled with no progress for ${PLANNING_GENERATION_TIMEOUT_MS / 1000}s on-device and was stopped - continuing with a single-response reply instead."
+                )
+                // The collector timeout can happen before the detached
+                // native worker has released llama.cpp's global mutex.
+                // Do not start the fallback while that worker is still
+                // active, otherwise the fallback can appear to return no
+                // output even though the model is simply still busy.
+                BrainEngine.awaitGenerationIdle(timeoutMs = 5_000L)
+            } else if (!planningTimedOut) {
+                removeBotMessage(planBotId)
+            } else {
+                completeStep(planningStepId, failed = false, label = "Planner timed out - using the web app file set")
+                postSystemNote(
+                    activeSessionId,
+                    "Planner timed out, so I am continuing with the standard web app files and writing each one separately."
                 )
             }
             return false
         }
-        completeStep(planningStepId, label = "Planning complete")
+        completeStep(
+            planningStepId,
+            label = if (planningTimedOut) "Planner timed out - fallback file set ready" else "Planning complete"
+        )
         postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(plan))
         // Weakness-review fix - real, honest heads-up when the model's own
         // plan is missing a real file a project of this platform
@@ -1919,10 +1991,18 @@ class ChatViewModel(
         }
 
         val artifactInfos = mutableListOf<ArtifactInfo>()
+        val projectArtifactEntries = mutableListOf<Pair<String, File>>()
         val fileSummaries = mutableListOf<String>()
         val generatedSoFar = mutableListOf<Pair<String, String>>() // fileName to content, for later files' own real context
         val olderFileSignatures = mutableListOf<String>() // real signature lines for files that have aged out of recentFilesContext
         var contextFullHit = false
+        // Bug fix (user report - preview me CSS/JS load nahi hoti thi) -
+        // one real, shared folder id for every file this build writes, so
+        // index.html's own real relative sibling references genuinely
+        // resolve inside WebPreviewScreen's file:// load - see
+        // [ArtifactFileManager.writeArtifact]'s own doc for the full
+        // reasoning.
+        val projectDirId = java.util.UUID.randomUUID().toString()
 
         for (planned in plan.files) {
             if (contextFullHit) {
@@ -1992,6 +2072,11 @@ class ChatViewModel(
                 fileSummaries += "- ${planned.fileName}: model returned no real content"
                 continue
             }
+            if (stopReason == "timeout" || stopReason == "error" || stopReason == "thermal_pause") {
+                completeStep(creatingStepId, failed = true, label = "Incomplete ${planned.fileName}")
+                fileSummaries += "- ${planned.fileName}: incomplete generation ($stopReason); file was not saved"
+                continue
+            }
             completeStep(creatingStepId, label = "Created ${planned.fileName}")
 
             // Phase 25's own real "helper" (user-requested) - see
@@ -2054,7 +2139,7 @@ class ChatViewModel(
                 "- ${planned.fileName}: saved with known issues - ${result.issues.joinToString("; ")}"
             }
 
-            val file = when (val write = toolGateway.writeArtifactFile(activeSessionId, planned.fileName, content)) {
+            val file = when (val write = toolGateway.writeArtifactFile(activeSessionId, planned.fileName, content, projectDirId)) {
                 is ToolGateway.GatewayResult.Success -> write.value
                 is ToolGateway.GatewayResult.Denied -> {
                     fileSummaries[fileSummaries.lastIndex] = "- ${planned.fileName}: could not be saved (${write.reason})"
@@ -2083,6 +2168,7 @@ class ChatViewModel(
                 )
             )
             artifactInfos += info
+            projectArtifactEntries += planned.fileName to file
         }
 
         val testingStepId = pushRunning(ProcessMarking.TESTING, "Checking all files against the plan")
@@ -2102,7 +2188,7 @@ class ChatViewModel(
             val packagingStepId = pushRunning(ProcessMarking.PACKAGING)
             val zipInfo = runCatching {
                 val zipFile = artifactFileManager.createZip(
-                    artifactInfos.map { File(it.storedPath) },
+                    projectArtifactEntries,
                     "project_$planBotId.zip"
                 )
                 val info = ArtifactInfo(
@@ -2237,6 +2323,56 @@ class ChatViewModel(
         }
     }
 
+    /**
+     * Bug fix (user report - "phone shayad slow hai", planning aur uske
+     * baad ka single-response fallback dono hi timeout ho jate the on a
+     * genuinely slow device, even while the model was still honestly
+     * streaming real progress). [PLANNING_GENERATION_TIMEOUT_MS] and
+     * [GENERATION_CHUNK_TIMEOUT_MS] used to wrap the *entire* real call in
+     * a flat [withTimeoutOrNull] - so a genuinely slow device (long
+     * prefill on a several-hundred-token prompt, then slow token-by-token
+     * decode on top) got killed the instant *total* wall time crossed the
+     * ceiling, even with fresh real progress (a heartbeat or a token, see
+     * [BrainEngine.generate]'s [onProgress]) arriving every second. That
+     * is backwards: a fixed ceiling should only ever catch a call that is
+     * genuinely STUCK - zero forward motion for the whole window - never
+     * one that is merely slow and still moving.
+     *
+     * [timeoutMs] here is re-armed on every real [onProgress] call, so the
+     * only way to actually time out is a real stretch of [timeoutMs] with
+     * no progress at all. A phone slow enough that one file genuinely
+     * takes several minutes, one heartbeat/token at a time, now finishes
+     * instead of being killed mid-stream - the planner and the fallback
+     * reply both use this now (see their own call sites below). Returns
+     * the real result of [block], or null if [block] was genuinely
+     * cancelled for having stalled.
+     */
+    private suspend fun <T> runWithStallWatchdog(timeoutMs: Long, block: suspend (onProgress: () -> Unit) -> T): T? = coroutineScope {
+        val lastProgressAt = AtomicLong(System.currentTimeMillis())
+        var stalledByWatchdog = false
+        val resultDeferred = async { block { lastProgressAt.set(System.currentTimeMillis()) } }
+        val watchdog = launch {
+            while (isActive) {
+                delay(1_000L)
+                if (System.currentTimeMillis() - lastProgressAt.get() >= timeoutMs) {
+                    stalledByWatchdog = true
+                    resultDeferred.cancel()
+                    break
+                }
+            }
+        }
+        try {
+            resultDeferred.await()
+        } catch (e: CancellationException) {
+            // Only swallow the cancellation this watchdog itself caused -
+            // a real, outer cancellation (e.g. the user hitting Stop)
+            // still has to propagate normally, never silently eaten here.
+            if (stalledByWatchdog) null else throw e
+        } finally {
+            watchdog.cancel()
+        }
+    }
+
     private fun chunkTokenBudget(contextSize: Int, promptSoFar: String): Int {
         val estimatedPromptTokens = (promptSoFar.length / 3) + 1
         val remaining = contextSize - estimatedPromptTokens - RESERVED_OUTPUT_MARGIN_TOKENS
@@ -2313,7 +2449,7 @@ class ChatViewModel(
          * generous real headroom while keeping a single pathological file
          * from starving every other file still queued in the same build.
          */
-        private const val MAX_FILE_CONTINUATION_CHUNKS = 8
+        private const val MAX_FILE_CONTINUATION_CHUNKS = 16
 
         /**
          * Weakness-review fix, issue 6 - "fix sirf ek attempt". Real, fixed
@@ -2362,6 +2498,14 @@ class ChatViewModel(
          * gives the on-device model genuinely enough time to finish a
          * normal planning pass before honestly giving up. Matches
          * [GENERATION_CHUNK_TIMEOUT_MS]'s own ceiling.
+         *
+         * Bug fix (user report - "phone slow hai", planning genuinely
+         * kept timing out on a slow device even while it was still
+         * honestly making progress). No longer a flat total-duration cap:
+         * [runWithStallWatchdog] re-arms this ceiling on every real
+         * heartbeat/token (see its own doc), so this is now "no progress
+         * for this long", not "took longer than this in total" - a
+         * genuinely slow device is never killed just for being slow.
          */
         private const val PLANNING_GENERATION_TIMEOUT_MS = 90_000L
 
@@ -2415,6 +2559,17 @@ class ChatViewModel(
          * those two call sites unbounded. Longer than the planning
          * timeout since a real answer chunk is allowed to be much bigger
          * than a short file-list.
+         *
+         * Bug fix (user report - "phone shayad slow hai", web-app builds
+         * kept hitting this ceiling even mid-stream on a slow device -
+         * both the planning call and this per-chunk/per-file ceiling,
+         * back to back, because a "web app" request is exactly the case
+         * with the biggest prompt: full chat history + web-search context
+         * +, for the fallback path, the same big prompt again). See
+         * [runWithStallWatchdog]'s own doc - this ceiling now re-arms on
+         * every real prefill heartbeat/token instead of measuring total
+         * call duration, so it only ever fires on a genuine stall, never
+         * on a device that is simply slower than 90s end-to-end.
          */
         private const val GENERATION_CHUNK_TIMEOUT_MS = 90_000L
     }

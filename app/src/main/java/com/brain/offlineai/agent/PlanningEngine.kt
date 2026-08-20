@@ -57,7 +57,10 @@ object PlanningEngine {
                     "PURPOSE: <one short line - what this file is actually for>\n" +
                     "---\n\n" +
                     "Repeat that 4-line block for every file. Keep the file count genuinely necessary " +
-                    "for the request - do not invent extra files just to pad the list."
+                    "for the request - do not invent extra files just to pad the list. " +
+                    "Do not ask a question or wait for approval: infer a sensible default " +
+                    "stack from the request (for example HTML/CSS/JavaScript for an unspecified " +
+                    "web app), include its real setup files, and begin the implementation plan."
             )
         }
     }
@@ -92,6 +95,52 @@ object PlanningEngine {
         } else {
             FilePlan(files = realFiles)
         }
+    }
+
+    /**
+     * Last-resort plan for the most common request that must never silently
+     * fall back to one giant answer.  The model still writes all three files;
+     * this only supplies the file list when a small on-device model times out
+     * or ignores the strict planning format.
+     */
+    fun fallbackPlan(originalRequest: String): FilePlan? {
+        val lower = originalRequest.lowercase()
+        val isWebRequest = listOf("web app", "webapp", "website", "html").any { lower.contains(it) }
+        if (isWebRequest) {
+            return FilePlan(
+                files = listOf(
+                    PlannedFile("index.html", "HTML", "Application structure, accessible UI, and real content"),
+                    PlannedFile("styles.css", "CSS", "Responsive visual design and component styling"),
+                    PlannedFile("script.js", "JavaScript", "Client-side interactions and application behavior")
+                )
+            )
+        }
+        val isPython = listOf("python", "flask", "django").any { lower.contains(it) }
+        if (isPython) {
+            return FilePlan(
+                files = listOf(
+                    PlannedFile("main.py", "Python", "Application entry point and core behavior"),
+                    PlannedFile("requirements.txt", "Text", "Runtime dependencies"),
+                    PlannedFile("README.md", "Markdown", "Run instructions and project overview")
+                )
+            )
+        }
+        val isNode = listOf("node", "express", "react", "vue", "angular", "javascript", "typescript").any { lower.contains(it) }
+        if (isNode) {
+            return FilePlan(
+                files = listOf(
+                    PlannedFile("package.json", "JSON", "Dependencies and runnable scripts"),
+                    PlannedFile("src/index.js", "JavaScript", "Application entry point and core behavior"),
+                    PlannedFile("README.md", "Markdown", "Run instructions and project overview")
+                )
+            )
+        }
+        return FilePlan(
+            files = listOf(
+                PlannedFile("README.md", "Markdown", "Project overview and run instructions"),
+                PlannedFile("main.txt", "Text", "Primary generated project content")
+            )
+        )
     }
 
     /** Real, deterministic fallback only for the rare case [langLine] genuinely didn't have a matching line for this file - never a guess about content, just the file's own real extension. */

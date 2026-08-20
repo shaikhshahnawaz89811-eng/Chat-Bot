@@ -40,6 +40,37 @@ data class EditDiffSummary(
 object EditSandbox {
 
     /**
+     * Writes one generated project file into the session sandbox before it is
+     * published as an artifact.  The sandbox is deliberately separate from
+     * the attachment/artifact directories: a failed or cancelled generation
+     * can never partially overwrite a user file.  Paths are normalized and
+     * traversal is rejected because file names come from a model plan.
+     */
+    suspend fun stageTextFile(
+        sandboxDir: File,
+        relativeName: String,
+        content: String
+    ): File = withContext(Dispatchers.IO) {
+        val normalized = relativeName.replace('\\', '/').trimStart('/')
+        require(normalized.isNotBlank() && normalized != "." && !normalized.split('/').contains("..")) {
+            "Unsafe project file name: $relativeName"
+        }
+        val destination = File(sandboxDir, normalized)
+        val root = sandboxDir.canonicalFile
+        val canonical = destination.canonicalFile
+        require(canonical.path == root.path || canonical.path.startsWith(root.path + File.separator)) {
+            "Project file escapes sandbox: $relativeName"
+        }
+        canonical.parentFile?.mkdirs()
+        canonical.writeText(content, Charsets.UTF_8)
+        val expectedBytes = content.toByteArray(Charsets.UTF_8).size.toLong()
+        check(canonical.isFile && canonical.length() == expectedBytes) {
+            "Sandbox write verification failed for $relativeName"
+        }
+        canonical
+    }
+
+    /**
      * Real byte-for-byte copy of [sourceZip] into its own fresh, real
      * staging file under [sandboxDir] - the actual patch step
      * ([com.brain.offlineai.data.artifacts.ArtifactFileManager.patchZip])
