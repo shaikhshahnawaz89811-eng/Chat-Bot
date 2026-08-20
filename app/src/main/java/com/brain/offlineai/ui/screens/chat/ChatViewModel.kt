@@ -3211,7 +3211,7 @@ class ChatViewModel(
         if (fileNames.size > 1) {
             pushRunning(ProcessMarking.PACKAGING)
             val zipInfo = runCatching {
-                val zipFile = artifactFileManager.createZip(
+                val zipFile = artifactFileManager.createZipFromFiles(
                     resultMessage.artifacts.map { File(it.storedPath) },
                     "project_$botId.zip"
                 )
