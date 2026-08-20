@@ -42,6 +42,18 @@ class ComputeManager(private val application: Application) {
      * other piece of that loop (thermal checks, context-budget chunking,
      * stall watchdog) keeps working unmodified, since it only ever
      * depends on getting back a Flow<String> plus the two callbacks.
+     *
+     * [forceMode] is an optional per-call override of [store.mode] -
+     * default null so every existing caller (which never passes it) sees
+     * zero behavior change. It exists so a caller (see ChatViewModel's
+     * multi-file build) can pin one specific call to LOCAL or REMOTE on
+     * purpose - e.g. to run this phone's own engine and a paired worker
+     * on two different files at the same time without both accidentally
+     * racing for the same target (llama.cpp only allows one generation
+     * at a time per engine - local or remote - so genuine simultaneous
+     * work across two devices means each call must be pinned to a
+     * different, explicit target, never left to AUTO's own heuristic for
+     * both calls).
      */
     fun generate(
         prompt: String,
@@ -49,8 +61,9 @@ class ComputeManager(private val application: Application) {
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
         onStopReason: (String) -> Unit = {},
-        onProgress: () -> Unit = {}
-    ): Flow<String> = when (store.mode) {
+        onProgress: () -> Unit = {},
+        forceMode: ComputeMode? = null
+    ): Flow<String> = when (forceMode ?: store.mode) {
         ComputeMode.LOCAL ->
             BrainEngine.generate(prompt, maxTokens, temperature, topP, onStopReason, onProgress)
 

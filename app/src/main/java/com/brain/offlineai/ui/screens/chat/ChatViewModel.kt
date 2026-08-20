@@ -1835,7 +1835,7 @@ class ChatViewModel(
         // it were finished. Returns the real, concatenated content plus
         // the real final stop reason ("end_of_generation", "context_full",
         // "chunk_cap", or "error").
-        suspend fun generateFileContent(prompt: String): Pair<String, String> {
+        suspend fun generateFileContent(prompt: String, forceMode: ComputeMode? = null): Pair<String, String> {
             val builder = StringBuilder()
             var continuationPrompt = prompt
             var reason = "max_tokens"
@@ -1860,7 +1860,7 @@ class ChatViewModel(
                 // out, the same way the fixed planning call used to.
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress)
+                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
                             .collect { builder.append(it) }
                     }
                     if (timedOutOrNull == null) {
@@ -2028,8 +2028,71 @@ class ChatViewModel(
         // reasoning.
         val projectDirId = java.util.UUID.randomUUID().toString()
 
-        for (planned in plan.files) {
+        // "Worker phone as a tool" - bounded, opt-in real parallelism.
+        // Chat-Bot stays in charge (same plan, same file list, same
+        // artifact/validation pipeline below); the only thing that
+        // changes is that when a paired worker is actually available,
+        // the plan's *second* file starts generating on that worker
+        // device at the exact same moment the *first* file starts
+        // generating on this phone's own local engine - both phones
+        // genuinely working at once, not one waiting idle for the other.
+        //
+        // Deliberately narrow: only ever this one file pair, never the
+        // whole plan. Every file from index 2 onward still runs fully
+        // sequential and still gets its real, full [recentFilesContext]
+        // exactly as before (including from file[1], once it's done) -
+        // the only real tradeoff is that file[1]'s own prompt does not
+        // include file[0]'s just-written content (it starts before
+        // file[0] exists), only the same shared plan list every file
+        // already gets. [forceMode] pins each call to a specific engine
+        // so both calls can't ever race for the same one (see
+        // [ComputeManager.generate]'s own doc on why AUTO/REMOTE alone
+        // isn't safe for this).
+        //
+        // Silently inactive (falls straight through to the existing
+        // fully-sequential loop below) unless the user has already
+        // paired an enabled worker and turned on Remote/Auto mode in
+        // Compute Bridge - nothing here changes behavior for anyone who
+        // hasn't opted into Compute Bridge at all.
+        val canPrefetchSecondFileOnWorker = plan.files.size >= 2 &&
+            computeManager.mode != ComputeMode.LOCAL &&
+            BrainEngine.isLoaded &&
+            computeManager.pairedWorkers().any { it.enabled }
+        var secondFilePrefetch: kotlinx.coroutines.Deferred<Pair<String, String>>? = null
+        if (canPrefetchSecondFileOnWorker) {
+            val secondPlanned = plan.files[1]
+            val planListTextForPrefetch = plan.files.joinToString("\n") { "- ${it.fileName} (${it.language}): ${it.purpose}" }
+            val trimmedExtraContextForPrefetch = if (extraContextBlock.length > FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
+                extraContextBlock.take(FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this file - see plan summary above for full context)"
+            } else extraContextBlock
+            val secondPrompt = buildString {
+                append("Project request: ").append(originalRequest).append("\n")
+                if (trimmedExtraContextForPrefetch.isNotBlank()) append(trimmedExtraContextForPrefetch).append("\n")
+                append("\nFull real file plan for this project:\n").append(planListTextForPrefetch).append("\n")
+                append(
+                    "\nNow write ONLY the complete, real content of this one file: ${secondPlanned.fileName} " +
+                        "(${secondPlanned.language}) - ${secondPlanned.purpose}\n" +
+                        "Reply with exactly one fenced code block containing the complete file, and nothing else."
+                )
+            }
+            postSystemNote(
+                activeSessionId,
+                "Paired worker is available - writing ${plan.files[0].fileName} here and ${secondPlanned.fileName} on the worker phone at the same time."
+            )
+            secondFilePrefetch = viewModelScope.async {
+                try {
+                    generateFileContent(secondPrompt, forceMode = ComputeMode.REMOTE)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    "" to "error"
+                }
+            }
+        }
+
+        for ((fileIndex, planned) in plan.files.withIndex()) {
             if (contextFullHit) {
+                if (fileIndex == 1) secondFilePrefetch?.cancel()
                 fileSummaries += "- ${planned.fileName}: skipped (context window filled by earlier files this turn)"
                 continue
             }
@@ -2078,8 +2141,24 @@ class ChatViewModel(
             // instead of a single bounded call, so a large file (e.g. a
             // long Activity class) genuinely keeps going across chunks
             // instead of being handed to [FileValidator] mid-answer.
+            //
+            // fileIndex 0: when the worker prefetch above is active,
+            // pinned to LOCAL so it genuinely runs on this phone at the
+            // same time the worker is already generating file[1] - never
+            // left to AUTO's own heuristic, which could otherwise also
+            // pick the same worker and serialize the two after all.
+            // fileIndex 1: when the prefetch is active, its generation
+            // already started above - awaited here instead of starting a
+            // second, redundant call for the same file.
             val (rawOutput, stopReason) = try {
-                generateFileContent(filePrompt)
+                if (fileIndex == 1 && secondFilePrefetch != null) {
+                    secondFilePrefetch.await()
+                } else {
+                    generateFileContent(
+                        filePrompt,
+                        forceMode = if (fileIndex == 0 && secondFilePrefetch != null) ComputeMode.LOCAL else null
+                    )
+                }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {

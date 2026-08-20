@@ -52,6 +52,15 @@
          their own, stricter battery managers on top. -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- Compute Bridge QR camera scan: the in-app scanner (CameraX +
+         on-device ML Kit) needs the real CAMERA permission, requested at
+         runtime from QrScannerScreen (not just declared here). android:required="false"
+         on the feature so devices/builds without a camera still install and
+         run the app fine - pairing still works via the paste-code field on
+         those. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
 
     <application
         android:name=".BrainApplication"

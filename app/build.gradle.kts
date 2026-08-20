@@ -144,4 +144,20 @@ dependencies {
     // (different real format, would need a different real library
     // decision - not silently bundled in under the same claim).
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+
+    // Compute Bridge QR camera scan: real on-device camera preview
+    // (CameraX) feeding a real on-device barcode decoder (ML Kit Barcode
+    // Scanning bundled model - com.google.mlkit:barcode-scanning is a
+    // fully offline, on-device model; it does not call any Google network
+    // API at runtime, so this does not violate the app's "100% Offline"
+    // posture the same way the paste-only pairing-code field never did.
+    // This replaces the old "scan with any camera app, then paste"
+    // workaround in ComputeBridgeScreen with an in-app scanner that feeds
+    // ComputeBridgeViewModel.pairFromCode() directly.
+    implementation("androidx.camera:camera-core:1.3.4")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    implementation("androidx.activity:activity-ktx:1.9.1")
 }
