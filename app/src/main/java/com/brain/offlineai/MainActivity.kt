@@ -42,6 +42,7 @@ import com.brain.offlineai.ui.screens.apikeys.KeyDetailsScreen
 import com.brain.offlineai.ui.screens.apikeys.KeyOptionsScreen
 import com.brain.offlineai.ui.screens.chat.ChatScreen
 import com.brain.offlineai.ui.screens.chat.CurrentChatSessionStore
+import com.brain.offlineai.ui.screens.computebridge.ComputeBridgeScreen
 import com.brain.offlineai.ui.screens.history.HistoryScreen
 import com.brain.offlineai.ui.screens.localapi.LocalApiScreen
 import com.brain.offlineai.ui.screens.modelsettings.ModelSettingsScreen
@@ -318,6 +319,9 @@ fun BrainApp() {
                 }
                 composable(Screen.LocalApi.route) {
                     LocalApiScreen(onBack = { navController.popBackStack() })
+                }
+                composable(Screen.ComputeBridge.route) {
+                    ComputeBridgeScreen(onBack = { navController.popBackStack() })
                 }
                 composable(
                     route = Screen.WebPreview.route,

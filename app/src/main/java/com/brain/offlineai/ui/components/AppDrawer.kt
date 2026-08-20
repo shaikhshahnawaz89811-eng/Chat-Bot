@@ -32,6 +32,7 @@ private fun iconFor(screen: Screen): ImageVector = when (screen) {
     Screen.ApiKeys -> Icons.Filled.VpnKey
     Screen.Models -> Icons.Filled.Layers
     Screen.LocalApi -> Icons.Filled.Dns
+    Screen.ComputeBridge -> Icons.Filled.DeviceHub
     Screen.Analytics -> Icons.Filled.BarChart
     Screen.Settings -> Icons.Filled.Settings
     Screen.About -> Icons.Filled.Info

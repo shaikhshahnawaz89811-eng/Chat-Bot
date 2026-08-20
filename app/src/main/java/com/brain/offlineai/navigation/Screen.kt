@@ -20,6 +20,12 @@ sealed class Screen(val route: String, val label: String) {
     data object Analytics : Screen("analytics", "Analytics") // Phase 5 (DONE) - real usage counters
     data object About : Screen("about", "About") // screen 14 - Phase 6 (DONE)
 
+    // Compute Bridge - pairs this app with one or more Compute Bridge
+    // Worker phones (see computebridge/ComputeManager.kt) so a chat
+    // generation can be offloaded to another phone's own CPU/RAM instead
+    // of always running locally. Drawer-only, same pattern as LocalApi.
+    data object ComputeBridge : Screen("compute_bridge", "Compute Bridge")
+
     // Phase 5 sub-destination (screen 11) - reached only from the Models
     // screen's settings action, so it's not in drawerItems/bottomNavItems.
     data object ModelSettings : Screen("model_settings", "Model Settings")
@@ -109,6 +115,6 @@ sealed class Screen(val route: String, val label: String) {
         // has finished constructing (a classic JVM circular static-init
         // ordering issue, not a logic bug in the routes themselves).
         val bottomNavItems by lazy { listOf(Chat, History, Models, Settings) }
-        val drawerItems by lazy { listOf(Chat, ApiKeys, Models, LocalApi, Analytics, Settings, About) }
+        val drawerItems by lazy { listOf(Chat, ApiKeys, Models, LocalApi, ComputeBridge, Analytics, Settings, About) }
     }
 }

@@ -25,6 +25,14 @@
          Local API server already declared). -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Compute Bridge - required for reliable NSD (_sa-compute._tcp)
+         discovery of Worker phones on the local Wi-Fi/hotspot network on
+         several OEM builds (same permission the Worker app itself already
+         declares for its own advertiser). No new capability beyond
+         discovering/talking to a paired worker over the existing INTERNET
+         permission above. -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+
     <!-- Phase 11: Artifact card + ZIP/file output + download flow. Only
          needed for the real legacy (API 26-28) "Save to Device" path in
          ArtifactFileManager.exportToDownloads - API 29+ uses scoped-storage

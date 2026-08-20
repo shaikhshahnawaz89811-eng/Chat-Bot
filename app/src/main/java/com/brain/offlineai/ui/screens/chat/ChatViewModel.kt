@@ -23,6 +23,8 @@ import com.brain.offlineai.agent.ThermalPauseRepository
 import com.brain.offlineai.agent.ToolGateway
 import com.brain.offlineai.agent.WebSearchContextBuilder
 import com.brain.offlineai.agent.WebSearchTrigger
+import com.brain.offlineai.computebridge.ComputeManager
+import com.brain.offlineai.computebridge.ComputeMode
 import com.brain.offlineai.data.analytics.AnalyticsStore
 import com.brain.offlineai.data.artifacts.ArtifactCandidate
 import com.brain.offlineai.data.artifacts.ArtifactDownloadTarget
@@ -159,6 +161,19 @@ class ChatViewModel(
      * this app (Phase 3's API keys, Phase 2's imported model).
      */
     private val webSearchRepository = WebSearchRepository(application)
+
+    /**
+     * Compute Bridge routing (see computebridge/ComputeManager.kt's own
+     * doc). Defaults to [com.brain.offlineai.computebridge.ComputeMode.LOCAL],
+     * so this is a no-op change for every install that hasn't opened the
+     * new Compute Bridge screen - [ComputeManager.generate] just calls
+     * straight through to [BrainEngine.generate] in that case, same
+     * signature, same behavior as before this field existed. Only the
+     * main send-message continuation loop below is routed through it for
+     * now; the planning/file-generation/retry call sites still call
+     * [BrainEngine.generate] directly.
+     */
+    private val computeManager = ComputeManager(application)
 
     /**
      * Phase 23 (Appendix - Mobile Thermal Management, integrated with
@@ -540,12 +555,21 @@ class ChatViewModel(
                     persistAttachments(activeSessionId, userMessage.id, readyAttachments)
                 }
 
-                if (BrainEngine.state.value !is EngineState.Loaded) {
+                // Compute Bridge: Remote/Auto mode with at least one
+                // enabled paired worker does not need a local model loaded
+                // at all - that is the entire point of offloading. Local
+                // mode (the default for every existing install) keeps this
+                // gate exactly as it was before this feature existed.
+                val canUseRemoteWorker = computeManager.mode != ComputeMode.LOCAL &&
+                    computeManager.pairedWorkers().any { it.enabled }
+                if (BrainEngine.state.value !is EngineState.Loaded && !canUseRemoteWorker) {
                     postSystemNote(
                         activeSessionId,
                         "No model is loaded yet. Go to Models and import + load a " +
-                            ".gguf file (e.g. Qwen2.5-1.5B-Instruct) before chatting - " +
-                            "this build never fabricates an answer without a real model."
+                            ".gguf file (e.g. Qwen2.5-1.5B-Instruct) before chatting, or " +
+                            "pair a Compute Bridge worker and switch to Remote/Auto mode " +
+                            "in the Compute Bridge screen - this build never fabricates an " +
+                            "answer without a real model."
                     )
                     return@launch
                 }
@@ -1414,7 +1438,7 @@ class ChatViewModel(
                 var chunkTimedOut = false
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        BrainEngine.generate(
+                        computeManager.generate(
                             continuationPrompt,
                             maxTokens = chunkBudget,
                             temperature = settings.temperature,
@@ -1795,7 +1819,7 @@ class ChatViewModel(
             if (budget <= 0) return "" to "context_full"
             var reason = "max_tokens"
             val builder = StringBuilder()
-            BrainEngine.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
+            computeManager.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
                 .collect { builder.append(it) }
             return builder.toString() to reason
         }
@@ -1836,7 +1860,7 @@ class ChatViewModel(
                 // out, the same way the fixed planning call used to.
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        BrainEngine.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress)
+                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress)
                             .collect { builder.append(it) }
                     }
                     if (timedOutOrNull == null) {
