@@ -12,7 +12,7 @@ import org.json.JSONObject
  * (and the user's own instruction not to hardcode one device) means the
  * Main APK's Pairing Manager has to hold a list from day one. Each
  * worker's access token is a real bearer credential for that worker's
- * `/v1/*` API, so this uses the same EncryptedSharedPreferences approach
+ * `/v1/` API endpoints, so this uses the same EncryptedSharedPreferences approach
  * this app's WebSearchKeyStore already uses for its own outbound API
  * secret - no new storage pattern introduced.
  */
