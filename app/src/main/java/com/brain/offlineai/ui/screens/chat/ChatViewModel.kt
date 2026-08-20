@@ -3300,7 +3300,7 @@ class ChatViewModel(
         val job = viewModelScope.launch {
             updateDownloadState(zipId, ArtifactDownloadUiState.Exporting(0L, 0L, ArtifactDownloadTarget.SAVE_TO_DEVICE))
             try {
-                val zipFile = artifactFileManager.createZip(artifacts.map { File(it.storedPath) }, "brain_artifacts_$messageId.zip")
+                val zipFile = artifactFileManager.createZipFromFiles(artifacts.map { File(it.storedPath) }, "brain_artifacts_$messageId.zip")
                 exportArtifact(zipId, zipFile, "application/zip", ArtifactDownloadTarget.SAVE_TO_DEVICE)
             } catch (e: Exception) {
                 if (e !is kotlinx.coroutines.CancellationException) {

@@ -104,7 +104,7 @@ class ArtifactFileManager(private val context: Context) {
      * `ZipEntry` per artifact, streamed in real 64 KB chunks (no full-file
      * read into memory, so this scales to genuinely large artifact sets).
      */
-    fun createZip(files: List<File>, zipName: String): File {
+    fun createZipFromFiles(files: List<File>, zipName: String): File {
         return createZip(files.map { it.name to it }, zipName)
     }
 
