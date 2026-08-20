@@ -31,7 +31,8 @@ import com.brain.offlineai.ui.theme.*
 @Composable
 fun ComputeBridgeScreen(
     viewModel: ComputeBridgeViewModel = viewModel(),
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onScanQr: () -> Unit = {}
 ) {
     val state by viewModel.uiState.collectAsState()
 
@@ -71,8 +72,8 @@ fun ComputeBridgeScreen(
             if (state.pairedWorkers.isEmpty()) {
                 item {
                     Text(
-                        "No worker paired yet. Scan a Worker app's QR code with any camera app, " +
-                            "then paste the code below.",
+                        "No worker paired yet. Tap \"Scan QR with camera\" below and point it " +
+                            "at the Worker app's QR code, or paste the code manually.",
                         color = BrainTextMuted, fontSize = 13.sp
                     )
                 }
@@ -90,6 +91,22 @@ fun ComputeBridgeScreen(
                 Text(
                     "Pair a new worker",
                     color = BrainTextPrimary, fontSize = 16.sp, fontWeight = FontWeight.SemiBold
+                )
+            }
+
+            item {
+                OutlinedButton(
+                    onClick = onScanQr,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Scan QR with camera")
+                }
+            }
+
+            item {
+                Text(
+                    "or paste it manually",
+                    color = BrainTextMuted, fontSize = 12.sp
                 )
             }
 

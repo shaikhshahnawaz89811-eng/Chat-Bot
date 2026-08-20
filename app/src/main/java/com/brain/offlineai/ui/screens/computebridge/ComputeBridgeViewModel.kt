@@ -29,8 +29,9 @@ data class ComputeBridgeUiState(
  * real list of paired workers (add/remove/enable - never capped to one),
  * a live "nearby on this network" list from NSD, and pairing via the
  * pairing-code JSON payload the Worker app's QR encodes (see
- * docs/protocol.md - scan that QR with any camera/QR app already on the
- * phone, then paste the text here).
+ * docs/protocol.md). The payload reaches this same [pairFromCode] whether
+ * it came from the in-app camera scanner (QrScannerScreen.kt) or from the
+ * manual paste field on ComputeBridgeScreen.
  */
 class ComputeBridgeViewModel(application: Application) : AndroidViewModel(application) {
 

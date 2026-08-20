@@ -26,6 +26,14 @@ sealed class Screen(val route: String, val label: String) {
     // of always running locally. Drawer-only, same pattern as LocalApi.
     data object ComputeBridge : Screen("compute_bridge", "Compute Bridge")
 
+    // Compute Bridge sub-destination - real in-app camera QR scanner,
+    // reached only from ComputeBridgeScreen's "Scan QR" action, same
+    // sub-destination pattern as ModelSettings/Storage below. Shares
+    // ComputeBridgeViewModel with its parent (scoped to the ComputeBridge
+    // backstack entry in MainActivity) so a successful scan feeds the
+    // same pairing state the paste-code field already used.
+    data object QrScanner : Screen("qr_scanner", "Scan QR")
+
     // Phase 5 sub-destination (screen 11) - reached only from the Models
     // screen's settings action, so it's not in drawerItems/bottomNavItems.
     data object ModelSettings : Screen("model_settings", "Model Settings")

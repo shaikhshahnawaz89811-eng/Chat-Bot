@@ -321,7 +321,30 @@ fun BrainApp() {
                     LocalApiScreen(onBack = { navController.popBackStack() })
                 }
                 composable(Screen.ComputeBridge.route) {
-                    ComputeBridgeScreen(onBack = { navController.popBackStack() })
+                    ComputeBridgeScreen(
+                        onBack = { navController.popBackStack() },
+                        onScanQr = { navController.navigate(Screen.QrScanner.route) }
+                    )
+                }
+                composable(Screen.QrScanner.route) { backStackEntry ->
+                    // Scoped to the ComputeBridge screen's own backstack
+                    // entry (not this one) so the scan result lands in the
+                    // exact same ComputeBridgeViewModel instance/state the
+                    // paste-code field already writes to - no separate
+                    // hand-off channel needed.
+                    val parentEntry = remember(backStackEntry) {
+                        navController.getBackStackEntry(Screen.ComputeBridge.route)
+                    }
+                    val computeBridgeViewModel: com.brain.offlineai.ui.screens.computebridge.ComputeBridgeViewModel =
+                        androidx.lifecycle.viewmodel.compose.viewModel(parentEntry)
+                    com.brain.offlineai.ui.screens.computebridge.QrScannerScreen(
+                        onResult = { scannedText ->
+                            computeBridgeViewModel.onPairingCodeChange(scannedText)
+                            computeBridgeViewModel.pairFromCode()
+                            navController.popBackStack()
+                        },
+                        onBack = { navController.popBackStack() }
+                    )
                 }
                 composable(
                     route = Screen.WebPreview.route,
