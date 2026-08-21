@@ -277,12 +277,6 @@ fun ChatScreen(
                     message.state == BotMessageState.GENERATING ->
                         BotGeneratingBubble(message)
 
-                    message.state == BotMessageState.PAUSED ->
-                        BotPausedBubble(message)
-
-                    message.state == BotMessageState.FAILED ->
-                        BotFailedBubble(message)
-
                     message.state == BotMessageState.SYSTEM_NOTE ->
                         BotSystemNoteBubble(message)
 

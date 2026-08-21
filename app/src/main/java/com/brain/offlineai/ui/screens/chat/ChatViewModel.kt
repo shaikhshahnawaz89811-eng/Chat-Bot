@@ -392,30 +392,6 @@ class ChatViewModel(
         }
         // Real continuation, not a fresh id space colliding with restored rows.
         nextId = (stored.maxOf { it.messageId } + 1)
-
-        // If the process was killed or the screen was recreated while a
-        // real task was paused, surface the persisted checkpoint as ONE
-        // non-animated status card. The old implementation restored only
-        // the chat messages, so the user could see the last generated code
-        // while having no indication that a resumable task still existed.
-        // This is display-only; the checkpoint itself remains the single
-        // source of truth and is consumed by the explicit "continue" route.
-        executionCheckpointRepository.getPaused(id)?.let { checkpoint ->
-            val target = checkpoint.currentFileName.takeIf { it.isNotBlank() }
-            val label = if (checkpoint.kind == ExecutionCheckpointKind.MULTI_FILE && target != null) {
-                "Paused at $target (file ${checkpoint.currentFileIndex + 1})"
-            } else {
-                "Reply paused with a saved checkpoint"
-            }
-            messages.value = messages.value + ChatMessage(
-                id = nextId++,
-                text = "$label. Nothing is currently running. Type \"continue\" to resume from the saved point.",
-                isUser = false,
-                timestamp = timeNow(),
-                state = BotMessageState.PAUSED,
-                codeFileName = target
-            )
-        }
     }
 
     private fun ArtifactEntity.toArtifactInfo() = ArtifactInfo(
@@ -633,7 +609,6 @@ class ChatViewModel(
                             persistedCheckpoint
                         )
                         if (resumed) executionCheckpointRepository.delete(persistedCheckpoint.id)
-                        else settleActiveWorkCard(BotMessageState.PAUSED)
                     } else {
                         executionCheckpointRepository.delete(persistedCheckpoint.id)
                         streamRealResponse(activeSessionId, persistedCheckpoint.continuationPrompt, null)
@@ -1283,17 +1258,6 @@ class ChatViewModel(
      * from earlier turns remain in chat history; the card that was actually
      * interrupted is settled so it cannot keep animating after Stop.
      */
-    private fun settleActiveWorkCard(state: BotMessageState = BotMessageState.PAUSED, reason: String = "Work paused. Type \"continue\" to resume the saved checkpoint.") {
-        val active = messages.value.lastOrNull { !it.isUser && it.state in setOf(BotMessageState.PROCESS, BotMessageState.GENERATING, BotMessageState.CODING) } ?: return
-        upsertBotMessage(
-            active.id,
-            active.copy(
-                state = state,
-                text = if (active.text.isNotBlank()) active.text else reason
-            )
-        )
-    }
-
     private suspend fun settleTransientBotMessageAfterCancellation(userStopped: Boolean) {
         val lastBot = messages.value.lastOrNull { !it.isUser } ?: return
         if (lastBot.state !in setOf(
@@ -1305,20 +1269,21 @@ class ChatViewModel(
 
         if (lastBot.text.isNotBlank()) {
             val split = splitIntroAndCode(lastBot.text)
-            val settled = lastBot.copy(
-                state = BotMessageState.PAUSED,
-                codeLines = split.codeLines ?: lastBot.codeLines,
-                text = lastBot.text
-            )
-            upsertBotMessage(lastBot.id, settled)
-            sessionId?.let { persistMessage(it, settled) }
+            if (split.codeLines != null) {
+                val settled = lastBot.copy(
+                    state = BotMessageState.CODE_DONE,
+                    codeLines = split.codeLines,
+                    text = lastBot.text
+                )
+                upsertBotMessage(lastBot.id, settled)
+                sessionId?.let { persistMessage(it, settled) }
+            } else {
+                val settled = lastBot.copy(state = BotMessageState.TEXT)
+                upsertBotMessage(lastBot.id, settled)
+                sessionId?.let { persistMessage(it, settled) }
+            }
         } else {
-            val settled = lastBot.copy(
-                state = BotMessageState.PAUSED,
-                text = if (userStopped) "Generation stopped. Type \"continue\" to resume the saved checkpoint." else "Generation paused. Type \"continue\" to resume the saved checkpoint."
-            )
-            upsertBotMessage(lastBot.id, settled)
-            sessionId?.let { persistMessage(it, settled) }
+            removeBotMessage(lastBot.id)
         }
 
         if (userStopped) {
@@ -1578,7 +1543,7 @@ class ChatViewModel(
                                     codeId = nextId++
                                 }
                                 val detectedFileName = ArtifactExtractor.extract(full).firstOrNull()?.fileName
-                                upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, generationProgress = tokenCount))
+                                upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, codeFileName = detectedFileName, generationProgress = tokenCount))
                             }
                             // Bug fix (user request) - real, periodic on-disk copy of
                             // whatever has genuinely streamed so far, keyed to the
@@ -1658,7 +1623,7 @@ class ChatViewModel(
                         if (partialSplit.introText.isNotBlank()) {
                             persistMessage(activeSessionId, ChatMessage(id = botId, text = partialSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
                         }
-                        persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.PAUSED, codeLines = partialSplit.codeLines))
+                        persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = partialSplit.codeLines))
                     }
                 }
             }
@@ -1700,13 +1665,7 @@ class ChatViewModel(
             if (finalSplit.codeLines == null || finalCodeId == null) {
                 // No real fence ever appeared - unchanged, single
                 // plain-text card, same as every earlier phase.
-                val renderedState = when (stopReason) {
-                    "end_of_generation" -> BotMessageState.TEXT
-                    "timeout", "max_tokens", "thermal_pause" -> BotMessageState.PAUSED
-                    "context_full" -> BotMessageState.FAILED
-                    else -> BotMessageState.FAILED
-                }
-                val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = renderedState)
+                val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
                 upsertBotMessage(botId, renderedMessage)
                 persistMessage(activeSessionId, renderedMessage)
             } else {
@@ -1727,21 +1686,11 @@ class ChatViewModel(
                 // since ArtifactExtractor needs those to find every
                 // real block, not just the first one this card
                 // shows live.
-                val codeRenderedState = when (stopReason) {
-                    "end_of_generation" -> BotMessageState.CODE_DONE
-                    "timeout", "max_tokens", "thermal_pause" -> BotMessageState.PAUSED
-                    "context_full" -> BotMessageState.FAILED
-                    else -> BotMessageState.FAILED
-                }
-                val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = codeRenderedState, codeLines = finalSplit.codeLines)
-                var finalCodeMessage = if (stopReason == "end_of_generation") {
-                    if (zipEditTarget == null && ProjectTypeGate.isWebAppCreationRequest(prompt)) {
-                        attachArtifactsIfAny(activeSessionId, codeRendered, simpleWebApp = true)
-                    } else {
-                        attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
-                    }
+                val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines)
+                var finalCodeMessage = if (zipEditTarget == null && ProjectTypeGate.isWebAppCreationRequest(prompt)) {
+                    attachArtifactsIfAny(activeSessionId, codeRendered, simpleWebApp = true)
                 } else {
-                    codeRendered
+                    attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
                 }
                 // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
                 // runs when [finalCodeMessage] genuinely has real
@@ -1823,7 +1772,6 @@ class ChatViewModel(
                         "Raise Context Length in Model Settings (up to 8192) and send " +
                         "the request again for a longer reply."
                 )
-                settleActiveWorkCard(BotMessageState.FAILED, "The model context window is full. Increase Context Length and send the task again.")
             } else if (stopReason == "thermal_pause") {
                 // Phase 23 (Appendix - Mobile Thermal Management) - the
                 // real device thermal status genuinely reached SEVERE+
@@ -1858,7 +1806,6 @@ class ChatViewModel(
                         "and this reply will resume automatically the moment " +
                         "the device's real thermal status drops back to a safe level."
                 )
-                settleActiveWorkCard(BotMessageState.PAUSED)
             } else if (stopReason == "timeout") {
                 // Bug fix (user request - "kaam ruk jata hai, koi progress
                 // nahi dikhta") - see [GENERATION_CHUNK_TIMEOUT_MS]'s own
@@ -1993,7 +1940,6 @@ class ChatViewModel(
         ): Pair<String, String> {
             val builder = StringBuilder(initialOutput)
             var continuationPrompt = initialContinuationPrompt?.takeIf { it.isNotBlank() } ?: prompt
-            if (builder.isNotEmpty()) onChunkText(builder.toString())
             var reason = "max_tokens"
             var chunk = 0
             while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
@@ -2023,7 +1969,14 @@ class ChatViewModel(
                             }
                     }
                     if (timedOutOrNull == null) {
-                        reason = "timeout"
+                        // Kotlin's watchdog can stop waiting before the detached
+                        // native worker has actually returned from JNI. Never let
+                        // Continue start a new generation against that still-busy
+                        // engine: that was the exact "glow but token count stays 0"
+                        // failure seen after the first timeout. Wait for the real
+                        // native operation to finish before exposing PAUSED.
+                        val nativeIdle = BrainEngine.awaitGenerationIdle(GENERATION_CHUNK_TIMEOUT_MS)
+                        reason = if (nativeIdle) "timeout" else "engine_busy"
                         break
                     }
                 } catch (e: kotlinx.coroutines.CancellationException) {
@@ -2146,13 +2099,19 @@ class ChatViewModel(
         }
 
         // "Worker phone as a tool" - bounded, opt-in real parallelism.
-        // Project generation is intentionally sequential at the visible UI layer.
-        // A speculative second-file worker used to create a second live CODING
-        // card and an independent progress stream. That made the task state
-        // ambiguous and made Continue impossible to reason about. Compute
-        // Bridge can still be used by the explicit compute route, but this
-        // project builder owns exactly one current-file cursor.
+        // Chat-Bot stays in charge (same plan, same file list, same
+        // artifact/validation pipeline below); the only thing that
+        // changes is that when a paired worker is actually available,
+        // Multi-file generation is intentionally sequential. One execution
+        // cursor owns one current file, so Continue can always identify the
+        // exact file/checkpoint that must resume.
         val executionCheckpointId = resumeCheckpoint?.id ?: java.util.UUID.randomUUID().toString()
+        // Project files are generated strictly one-at-a-time. A speculative
+        // second worker used to create a second visible CODING card and, more
+        // importantly, could leave a remote generation alive while Continue
+        // tried to resume the first file. That made the UI look active while
+        // the resumed native generation was actually waiting for the single
+        // engine to become idle. Keep one authoritative execution cursor.
 
         for ((fileIndex, planned) in plan.files.withIndex()) {
             if (fileIndex < startFileIndex) continue
@@ -2229,20 +2188,10 @@ class ChatViewModel(
                 )
             }
 
-            // Weakness-review fix, issue 2 - real, auto-continuing
-            // per-file generation (see [generateFileContent] above)
-            // instead of a single bounded call, so a large file (e.g. a
-            // long Activity class) genuinely keeps going across chunks
-            // instead of being handed to [FileValidator] mid-answer.
-            //
-            // fileIndex 0: when the worker prefetch above is active,
-            // pinned to LOCAL so it genuinely runs on this phone at the
-            // same time the worker is already generating file[1] - never
-            // left to AUTO's own heuristic, which could otherwise also
-            // pick the same worker and serialize the two after all.
-            // fileIndex 1: when the prefetch is active, its generation
-            // already started above - awaited here instead of starting a
-            // second, redundant call for the same file.
+            // Generate exactly one authoritative file at a time. The
+            // checkpoint and this message both point at the same file, so a
+            // pause/Continue can never leave a second hidden generator or a
+            // second visible CODING card competing with the current cursor.
             val resumePartial = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.partialOutput else ""
             val resumeContinuationPrompt = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.continuationPrompt.takeIf { it.isNotBlank() } else null
             var lastCheckpointChars = resumePartial.length
@@ -2280,13 +2229,11 @@ class ChatViewModel(
             } catch (e: Exception) {
                 completeStep(creatingStepId, failed = true, label = "Paused: ${planned.fileName} failed")
                 postSystemNote(activeSessionId, "${planned.fileName} hit a real generation error: ${e.message ?: e::class.java.simpleName}. The checkpoint is saved; reply \"continue\" to retry this file safely.")
-                settleActiveWorkCard(BotMessageState.PAUSED)
                 return false
             }
-            if (stopReason == "context_full" || stopReason == "timeout" || stopReason == "error" || stopReason == "thermal_pause" || stopReason == "chunk_cap") {
+            if (stopReason != "end_of_generation") {
                 completeStep(creatingStepId, failed = true, label = "Paused ${planned.fileName}: $stopReason")
                 postSystemNote(activeSessionId, "${planned.fileName} could not be completed safely ($stopReason). The real project checkpoint is saved; reply \"continue\" to resume this file instead of starting over.")
-                settleActiveWorkCard(BotMessageState.PAUSED)
                 return false
             }
 
@@ -2304,7 +2251,6 @@ class ChatViewModel(
             if (content.isBlank()) {
                 completeStep(creatingStepId, failed = true, label = "Paused: ${planned.fileName} returned no content")
                 postSystemNote(activeSessionId, "${planned.fileName} returned no real content. The project checkpoint is saved; reply \"continue\" after checking the model/device state.")
-                settleActiveWorkCard(BotMessageState.PAUSED)
                 return false
             }
             if (ProjectTypeGate.isWebAppCreationRequest(originalRequest)) {
@@ -2378,7 +2324,6 @@ class ChatViewModel(
                 // a reason to publish known-bad source.
                 fileSummaries += "- ${planned.fileName}: rejected - ${result.issues.joinToString("; ")}"
                 postSystemNote(activeSessionId, "${planned.fileName} still has real validation issues after the allowed fixes. The checkpoint is saved at this file; reply \"continue\" after the task is corrected.")
-                settleActiveWorkCard(BotMessageState.PAUSED)
                 return false
             }
 
@@ -2392,7 +2337,6 @@ class ChatViewModel(
                 is ToolGateway.GatewayResult.Denied -> {
                     fileSummaries[fileSummaries.lastIndex] = "- ${planned.fileName}: could not be saved (${write.reason})"
                     postSystemNote(activeSessionId, "${planned.fileName} was generated but could not be saved safely: ${write.reason}. The checkpoint is preserved; reply \"continue\" to retry the saved file.")
-                    settleActiveWorkCard(BotMessageState.PAUSED)
                     return false
                 }
             }

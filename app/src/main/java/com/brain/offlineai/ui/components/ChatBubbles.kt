@@ -304,7 +304,7 @@ fun BotCodeDoneBubble(
             }
         }
         Spacer(Modifier.height(6.dp))
-        Text("Completed", color = BrainSuccessGreen, style = MaterialTheme.typography.bodySmall)
+        Text("Done.", color = BrainSuccessGreen, style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(2.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
         if (message.artifacts.isNotEmpty()) {
@@ -322,42 +322,6 @@ fun BotCodeDoneBubble(
                 onPublishAll = onPublishAllArtifacts
             )
         }
-    }
-}
-
-@Composable
-fun BotPausedBubble(message: ChatMessage) {
-    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.45f)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("⏸", color = BrainWarningAmber, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.width(8.dp))
-            Text("Paused", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.weight(1f))
-            Text("Continue", color = BrainWarningAmber, style = MaterialTheme.typography.bodySmall)
-        }
-        Spacer(Modifier.height(6.dp))
-        message.codeFileName?.let {
-            Text(it, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 1)
-            Spacer(Modifier.height(4.dp))
-        }
-        if (message.text.isNotBlank()) {
-            Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 3)
-        }
-        Spacer(Modifier.height(4.dp))
-        Text("No active generation is running. Type \"continue\" to resume the saved checkpoint.", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
-    }
-}
-
-@Composable
-fun BotFailedBubble(message: ChatMessage) {
-    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.45f)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("✕", color = BrainWarningAmber, style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.width(8.dp))
-            Text("Failed", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
-        }
-        Spacer(Modifier.height(6.dp))
-        Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
     }
 }
 
