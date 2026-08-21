@@ -2,16 +2,18 @@ package com.brain.offlineai.ui.components
 
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.RadioButtonUnchecked
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -117,9 +119,16 @@ fun BotTextBubble(
  *  emitting a genuine THINKING step while it checks engine state / loads
  *  settings before a real generation starts - see that file's sendMessage(). */
 @Composable
-fun BotProcessBubble(message: ChatMessage) {
+fun BotProcessBubble(
+    message: ChatMessage,
+    onOpenUrl: (String) -> Unit = {}
+) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
-        LiveProcessCard(steps = message.processSteps, modifier = Modifier.widthIn(max = 280.dp))
+        LiveProcessCard(
+            steps = message.processSteps,
+            modifier = Modifier.widthIn(max = 320.dp),
+            onOpenUrl = onOpenUrl
+        )
     }
 }
 
@@ -189,11 +198,22 @@ private fun ThinkingStepRow(step: ThinkingStep) {
  */
 @Composable
 fun BotCodingBubble(message: ChatMessage) {
+    val scrollState = rememberScrollState()
+    LaunchedEffect(message.generationProgress, message.codeLines.size) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
     BotCardShell {
         Row(verticalAlignment = Alignment.CenterVertically) {
             PulsingDot(color = BrainCyanAccent)
             Spacer(Modifier.width(8.dp))
-            Text("Coding...", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+            Text(
+                text = message.codeFileName?.let { "Coding · $it" } ?: "Coding...",
+                color = BrainTextPrimary,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1
+            )
+            Spacer(Modifier.weight(1f))
+            Text("${message.generationProgress} tokens", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
         }
         Spacer(Modifier.height(8.dp))
         Box(
@@ -202,7 +222,7 @@ fun BotCodingBubble(message: ChatMessage) {
                 .clip(RoundedCornerShape(10.dp))
                 .background(BrainBgPrimary)
                 .heightIn(max = 280.dp)
-                .verticalScroll(rememberScrollState())
+                .verticalScroll(scrollState)
                 .padding(12.dp)
         ) {
             Column {
@@ -242,6 +262,10 @@ fun BotCodeDoneBubble(
     onPublishArtifact: (ArtifactInfo) -> Unit = {},
     onPublishAllArtifacts: (List<ArtifactInfo>) -> Unit = {}
 ) {
+    val scrollState = rememberScrollState()
+    LaunchedEffect(message.codeLines.size) {
+        scrollState.scrollTo(scrollState.maxValue)
+    }
     BotCardShell {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
@@ -251,7 +275,12 @@ fun BotCodeDoneBubble(
                 modifier = Modifier.size(18.dp)
             )
             Spacer(Modifier.width(8.dp))
-            Text("Code ready", color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+            Text(
+                message.codeFileName?.let { "Code ready · $it" } ?: "Code ready",
+                color = BrainTextPrimary,
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1
+            )
         }
         Spacer(Modifier.height(8.dp))
         Box(
@@ -259,6 +288,8 @@ fun BotCodeDoneBubble(
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(10.dp))
                 .background(BrainBgPrimary)
+                .heightIn(max = 280.dp)
+                .verticalScroll(scrollState)
                 .padding(12.dp)
         ) {
             Column {
@@ -303,27 +334,43 @@ fun BotCodeDoneBubble(
  */
 @Composable
 fun BotGeneratingBubble(message: ChatMessage) {
-    BotCardShell {
+    var expanded by remember { mutableStateOf(false) }
+    val scrollState = rememberScrollState()
+    LaunchedEffect(message.generationProgress, expanded) {
+        if (expanded) scrollState.scrollTo(scrollState.maxValue)
+    }
+    BotCardShell(
+        modifier = Modifier.clickable { expanded = !expanded }
+    ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             PulsingDot(color = BrainPurplePrimary)
             Spacer(Modifier.width(8.dp))
-            // Phase 9 - real start/streaming distinction: message.generationProgress
-            // is the real running token count already collected from BrainEngine's
-            // Flow (Phase 2). Zero tokens so far means the real decode loop hasn't
-            // produced its first piece yet (Starting...); any token already means
-            // real pieces are actively arriving (Streaming reply...). No new timer
-            // or fake state was added - this reads the same real counter the token
-            // count on the right already uses.
-            val label = if (message.generationProgress == 0) "Starting..." else "Streaming reply..."
-            Text(label, color = BrainTextPrimary, style = MaterialTheme.typography.titleMedium)
+            Text(
+                if (message.generationProgress == 0) "Starting..." else "Streaming reply...",
+                color = BrainTextPrimary,
+                style = MaterialTheme.typography.titleMedium
+            )
             Spacer(Modifier.weight(1f))
             Text("${message.generationProgress} tokens", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.width(6.dp))
+            Text(if (expanded) "▲" else "▼", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
         }
-        if (message.text.isNotBlank()) {
+        // Keep the live card compact by default. The real streamed text is
+        // still available on tap, inside its own bounded scroll area.
+        if (expanded && message.text.isNotBlank()) {
             Spacer(Modifier.height(8.dp))
-            Text(message.text, color = BrainTextPrimary, style = MaterialTheme.typography.bodyLarge)
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 240.dp)
+                    .verticalScroll(scrollState)
+                    .background(BrainBgPrimary, RoundedCornerShape(10.dp))
+                    .padding(10.dp)
+            ) {
+                Text(message.text, color = BrainTextPrimary, style = MaterialTheme.typography.bodySmall)
+            }
         } else {
-            Spacer(Modifier.height(10.dp))
+            Spacer(Modifier.height(8.dp))
             WaveformAnimation()
         }
     }
@@ -452,12 +499,13 @@ private fun TypingDots() {
 @Composable
 private fun BotCardShell(
     borderColor: Color = BrainBorder,
+    modifier: Modifier = Modifier,
     content: @Composable ColumnScope.() -> Unit
 ) {
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
         val shape = RoundedCornerShape(topStart = 4.dp, topEnd = 16.dp, bottomStart = 16.dp, bottomEnd = 16.dp)
         Column(
-            modifier = Modifier
+            modifier = modifier
                 .widthIn(max = 300.dp)
                 .clip(shape)
                 .background(BrainBgCard)

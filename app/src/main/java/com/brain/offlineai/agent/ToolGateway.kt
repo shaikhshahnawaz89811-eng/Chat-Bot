@@ -45,8 +45,8 @@ class ToolGateway(private val context: Context) {
 
     // ---- LOW-risk reads (uniform entry point, no audit row - see class doc) ----
 
-    suspend fun listZipEntries(storedPath: String): List<AttachmentContentReader.ZipEntrySummary> =
-        AttachmentContentReader.listZipEntries(storedPath)
+    suspend fun listZipEntries(storedPath: String, maxEntries: Int = 5000): List<AttachmentContentReader.ZipEntrySummary> =
+        AttachmentContentReader.listZipEntries(storedPath, maxEntries)
 
     suspend fun readZipEntry(storedPath: String, entryName: String): String? =
         AttachmentContentReader.readZipEntryText(storedPath, entryName)
@@ -93,6 +93,32 @@ class ToolGateway(private val context: Context) {
         } catch (e: Exception) {
             auditRepository.record(sessionId, AgentTool.PATCH_ZIP_ENTRY, entryName, outcome = false, detail = "Patch failed: ${e.message}")
             GatewayResult.Denied("Patch failed: ${e.message}")
+        }
+    }
+
+    /** Real atomic-style multi-entry ZIP patch: one staged source is read completely and every requested real entry is replaced in one output ZIP. Each changed entry gets its own persisted audit row. */
+    suspend fun patchZipEntries(
+        sessionId: String,
+        sourceZip: File,
+        replacements: Map<String, Pair<String, String>>,
+        zipDisplayName: String
+    ): GatewayResult<File> {
+        if (!sourceZip.exists() || !sourceZip.isFile) {
+            auditRepository.record(sessionId, AgentTool.PATCH_ZIP_ENTRY, zipDisplayName, outcome = false, detail = "Source ZIP no longer exists on disk.")
+            return GatewayResult.Denied("Source ZIP no longer exists on disk.")
+        }
+        if (replacements.isEmpty()) return GatewayResult.Denied("No real ZIP entries were selected for change.")
+        return try {
+            val staged = EditSandbox.stageCopy(sourceZip, sandboxDir)
+            val replacementText = replacements.mapValues { it.value.second }
+            val patched = artifactFileManager.patchZip(staged, replacementText, zipDisplayName)
+            replacements.forEach { (entry, pair) ->
+                auditRepository.record(sessionId, AgentTool.PATCH_ZIP_ENTRY, entry, outcome = true, detail = EditSandbox.diffSummary(pair.first, pair.second).describe())
+            }
+            GatewayResult.Success(patched)
+        } catch (e: Exception) {
+            auditRepository.record(sessionId, AgentTool.PATCH_ZIP_ENTRY, zipDisplayName, outcome = false, detail = "Multi-entry patch failed: ${e.message}")
+            GatewayResult.Denied("Multi-entry patch failed: ${e.message}")
         }
     }
 

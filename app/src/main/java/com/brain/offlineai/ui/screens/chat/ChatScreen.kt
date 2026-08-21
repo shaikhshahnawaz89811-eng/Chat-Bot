@@ -2,6 +2,7 @@ package com.brain.offlineai.ui.screens.chat
 
 import android.Manifest
 import android.content.ContentValues
+import android.content.Intent
 import android.os.Build
 import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -244,7 +245,11 @@ fun ChatScreen(
                     message.isUser -> UserBubble(message)
 
                     message.state == BotMessageState.PROCESS ->
-                        BotProcessBubble(message)
+                        BotProcessBubble(message) { url ->
+                            runCatching {
+                                context.startActivity(Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)))
+                            }
+                        }
 
                     message.state == BotMessageState.TASK_LIST ->
                         BotTaskListBubble(message)

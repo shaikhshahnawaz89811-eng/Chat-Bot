@@ -39,7 +39,7 @@ object ProjectTypeGate {
         "node", "react", "vue", "angular", "html", "css", "flutter", "dart",
         "swift", "ios", "c++", "c#", "csharp", "rust", "golang", " go ",
         "php", "ruby", "django", "flask", "spring", ".net", "unity",
-        "jetpack compose", "compose", "web"
+        "jetpack compose", "compose", "web", "website", "web app", "webapp"
     )
 
     /** Phase 25 - real, public aliases of this file's own existing keyword lists above, reused (not duplicated) by [WebSearchTrigger.buildTargetSearchQuery] and by [isCreationRequest] below - same "don't duplicate an existing abstraction before reusing it" reasoning [ContextManager]'s own doc already gives. */
@@ -106,7 +106,14 @@ object ProjectTypeGate {
      * plain "explain how apps work" is untouched) AND names no real
      * platform/language - never a model guess about what was meant.
      */
-    fun detectAmbiguity(text: String): Ambiguity? = null
+    fun detectAmbiguity(text: String): Ambiguity? {
+        if (!isCreationRequest(text)) return null
+        val lower = text.lowercase()
+        if (PLATFORM_KEYWORDS.any { lower.contains(it) }) return null
+        return Ambiguity(
+            "I can build this, but I need the target platform/language first. For example: Android/Kotlin, web/HTML-CSS-JS, Python, Node.js, Flutter/Dart, or another platform. Reply with the one you want and I'll continue this same task."
+        )
+    }
 
     /** Real, narrow check for whether a follow-up answer actually names a real platform - never a model guess about intent. */
     fun answerNamesPlatform(text: String): Boolean {

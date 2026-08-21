@@ -26,7 +26,7 @@ hain):
 | Local AI engine   | llama.cpp (JNI/NDK) - Phase 2 (DONE)               |
 | Model             | Qwen2.5-1.5B-Instruct, GGUF Q4_K_M - user-imported |
 | Secure storage    | SQLCipher (encrypted DB) - Phase 3 (DONE)          |
-| Local API server  | OpenAI-compatible, loopback-only — Phase 4 (DONE)   |
+| Local API server  | OpenAI-compatible, authenticated LAN + loopback — Phase 4 (DONE) |
 
 ---
 
@@ -303,7 +303,7 @@ app/build.gradle.kts  (ksp plugin + Room/SQLCipher/security-crypto deps)
 **What's real and working in this phase:**
 - `server/LocalApiServer.kt` — a real `NanoHTTPD` subclass, constructed as
   `NanoHTTPD("127.0.0.1", PORT)` — bound to the loopback interface only,
-  never `0.0.0.0`, so "100% Offline" is enforced at the socket level (on
+  never `0.0.0.0`, so the local API is intentionally loopback-bound (on
   top of `network_security_config.xml`'s existing loopback-only cleartext
   rule from Phase 1). Implements two real OpenAI-compatible routes:
   - `GET /v1/models` — lists the model actually loaded in `BrainEngine`
@@ -3843,3 +3843,288 @@ app/src/main/java/.../ui/screens/github/GitHubPublishScreen.kt    (custom-domain
   pattern `FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP` already uses for per-file
   prompts. No existing function removed or renamed; only additive changes
   inside `buildMultiFileProject`.
+
+## Full-system weakness audit + real cross-feature fixes (2026-08-21) — v4 hardening
+
+This pass reviewed the whole current APK source tree and CI workflow, not only the web-app path. The purpose was to find feature interactions where one real subsystem could silently bypass, weaken, duplicate, or contradict another real subsystem. No fake Android API, dummy implementation, simulated success, or patch-only workaround was introduced.
+
+### Real fixes applied
+
+1. **Generation error recovery now preserves the selected Compute Bridge route.** Recovery no longer calls `BrainEngine.generate()` directly. It uses the same `ComputeManager` mode selected for the failed request and the same real stall watchdog. A Remote/Auto request therefore cannot silently fall back to Local merely because recovery started.
+2. **Recovery uses a real token budget and stop reason.** A retry is accepted only when it genuinely produced output and ended with a real non-error stop reason. Timeout/context-full/error outcomes remain failures and are shown as such.
+3. **Simple web-app artifacts are fully statically validated before being written.** The same `FileValidator` now checks the extracted HTML, plus the dedicated web-app contract. A known-invalid artifact is not persisted just because a fenced code block existed.
+4. **Multi-file builds no longer save known-invalid files after all fix attempts are exhausted.** A file that still fails the real validator is rejected and excluded from the project ZIP. The summary reports the rejection instead of publishing known-bad source.
+5. **False-positive dummy detection was removed.** Literal `...` is not a dummy marker because it is valid JavaScript/TypeScript spread syntax and valid object/array syntax. The remaining markers stay explicit and deterministic.
+6. **ZIP patching is hardened.** Source ZIP entries are normalized and rejected if absolute, traversal-based, blank, or duplicated. The generated patched ZIP cannot silently reproduce a dangerous `../` entry or duplicate entry.
+7. **Public Tunnel is now an explicit user action.** Starting the Local API server no longer automatically exposes it through a public Cloudflare tunnel. The tunnel can only start after the real Local API server is running and is separately stopped by the user.
+8. **Compute Bridge pairing rejects public worker addresses.** Pairing codes are accepted only when the resolved address is loopback, site-local/private, or link-local and the port is 1–65535. This prevents a QR/paste payload from silently sending the pairing credential to an arbitrary public host.
+9. **Android build toolchain is aligned.** AGP is updated to 8.6.1 while Gradle remains 8.7; the CI runner installs Android API 35 and Build Tools 35.0.0. Android's official compatibility table lists API 35 support beginning at AGP 8.6.0 and AGP 8.6 using Gradle 8.7.
+10. **Cloudflared CI download is reproducible and integrity-checked.** The workflow pins the ARM64 binary to 2026.7.3 and verifies the published SHA-256 before putting it into `jniLibs/arm64-v8a`. The pin avoids the unbounded `latest` asset changing underneath a future build.
+11. **Project-type clarification is now actually wired.** The deterministic `ProjectTypeGate.detectAmbiguity()` implementation no longer returns a hardcoded `null`. Creation requests without a recognizable platform now pause with a real clarification question, while explicit web/Android/Python/Node/etc. requests continue directly.
+
+### End-to-end workflow audit after the fixes
+
+#### A. Normal chat — Local
+
+`User message → InputNormalizer → session/message persistence → model-loaded gate → attachment routing → web-search trigger → context builder → ComputeManager(LOCAL) → BrainEngine → JNI llama.cpp → real token stream → live UI → periodic Room persistence → final message/artifact extraction → final validation → artifact write/audit → history/analytics.`
+
+#### B. Normal chat — Remote / Auto
+
+`User message → same preprocessing → ComputeManager(REMOTE/AUTO) → paired worker selection → real HTTP/SSE worker generation → real token stream → same ChatViewModel collector → same persistence/finalization path.`
+
+If a remote worker fails before producing any token, the existing real fallback policy may try the next worker/local engine according to the selected mode. If a worker already produced partial output and then fails, the partial stream is not silently spliced with another model; the request fails honestly.
+
+#### C. Web search ON
+
+`User request → deterministic search trigger → WebSearchRepository checks toggle + validated key + connectivity → Tavily HTTPS search → bounded result/answer context → search process card → same ComputeManager generation path.`
+
+Search results are reference context only. They do not replace the user's task, and source code/file contents are not sent to the search provider by this path.
+
+#### D. Web search OFF
+
+`User request → same deterministic trigger → WebSearchRepository immediately returns Unavailable → no search HTTP request → normal generation continues with the non-search context.`
+
+No fake search result is substituted.
+
+#### E. Simple web app
+
+`"create web app" → creation/build-target detection → optional real web search → single normal generation contract → HTML fence extraction → web-app contract validation → full FileValidator static validation → verified artifact write → artifact card/download/preview.`
+
+The simple path does not enter the expensive multi-file planner merely because the target is a web app.
+
+#### F. Explicit multi-file web app
+
+`"web app, separate HTML/CSS/JS files" → explicit multi-file gate → PlanningEngine → real plan parse/fallback → per-file prompt → ComputeManager generation → auto-continuation → per-file static validation → up to two real fix attempts → reject if still invalid → write only verified files → package real ZIP when more than one file → final process summary.`
+
+A paired Compute Bridge worker may genuinely prefetch the second file while the first file is generated locally; the calls are explicitly pinned to different targets so they do not accidentally select the same worker twice.
+
+#### G. Generation failure / recovery
+
+`Real generation exception → Error step → deterministic root-cause classification → same ComputeManager route + same stall watchdog for one bounded retry → re-test actual output → verify only on real success → otherwise real failure note with root cause.`
+
+Recovery never bypasses Compute Bridge and never runs a second hidden retry.
+
+#### H. Stop / timeout / cancellation
+
+`User Stop or lifecycle cancellation → generation coroutine cancellation → native callback cancellation signal → partial real output settlement → NonCancellable persistence of the real partial message → foreground task service stopped.`
+
+A genuine stall timeout is reported as a timeout rather than converted into a fake successful answer. The native worker is allowed to unwind before another generation can safely acquire the engine.
+
+#### I. Model lifecycle / thermal pause
+
+`ThermalMonitor → ThermalPolicy checkpoint → severe status → real native unload → persisted thermal pause → cooling state → automatic resume when the real thermal status becomes safe.`
+
+The same native unload/load ownership is reused; no second fake model lifecycle exists.
+
+#### J. ZIP attachment / edit
+
+`Real attachment copy → bounded listing/read → target resolver → clarification gate when needed → copy-first sandbox → real ZIP patch → normalized/validated ZIP entries → audit row + diff summary → new ZIP artifact.`
+
+The original attachment is never overwritten by the edit operation.
+
+#### K. Local API + LAN
+
+`User starts Local API → foreground service → LocalApiServerManager → real NanoHTTPD server → authenticated /v1/models or /v1/chat/completions → real BrainEngine generation → OpenAI-compatible response/SSE → live request counter + analytics.`
+
+The public tunnel is not started by this chain anymore; it is a separate explicit action.
+
+#### L. Public Tunnel
+
+`Local API already running → user taps Start Public Tunnel → bundled ARM64 cloudflared executable is verified/present → ProcessBuilder starts real quick tunnel to 127.0.0.1:11434 → stdout is parsed for the real trycloudflare URL → UI shows only the URL actually returned by cloudflared → user stops tunnel or stops Local API.`
+
+If the binary is absent, the process cannot start and the UI reports the real error. CI supplies the pinned, checksum-verified binary for ARM64 builds.
+
+#### M. GitHub publishing
+
+`Selected real artifacts → token/connectivity validation → repo create/reuse → real file commits → GitHub Pages enable → optional real CNAME commit/API update → real Pages status polling → final URL only after GitHub reports the real site status.`
+
+DNS remains a user-owned registrar action; the app does not pretend that a DNS change happened when it did not.
+
+#### N. Compute Bridge pairing
+
+`QR/paste payload → protocol validation → workerId/host/port/token extraction → local/private address + port validation → real POST /v1/pair → real worker access token → encrypted local storage → enabled/priority/mode selection → real health/worker/generation calls.`
+
+A public arbitrary host in a pairing payload is rejected before the pairing token is transmitted.
+
+### Validation performed in this environment
+
+- Full v3 ZIP extracted successfully and the complete source tree was reviewed across Kotlin, C++, Gradle, Android manifest/resources, CI workflow, and feature interaction points.
+- ZIP integrity after hardening: checked with `unzip -t`.
+- Whole-project source searches were repeated for direct `BrainEngine.generate()` bypasses, network endpoints, process launches, public bind addresses, stale tunnel ownership, placeholder markers, and unresolved setter clashes.
+- Android SDK/Gradle are not installed in this working environment, so `assembleDebug` cannot honestly be claimed as locally compiled here. The GitHub Actions workflow remains the real end-to-end Android compiler/NDK validation endpoint.
+- The CI toolchain is now aligned to API 35 + AGP 8.6.1 + Gradle 8.7. Android's official documentation confirms AGP 8.6 supports API 35 and requires Gradle 8.7. citeturn0search0turn0search4
+
+### Deliberately unchanged in this pass
+
+The existing offline-status/badge wording was intentionally left untouched as requested. This hardening pass focuses on the actual cross-feature correctness, recovery, validation, networking exposure, ZIP safety, Compute Bridge routing, and CI issues listed above.
+
+
+## Final chat/attachment/UI hardening — 2026-08-21
+
+This pass addresses the remaining user-visible workflow gaps found in the previous audit. The changes are real Compose/state/engine-path changes; no visual-only mock, fake progress, dummy file, or simulated completion was added.
+
+### 1. Code-card size and scrolling
+
+- Live coding cards have a bounded inner code viewport (`280dp` maximum) instead of growing with the entire generated source.
+- The code viewport owns a real `ScrollState`.
+- While real tokens/lines arrive, the viewport follows the newest real line automatically.
+- The user can manually scroll inside the code area to inspect earlier lines.
+- Completed code cards use the same bounded inner scroll area.
+- The filename is shown in the card header when the model/artifact pipeline has a real filename.
+
+### 2. Large streaming reply card
+
+- The large live streaming text is no longer rendered as an ever-growing outer chat card.
+- The live card stays compact and shows the real streaming animation/token count.
+- Tapping the live card expands the real streamed text into a bounded inner scroll area.
+- The expanded stream follows the newest real text automatically while generation continues.
+- Tapping again collapses it.
+- No generated text is discarded by this UI change; the full text remains in the real message state/persistence path.
+
+### 3. Multiple-file generation visibility
+
+Each real planned file now gets its own live coding card while its actual bytes are being generated:
+
+`Creating <real filename> → live code lines → verification → Code ready <real filename>`
+
+The same real code card is updated as the generation callback produces more content. This applies to the local per-file path and to the explicitly enabled worker prefetch path.
+
+The process card continues to show the real file-level work:
+
+`Planning → Creating file → Verifying file → Fixing (attempt N/2) → Packaging → Complete/Failed`
+
+No file is marked complete until the real generation and validation gates have actually reached that state.
+
+### 4. Search-result links
+
+Search process steps now render a returned `https://` URL as an actual clickable UI link. Tapping the link opens the Android system URL handler with the exact URL returned by the real search provider.
+
+The displayed title and URL are still taken from the real search result. No URL is invented from a title.
+
+### 5. ZIP upload with no instruction
+
+`Attach ZIP → real byte copy → Ready attachment chip → Send with no text → attachment is persisted → user is told to describe the desired action.`
+
+The app does not silently run a model call on an attachment without an instruction.
+
+### 6. ZIP + "error/bug dhoondo"
+
+When one ZIP is attached and the user's request is a diagnosis/review request without a specific target file:
+
+`ZIP → real entry listing → bounded readable-source selection → real file excerpts → diagnosis prompt → model review → evidence-based explanation`
+
+No file is modified in this diagnosis path.
+
+The diagnosis context is bounded to a small number of real readable source/config files so a large project does not flood the mobile model context. If a useful file cannot actually be read, the response is expected to say so rather than inventing its contents.
+
+If the user names one real file/function and asks to diagnose it, the existing exact-target ZIP resolver remains preferred and only that real target is inspected.
+
+### 7. ZIP + edit/fix request
+
+`ZIP → exact filename/declaration resolution → ambiguity clarification if necessary → real target read → edit/fix generation → complete-file response → declaration-removal safety check → copy-first real ZIP patch → validation/audit → new ZIP artifact`
+
+The original ZIP is not overwritten.
+
+A request such as `fix the bug` without a uniquely resolvable target remains conservative and asks the user when an edit target is genuinely ambiguous. A diagnosis-only request does not get forced through the edit path.
+
+### 8. "Continue" behavior
+
+The normal long-response path already carries a real continuation prompt containing the original request plus the actual generated text. `continue`, `keep going`, `go on`, `next`, and the supported Hinglish equivalents consume that real pending continuation once.
+
+The continuation is not a new unrelated answer and does not re-guess the original task.
+
+For normal generation, the app automatically continues chunks before asking the user to type `continue`; the explicit `continue` path exists only when a genuine bounded continuation state remains.
+
+Thermal pauses are separate: the thermal state is persisted and the real model is reloaded/resumed automatically after the device reaches the safe status.
+
+### 9. User code → later "file me do" / "zip kar do"
+
+A follow-up can now turn already-visible code into real artifacts without forcing a new model generation:
+
+`User writes code → message is persisted → later "file me do" → previous real user code is read → filename/fence is resolved deterministically → real artifact written → artifact card`
+
+If the previous assistant message already contains real persisted artifacts:
+
+`"zip kar do" → existing real artifact files verified on disk → real ZIP created → ZIP artifact persisted → artifact card`
+
+If the previous user message contains multiple real fenced blocks and the user asks for a ZIP, each block becomes a real file and the resulting files are packaged into a real ZIP.
+
+A programming language is not invented when the previous plain-text snippet does not contain a reliable language signal; the safe real fallback is a text file.
+
+### 10. Chat-screen visibility
+
+The chat list remains the source of truth for all user-visible process/result cards. Live code, process steps, search-result links, system notes, generated artifacts, and final responses are separate real message states rather than temporary overlays that disappear when generation completes.
+
+The outer chat list auto-follows only when the user is already near the bottom. Inner code/stream/process areas have their own bounded scroll states, so large content cannot force the whole screen to grow indefinitely.
+
+### 11. No partial-file publishing
+
+For multi-file generation:
+
+- a generation that times out, errors, thermally pauses, or reaches its file continuation ceiling is not treated as a verified file;
+- a file that still fails `FileValidator` after the real fix attempts is not saved into the project ZIP;
+- the process summary reports the exact file-level failure;
+- packaging only occurs after every planned file required for the project has passed the real validation gate.
+
+The visible live code card may contain genuinely streamed partial text, but that UI visibility is not permission to publish the partial bytes as a completed project file.
+
+### 12. Final feature interaction matrix
+
+| Feature | Real dependency | Protected interaction |
+|---|---|---|
+| Chat streaming | ComputeManager → BrainEngine/worker | bounded card + inner scroll; no UI-only fake progress |
+| Web search | WebSearchRepository → Tavily | bounded context; clickable real URLs; no source-code upload to search |
+| Simple web app | ProjectTypeGate → normal generation → extractor → validator | one HTML artifact path |
+| Multi-file web app | planner → per-file generation → validator → fixer → ZIP | each file visible while generating; no known-bad ZIP entries |
+| ZIP diagnosis | attachment reader → bounded source excerpts → generation | no edit target required for diagnosis |
+| ZIP edit | resolver → gateway → copy-first patch | original ZIP preserved; ambiguous edits ask |
+| User code to file | prior message → deterministic extraction → artifact writer | no new model call required |
+| Continue | persisted real continuation prompt | resumes same real generation context |
+| Thermal pause | ThermalMonitor → persisted pause → reload | generation does not silently restart from scratch |
+| Compute Bridge | mode → worker selection → real generation | recovery preserves selected route |
+| Local API | foreground service → NanoHTTPD → BrainEngine | public tunnel is separate and explicit |
+| GitHub publishing | artifact files → GitHub API/Pages | only real files are published |
+| History | Room messages + attachment/artifact rows | generated files remain addressable after reopen |
+
+### 13. Final audit standard
+
+Every final state shown by the chat UI must now correspond to one of:
+
+- a real input/attachment event,
+- a real process step that actually started or finished,
+- real streamed model output,
+- a real validation result,
+- a real file/ZIP operation,
+- a real network result,
+- or a real persisted recovery/clarification state.
+
+No success card is used as a substitute for a failed operation, and no generated file is published merely because text happened to appear in a code block.
+
+## ZIP Project Workflows — Final Hardened Pass
+
+### 1. ZIP upload only
+`Attach ZIP -> copy real bytes into app-private storage -> validate/read real ZIP entry list -> show attachment/structure information -> wait for the user's actual instruction.`
+No source is modified merely because a ZIP was attached.
+
+### 2. ZIP + “error dekho / bug dhoondo / problem check karo”
+`User request -> diagnosis intent gate -> real ZIP inspection -> README/MD + build/config + relevant source selection -> bounded real content reads -> dependency/import/name evidence -> optional real web search when the existing-project search trigger and configured provider allow it -> diagnosis generation -> root cause/evidence -> minimal impact plan -> report only.`
+The diagnostic path never writes the ZIP. It explicitly reports files that were not inspected instead of claiming the entire archive was read when it was not.
+
+### 3. ZIP + named bug/function/change
+`User request -> resolve real filename or real declaration -> inspect project docs/build files + target + related files -> determine impact evidence -> if outside information is needed, real web search can run -> generate a change plan -> generate complete content only for files that actually need changes -> validate each changed file -> verify existing declarations are preserved unless removal was explicitly requested -> atomically rebuild a new ZIP from the original plus approved real replacements -> audit every changed entry.`
+
+### 4. Function/API creation and wiring
+For an existing project, a function/API request is not treated as a one-file blind rewrite. The inspection pass supplies imports, nearby source/config files and real project evidence. The model is instructed to include every existing file that genuinely needs wiring (caller, interface, registration, route, dependency/config, etc.). Only fences whose filenames match real ZIP entries are accepted for an existing-project change; unnamed or invented targets are not silently patched.
+
+### 5. “Fix the bug” safety sequence
+`Inspect -> evidence -> impact plan -> change -> per-file safety validation -> declaration-preservation check -> staged multi-entry ZIP rebuild -> persisted audit -> final artifact.`
+A failed validation or ambiguous target never becomes a fake “fixed” result.
+
+### 6. Large ZIPs
+The ZIP entry list is read from the real archive. The inspector ranks README/Markdown, build/config files, the requested target, source files, and files related by real names/import evidence. The model receives bounded real excerpts and an explicit count of readable files not included in that pass. This prevents a huge archive from being dumped into the model context while also preventing the app from falsely claiming that unseen files were inspected.
+
+### 7. Web search during project work
+Search is optional and real. Existing-project inspection/change requests can trigger the configured web-search provider when the deterministic trigger sees a need for outside/current information. No provider key or no connectivity means no network call and the local workflow continues without invented results.
+
+### 8. No partial ZIP claim
+A multi-file project change is written to a staged copy and then rebuilt as a complete ZIP. Every original entry is streamed through, and only approved replacements are substituted. The original uploaded ZIP remains untouched.

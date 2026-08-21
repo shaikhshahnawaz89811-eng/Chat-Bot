@@ -55,6 +55,20 @@ object ArtifactExtractor {
      * prose) means no artifacts are created for that message - no fenced
      * block, no file, no fabricated placeholder.
      */
+    /**
+     * Deterministic extractor for a simple web-app reply. A plain "create web app"
+     * request is a single-file task, so only a real HTML/HTM fenced block is
+     * promoted to an artifact. CSS/JS/bash blocks that the small model may
+     * accidentally emit are left in the visible response instead of silently
+     * becoming extra files. Explicit multi-file web requests continue to use
+     * [extract] through the multi-file pipeline.
+     */
+    fun extractWebApp(finalText: String): List<ArtifactCandidate> =
+        extract(finalText).filter { candidate ->
+            candidate.fileName.endsWith(".html", ignoreCase = true) ||
+                candidate.fileName.endsWith(".htm", ignoreCase = true)
+        }.take(1)
+
     fun extract(finalText: String): List<ArtifactCandidate> {
         val matches = fencePattern.findAll(finalText).toList()
         // Real names already used earlier in this same response - a model

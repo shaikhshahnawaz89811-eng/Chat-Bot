@@ -4,6 +4,7 @@ import android.content.Context
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
@@ -57,6 +58,7 @@ object PublicTunnelManager {
 
     private var process: Process? = null
     private var readerJob: Job? = null
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /** Real path to the bundled binary once installed - null (never a
      *  guessed path) if this app build has no native library dir at all. */
@@ -66,10 +68,13 @@ object PublicTunnelManager {
         return if (file.exists()) file else null
     }
 
-    /** Called from [LocalApiServerManager.start] - never called standalone,
-     *  so the tunnel can never be "on" while the Local API Server it
-     *  tunnels is off. */
-    fun start(context: Context, scope: CoroutineScope) {
+    /** Explicit user action from the Local API screen. The local server must
+     * already be running; the tunnel is never started implicitly. */
+    fun start(context: Context) {
+        if (!LocalApiServerManager.isRunning) {
+            _state.value = TunnelState.Error("Start the Local API server before starting the public tunnel.")
+            return
+        }
         if (_state.value is TunnelState.Running || _state.value is TunnelState.Starting) return
 
         val binary = binaryPath(context)
@@ -89,7 +94,7 @@ object PublicTunnelManager {
             process = proc
 
             readerJob?.cancel()
-            readerJob = scope.launch(Dispatchers.IO) {
+            readerJob = managerScope.launch(Dispatchers.IO) {
                 val reader = BufferedReader(InputStreamReader(proc.inputStream))
                 var line: String?
                 try {

@@ -88,7 +88,7 @@ fun AboutScreen() {
             InfoLine("App logic", "Kotlin + Jetpack Compose (Material3)")
             InfoLine("Local AI engine", "llama.cpp (JNI/NDK)")
             InfoLine("Secure storage", "Room + SQLCipher (AES-256)")
-            InfoLine("Local API server", "NanoHTTPD, loopback-only")
+            InfoLine("Local API server", "NanoHTTPD, authenticated LAN + loopback")
         }
         Spacer(Modifier.height(14.dp))
 

@@ -64,6 +64,7 @@ fun LocalApiScreen(
 
     // Live-ticking uptime, matches mockup's "Uptime 02:15:47" field -
     // recomputed every second from the real startedAtMillis, not animated.
+    val tunnelState by PublicTunnelManager.state.collectAsState()
     var uptimeText by remember { mutableStateOf("00:00:00") }
     LaunchedEffect(state) {
         val running = state as? ServerState.Running
@@ -117,13 +118,12 @@ fun LocalApiScreen(
                 onCopy = { lanEndpoint?.let { copyKeyToClipboard(context, it) } }
             )
             RowDivider()
-            // Public Tunnel - real state from PublicTunnelManager, which
-            // starts/stops in lockstep with this server (see
-            // LocalApiServerManager) and runs cloudflared as Brain's own
+            // Public Tunnel - real state from PublicTunnelManager. It is
+            // started explicitly by the user only after this server is
+            // running, and runs cloudflared as Brain's own
             // child process. Only ever shows a URL actually parsed from
             // cloudflared's real stdout - never a placeholder while
             // Starting/Error.
-            val tunnelState by PublicTunnelManager.state.collectAsState()
             val tunnelText = when (val t = tunnelState) {
                 is TunnelState.Off -> "Off"
                 is TunnelState.Starting -> "Starting…"
@@ -171,6 +171,24 @@ fun LocalApiScreen(
                 shape = RoundedCornerShape(12.dp)
             ) {
                 Text("Start Server")
+            }
+        }
+
+        if (state is ServerState.Running) {
+            Spacer(Modifier.height(10.dp))
+            val tunnelRunning = tunnelState is TunnelState.Running || tunnelState is TunnelState.Starting
+            Button(
+                onClick = {
+                    if (tunnelRunning) PublicTunnelManager.stop()
+                    else PublicTunnelManager.start(context.applicationContext)
+                },
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (tunnelRunning) BrainDangerRed else BrainPurplePrimary
+                ),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(if (tunnelRunning) "Stop Public Tunnel" else "Start Public Tunnel")
             }
         }
 

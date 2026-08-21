@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.net.InetAddress
 
 data class ComputeBridgeUiState(
     val mode: ComputeMode = ComputeMode.LOCAL,
@@ -72,8 +73,13 @@ class ComputeBridgeViewModel(application: Application) : AndroidViewModel(applic
                 val json = JSONObject(raw)
                 require(json.optString("protocol") == "sa-compute-v1") { "Not a Compute Bridge pairing code" }
                 val workerId = json.getString("worker_id")
-                val host = json.getString("host")
+                val host = json.getString("host").trim()
                 val port = json.getInt("port")
+                require(port in 1..65535) { "Invalid worker port" }
+                val address = InetAddress.getByName(host)
+                require(address.isLoopbackAddress || address.isSiteLocalAddress || address.isLinkLocalAddress) {
+                    "Compute Bridge pairing only accepts a local/private worker address."
+                }
                 val pairingToken = json.getString("pairing_token")
                 val accessToken = WorkerApiClient(PairedWorker(workerId, host, port, pairingToken))
                     .pair(host, port, pairingToken)

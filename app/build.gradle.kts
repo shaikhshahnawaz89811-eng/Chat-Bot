@@ -13,7 +13,7 @@ android {
         applicationId = "com.brain.offlineai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 21
+        versionCode = 22
         versionName = "1.0.0"
 
         vectorDrawables.useSupportLibrary = true
@@ -123,10 +123,8 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
     // Phase 4: Local API Server. NanoHTTPD is a real, tiny embeddable HTTP
-    // server - used here bound explicitly to 127.0.0.1 only (see
-    // LocalApiServerManager/LocalApiServer), never 0.0.0.0, so the
-    // "100% Offline" / loopback-only guarantee is enforced in code, not
-    // just in the network_security_config. Request/response JSON uses
+    // server - the actual bind policy is enforced in LocalApiServer itself.
+    // Request/response JSON uses
     // org.json, which already ships with Android - no extra JSON dep
     // needed (Rule 20 - only what this phase actually needs).
     // NotificationCompat (foreground-service notification) comes from

@@ -69,7 +69,12 @@ class ArtifactFileManager(private val context: Context) {
         val destDir = File(artifactsDir, projectDirId ?: UUID.randomUUID().toString()).apply { mkdirs() }
         val destFile = File(destDir, sanitizeRelativePath(fileName))
         destFile.parentFile?.mkdirs()
-        destFile.writeText(content)
+        if (destFile.exists()) {
+            val existing = runCatching { destFile.readText(Charsets.UTF_8) }.getOrNull()
+            require(existing == content) { "Artifact path collision: $fileName maps to an existing different file" }
+            return destFile
+        }
+        destFile.writeText(content, Charsets.UTF_8)
         // Weakness-review fix ("file sach me ban rahi hai ya nahi check
         // kare") - writeText() normally throws on a real IO failure, but a
         // partial/interrupted write (e.g. disk full mid-write) can still
@@ -119,11 +124,11 @@ class ArtifactFileManager(private val context: Context) {
         val zipFile = File(destDir, sanitizeFileName(zipName).let { if (it.endsWith(".zip")) it else "$it.zip" })
         ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
             val buffer = ByteArray(64 * 1024)
+            val seenEntries = mutableSetOf<String>()
             files.forEach { (entryName, file) ->
-                val safeEntry = entryName.replace('\\', '/').trimStart('/')
-                require(safeEntry.isNotBlank() && !safeEntry.split('/').contains("..")) {
-                    "Unsafe ZIP entry name: $entryName"
-                }
+                val safeEntry = normalizeZipEntryName(entryName)
+                require(seenEntries.add(safeEntry)) { "Duplicate ZIP entry: $entryName" }
+                require(file.isFile) { "Cannot package missing/non-file artifact: ${file.absolutePath}" }
                 zipOut.putNextEntry(ZipEntry(safeEntry))
                 FileInputStream(file).use { input ->
                     var read: Int
@@ -152,9 +157,15 @@ class ArtifactFileManager(private val context: Context) {
         val buffer = ByteArray(64 * 1024)
         java.util.zip.ZipInputStream(FileInputStream(sourceZip)).use { zipIn ->
             ZipOutputStream(FileOutputStream(zipFile)).use { zipOut ->
+                val seenEntries = mutableSetOf<String>()
                 var entry = zipIn.nextEntry
                 while (entry != null) {
-                    zipOut.putNextEntry(ZipEntry(entry.name))
+                    val safeEntry = normalizeZipEntryName(entry.name)
+                    require(seenEntries.add(safeEntry)) { "Duplicate ZIP entry: ${entry.name}" }
+                    val outEntry = ZipEntry(safeEntry).apply {
+                        time = entry.time
+                    }
+                    zipOut.putNextEntry(outEntry)
                     val replacementText = if (!entry.isDirectory) replacements[entry.name] else null
                     if (replacementText != null) {
                         zipOut.write(replacementText.toByteArray(Charsets.UTF_8))
@@ -276,6 +287,14 @@ class ArtifactFileManager(private val context: Context) {
      */
     fun getShareUri(file: File): Uri =
         FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+
+    private fun normalizeZipEntryName(name: String): String {
+        val normalized = name.replace('\\', '/').trimStart('/')
+        require(normalized.isNotBlank() && normalized != "." && !normalized.split('/').contains("..")) {
+            "Unsafe ZIP entry name: $name"
+        }
+        return normalized
+    }
 
     private fun sanitizeFileName(name: String): String {
         val safe = name.replace(Regex("[^A-Za-z0-9._-]"), "_")

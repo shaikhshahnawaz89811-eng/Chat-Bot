@@ -85,7 +85,7 @@ object ZipEditResolver {
         entries: List<AttachmentContentReader.ZipEntrySummary>,
         storedPath: String,
         messageText: String,
-        maxEntriesScanned: Int = 40
+        maxEntriesScanned: Int = 250
     ): AttachmentContentReader.ZipEntrySummary? {
         val identifiers = Regex("""\b[A-Za-z_][A-Za-z0-9_]{2,}\b""").findAll(messageText)
             .map { it.value }

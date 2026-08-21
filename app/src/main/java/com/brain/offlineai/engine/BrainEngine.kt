@@ -197,13 +197,20 @@ object BrainEngine {
             // until the next prefill heartbeat. Queue the next request here
             // as well as exposing awaitGenerationIdle(), so every caller is
             // protected even when it is not the planner fallback path.
-            val idle = withTimeoutOrNull(30_000L) {
+            // A previous call can still be unwinding inside the real native
+            // llama.cpp mutex after a Kotlin-side watchdog stopped waiting.
+            // Do not turn that normal native teardown race into a generic
+            // generation error for the user's next message. Wait for the real
+            // engine to become idle, while emitting genuine liveness heartbeats
+            // so the UI watchdog knows this coroutine is actively waiting.
+            val idle = withTimeoutOrNull(90_000L) {
                 while (generationActive.get()) {
-                    delay(25L)
+                    onProgress()
+                    delay(250L)
                 }
             }
             if (idle == null) {
-                close(IllegalStateException("Previous generation is still finishing"))
+                close(IllegalStateException("Previous generation did not become idle within 90 seconds"))
                 return@callbackFlow
             }
             generationActive.set(true)

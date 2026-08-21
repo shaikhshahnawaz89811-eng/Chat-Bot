@@ -54,7 +54,7 @@ object FileValidator {
         "todo", "fixme", "your code here", "your implementation here",
         "implement this", "implement me", "placeholder", "not implemented",
         "notimplementedexception", "notimplementederror", "coming soon",
-        "lorem ipsum", "pass  # todo", "..."
+        "lorem ipsum", "pass  # todo"
     )
 
     private val braceLangs = setOf("kt", "kts", "java", "js", "ts", "jsx", "tsx", "c", "cpp", "h", "hpp", "cs", "json", "css", "go", "swift", "dart", "rs", "php")

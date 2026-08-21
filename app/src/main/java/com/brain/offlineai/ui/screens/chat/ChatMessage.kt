@@ -32,6 +32,8 @@ data class ChatMessage(
     val state: BotMessageState = BotMessageState.TEXT,
     val thinkingSteps: List<ThinkingStep> = emptyList(),
     val codeLines: List<String> = emptyList(),
+    /** Real filename currently being streamed in a coding card, when known. */
+    val codeFileName: String? = null,
     val generationProgress: Int = 0,
     val processSteps: List<ProcessStep> = emptyList(),
     // Phase 10 (File/ZIP/Image/Video upload flow) - real attachments that

@@ -35,7 +35,9 @@ object WebSearchTrigger {
     // intent already has its own, separate real gate - see
     // ZipEditResolver/AgentClarificationGate, both untouched by this file).
     private val INSPECT_KEYWORDS = listOf(
-        "what is", "what does", "how does", "explain", "look up", "search for", "find out about"
+        "what is", "what does", "how does", "explain", "look up", "search for", "find out about",
+        "error", "bug", "issue", "problem", "galt", "galat", "dhoondo", "dhundo", "dundo",
+        "dekho", "check karo", "fix", "fix karo"
     )
 
     /**

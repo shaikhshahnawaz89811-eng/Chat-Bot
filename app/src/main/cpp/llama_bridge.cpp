@@ -92,7 +92,14 @@ Java_com_brain_offlineai_engine_BrainNative_nativeLoadModel(
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = static_cast<uint32_t>(nCtx > 0 ? nCtx : 2048);
-    ctx_params.n_batch = ctx_params.n_ctx;
+    // Keep prompt-evaluation batch memory bounded on phones. The JNI bridge
+    // already feeds the prompt in small real chunks below, so allocating a
+    // full context-sized batch (for example 4096) wastes native RAM and can
+    // turn a large prompt into an avoidable OOM on an otherwise usable 8 GB
+    // device. A 512-token batch is sufficient for this bridge's chunked
+    // prefill and keeps the model's KV context size independent from batch
+    // workspace size.
+    ctx_params.n_batch = std::min<uint32_t>(ctx_params.n_ctx, 512u);
     ctx_params.n_threads = nThreads > 0 ? nThreads : 4;
     ctx_params.n_threads_batch = ctx_params.n_threads;
 
@@ -243,7 +250,7 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     // timeout/Stop can now actually interrupt prefill itself, not only
     // the decode-one-token-at-a-time loop below.
     std::string stopReason = "max_tokens";
-    const int kPrefillChunkTokens = 64;
+    const int kPrefillChunkTokens = 16;
     const int n_prompt = static_cast<int>(prompt_tokens.size());
     int n_fed = 0;
     bool prefillCancelled = false;

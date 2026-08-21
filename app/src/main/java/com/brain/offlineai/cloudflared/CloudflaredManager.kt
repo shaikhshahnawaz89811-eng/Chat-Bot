@@ -10,7 +10,6 @@ class CloudflaredManager(private val context: Context) {
 
     companion object {
         private const val ASSET_NAME = "libcloudflared.so"
-        private const val EXECUTABLE_NAME = "cloudflared"
     }
 
     private var process: Process? = null
@@ -55,16 +54,11 @@ class CloudflaredManager(private val context: Context) {
         process?.isAlive == true
 
     private fun extractExecutable(): File {
-        val target = File(context.filesDir, EXECUTABLE_NAME)
-
-        if (!target.exists() || target.length() == 0L) {
-            context.assets.open(ASSET_NAME).use { input ->
-                target.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
+        val nativeDir = context.applicationInfo.nativeLibraryDir
+        val target = File(nativeDir, ASSET_NAME)
+        check(target.isFile && target.length() > 0L) {
+            "Bundled cloudflared executable is missing from the ARM64 native library directory."
         }
-
         return target
     }
 }

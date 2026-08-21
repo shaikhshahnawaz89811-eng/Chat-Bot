@@ -36,11 +36,12 @@ import com.brain.offlineai.data.settings.AppSettingsState
 @Composable
 fun LiveProcessCard(
     steps: List<ProcessStep>,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    onOpenUrl: (String) -> Unit = {}
 ) {
     if (steps.isEmpty()) return
 
-    var expanded by remember { mutableStateOf(steps.size <= 1) }
+    var expanded by remember { mutableStateOf(steps.size <= 1 || steps.any { it.displayLabel.contains("http://") || it.displayLabel.contains("https://") }) }
     var showSummary by remember { mutableStateOf(false) }
 
     val transition = rememberInfiniteTransition(label = "process-glow")
@@ -164,7 +165,8 @@ fun LiveProcessCard(
                     ProcessStepRow(
                         index = index + 1,
                         step = step,
-                        accent = accent
+                        accent = accent,
+                        onOpenUrl = onOpenUrl
                     )
                 }
             }
@@ -176,7 +178,8 @@ fun LiveProcessCard(
             ProcessStepRow(
                 index = steps.indexOf(current) + 1,
                 step = current,
-                accent = accent
+                accent = accent,
+                onOpenUrl = onOpenUrl
             )
         }
 
@@ -222,7 +225,8 @@ fun LiveProcessCard(
 private fun ProcessStepRow(
     index: Int,
     step: ProcessStep,
-    accent: Color
+    accent: Color,
+    onOpenUrl: (String) -> Unit
 ) {
     val running = step.status == ProcessStepStatus.RUNNING
     val animate = running && AppSettingsState.animationsEnabled
@@ -267,16 +271,28 @@ private fun ProcessStepRow(
                 }
         )
 
-        Text(
-            text = step.displayLabel,
-            color = when (step.status) {
-                ProcessStepStatus.FAILED -> BrainDangerRed
-                ProcessStepStatus.COMPLETE -> BrainTextPrimary
-                ProcessStepStatus.RUNNING -> BrainTextPrimary
-            },
-            style = MaterialTheme.typography.bodySmall,
-            modifier = Modifier.weight(1f)
-        )
+        val label = step.displayLabel
+        val url = Regex("https?://\\S+").find(label)?.value?.trimEnd('.', ',', ')', ']', ';')
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = if (url == null) label else label.substringBefore(url).trimEnd(),
+                color = when (step.status) {
+                    ProcessStepStatus.FAILED -> BrainDangerRed
+                    ProcessStepStatus.COMPLETE -> BrainTextPrimary
+                    ProcessStepStatus.RUNNING -> BrainTextPrimary
+                },
+                style = MaterialTheme.typography.bodySmall
+            )
+            if (url != null) {
+                Text(
+                    text = url,
+                    color = BrainCyanAccent,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    modifier = Modifier.clickable { onOpenUrl(url) }
+                )
+            }
+        }
 
         when {
             step.status == ProcessStepStatus.RUNNING -> RunningDots()
