@@ -1,14 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Brain 100% offline engine hai. Local API server (Phase 4) sirf 127.0.0.1
-    par chalega — is config se explicitly sirf loopback allow hoga, koi bhi
-    external cleartext traffic allow nahi hoga. Isse "No Internet for AI
-    Inference" wala highlight enforce hota hai code-level par bhi.
+    par chalega. Compute Bridge (worker pairing/health/chat) ke liye is app
+    ko doosre phone se local Wi-Fi/hotspot par plain HTTP par baat karni
+    padti hai — traffic kabhi local network se bahar (internet par) nahi
+    jaata, sirf scheme HTTP hai. Isliye cleartext ab overall allow hai, sirf
+    loopback tak simit nahin — pehle base-config false hone ki wajah se har
+    LAN call (pair/health/chat) silently CLEARTEXT-blocked ho rahi thi, jo
+    "Pair" button ko kaam na karte hue dikha raha tha. Cloud calls
+    (Tavily/GitHub) already https:// use karte hain, wo isse affected nahi.
 -->
 <network-security-config>
-    <domain-config cleartextTrafficPermitted="true">
-        <domain includeSubdomains="false">127.0.0.1</domain>
-        <domain includeSubdomains="false">localhost</domain>
-    </domain-config>
-    <base-config cleartextTrafficPermitted="false" />
+    <base-config cleartextTrafficPermitted="true" />
 </network-security-config>

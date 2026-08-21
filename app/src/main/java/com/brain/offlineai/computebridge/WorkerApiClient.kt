@@ -67,19 +67,27 @@ class WorkerApiClient(private val target: PairedWorker) {
      * can pair before a [PairedWorker] (which needs an access token) even
      * exists yet. */
     suspend fun pair(host: String, port: Int, pairingToken: String): String? = withContext(Dispatchers.IO) {
-        runCatching {
-            val conn = URL("http://$host:$port/v1/pair").openConnection() as HttpURLConnection
+        // Deliberately NOT wrapped in a blanket runCatching{}.getOrNull() -
+        // a network-level failure (unreachable host, timeout, blocked
+        // cleartext policy, etc.) is a different problem than "worker said
+        // no", and the caller (ComputeBridgeViewModel.pairFromCode) already
+        // catches whatever this throws and shows e.message to the user. If
+        // this returns null, it specifically means the worker was reached
+        // and responded with something other than a valid access token.
+        val conn = URL("http://$host:$port/v1/pair").openConnection() as HttpURLConnection
+        try {
             conn.connectTimeout = 4000
             conn.readTimeout = 4000
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
             conn.outputStream.use { it.write(JSONObject().put("pairing_token", pairingToken).toString().toByteArray()) }
-            if (conn.responseCode != 200) { conn.disconnect(); return@withContext null }
+            if (conn.responseCode != 200) return@withContext null
             val body = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
-            conn.disconnect()
             body.optString("access_token").ifBlank { null }
-        }.getOrNull()
+        } finally {
+            conn.disconnect()
+        }
     }
 
     /**
