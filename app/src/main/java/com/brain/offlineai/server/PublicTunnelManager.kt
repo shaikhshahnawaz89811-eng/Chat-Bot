@@ -25,7 +25,10 @@ sealed class TunnelState {
 
 /**
  * Public Tunnel (additive feature) - runs entirely inside Brain's own
- * process. No Termux, no other app, no user typing a command.
+ * process. No Termux, no other app, no user typing a command, no domain
+ * or Cloudflare account required - this is Cloudflare's free "quick
+ * tunnel" mode, which hands back a real but random *.trycloudflare.com
+ * link each time it starts.
  *
  * How this actually works (real, not a workaround): Android extracts every
  * file under app/src/main/jniLibs/<abi>/ into this app's own
