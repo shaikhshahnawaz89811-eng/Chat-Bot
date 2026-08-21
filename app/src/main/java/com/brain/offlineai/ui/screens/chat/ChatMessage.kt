@@ -22,7 +22,7 @@ import com.brain.offlineai.ui.tasks.TaskItem
  *  list rendered via TaskListCard. THINKING/CODING/CODE_DONE/PROCESS are
  *  unchanged and still used exactly as before (Document-Editing Convention
  *  - nothing existing removed or replaced). */
-enum class BotMessageState { TEXT, THINKING, CODING, CODE_DONE, GENERATING, SYSTEM_NOTE, PROCESS, TASK_LIST }
+enum class BotMessageState { TEXT, THINKING, CODING, CODE_DONE, GENERATING, SYSTEM_NOTE, PROCESS, TASK_LIST, PAUSED, FAILED }
 
 data class ChatMessage(
     val id: Long,
