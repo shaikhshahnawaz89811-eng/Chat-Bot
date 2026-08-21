@@ -28,7 +28,7 @@ object ProjectTypeGate {
     )
 
     private val BUILD_TARGET_WORDS = listOf(
-        "app", "application", "website", "web app", "webapp", "program",
+        "app", "application", "apk", "website", "web app", "webapp", "program",
         "script", "tool", "project", "game", "bot", "api", "backend",
         "server", "system"
     )
@@ -97,7 +97,16 @@ object ProjectTypeGate {
             "har file alag", "poora project", "puri project", "zip me",
             "अलग अलग फाइल", "मल्टीपल फाइल", "पूरा प्रोजेक्ट"
         )
-        return explicitMultiFileWords.any { lower.contains(it) }
+        val naturallyMultiFileTargets = listOf(
+            "create web app", "build web app", "make web app", "create website",
+            "build website", "make website", "web app banao", "website banao",
+            "create android app", "build android app", "android app banao",
+            "create flutter app", "build flutter app", "flutter app banao",
+            "create react app", "build react app", "react app banao",
+            "full app", "complete app", "complete project", "full project"
+        )
+        return explicitMultiFileWords.any { lower.contains(it) } ||
+            naturallyMultiFileTargets.any { lower.contains(it) }
     }
 
     /**

@@ -28,9 +28,7 @@ object AgentClarificationGate {
 
     /** Fixed, real edit-intent keyword set - a message needs at least one of these before this gate considers asking. */
     private val EDIT_INTENT_KEYWORDS = listOf(
-        "fix", "update", "change", "edit", "modify", "correct", "patch", "rewrite",
-        "fix karo", "theek karo", "thik karo", "sudhar", "sahi karo", "error hatao",
-        "problem solve", "implement", "add", "remove", "replace", "banao", "kar do"
+        "fix", "update", "change", "edit", "modify", "correct", "patch", "rewrite"
     )
 
     private const val MAX_NAMES_IN_QUESTION = 10

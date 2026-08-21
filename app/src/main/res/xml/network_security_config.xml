@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Brain 100% offline engine hai. Local API server (Phase 4) LAN par authenticated hai aur 0.0.0.0 par listen karta hai
-    taaki paired worker/companion phone real network par connect kar sake. Compute Bridge (worker pairing/health/chat) ke liye is app
+    Brain 100% offline engine hai. Local API server (Phase 4) sirf 127.0.0.1
+    par chalega. Compute Bridge (worker pairing/health/chat) ke liye is app
     ko doosre phone se local Wi-Fi/hotspot par plain HTTP par baat karni
     padti hai — traffic kabhi local network se bahar (internet par) nahi
     jaata, sirf scheme HTTP hai. Isliye cleartext ab overall allow hai, sirf

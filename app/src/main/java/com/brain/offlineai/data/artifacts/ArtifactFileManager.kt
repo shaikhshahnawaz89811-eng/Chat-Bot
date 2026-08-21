@@ -94,6 +94,15 @@ class ArtifactFileManager(private val context: Context) {
         return destFile
     }
 
+    /** Real readback of a multi-file project's current on-disk files, used to reconstruct a persisted build after process death. */
+    fun listProjectFiles(projectDirId: String): List<Pair<String, File>> {
+        val root = File(artifactsDir, projectDirId)
+        if (!root.isDirectory) return emptyList()
+        return root.walkTopDown().filter { it.isFile }.map { file ->
+            root.toPath().relativize(file.toPath()).toString().replace(File.separatorChar, '/') to file
+        }.toList()
+    }
+
     /** Real, permanent removal of one artifact's file (and its now-empty per-artifact folder). */
     fun deleteArtifactFile(storedPath: String) {
         val file = File(storedPath)

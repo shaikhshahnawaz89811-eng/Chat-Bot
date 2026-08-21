@@ -27,7 +27,7 @@ object ZipProjectInspector {
     )
 
     suspend fun inspect(storedPath: String, request: String, preferredFile: String? = null): Inspection {
-        val entries = AttachmentContentReader.listZipEntries(storedPath, maxEntries = 5000)
+        val entries = AttachmentContentReader.listZipEntries(storedPath, maxEntries = Int.MAX_VALUE)
             .filter { !it.isDirectory && AttachmentContentReader.isTextReadable(it.name) }
         val lowerRequest = request.lowercase()
         val requestWords = Regex("\\b[A-Za-z_][A-Za-z0-9_]{2,}\\b").findAll(request)

@@ -147,30 +147,9 @@ fun BotTaskListBubble(message: ChatMessage) {
 
 @Composable
 fun BotSystemNoteBubble(message: ChatMessage) {
-    val lines = message.text.lines()
-    val compactDetails = lines.size > 2 || message.text.length > 180 ||
-        lines.count { it.contains("Chunk ") } >= 2 || message.text.contains("Context Info Box")
-    val scrollState = rememberScrollState()
-    LaunchedEffect(message.text) { if (compactDetails) scrollState.scrollTo(scrollState.maxValue) }
-    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.4f), modifier = Modifier.widthIn(max = 300.dp)) {
-        val title = lines.firstOrNull()?.take(100)?.ifBlank { "Status" } ?: "Status"
-        Text(title, color = BrainTextPrimary, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-        if (compactDetails && lines.drop(1).joinToString("\n").isNotBlank()) {
-            Spacer(Modifier.height(5.dp))
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 150.dp)
-                    .verticalScroll(scrollState)
-                    .background(BrainBgPrimary, RoundedCornerShape(10.dp))
-                    .padding(8.dp)
-            ) {
-                Text(lines.drop(1).joinToString("\n"), color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
-            }
-        } else if (!compactDetails) {
-            Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
-        }
-        Spacer(Modifier.height(3.dp))
+    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.4f)) {
+        Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        Spacer(Modifier.height(4.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
     }
 }

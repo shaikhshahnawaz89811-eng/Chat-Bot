@@ -41,7 +41,8 @@ fun LiveProcessCard(
 ) {
     if (steps.isEmpty()) return
 
-    var expanded by remember { mutableStateOf(steps.size <= 1 || steps.any { it.displayLabel.contains("http://") || it.displayLabel.contains("https://") }) }
+    val isSearchCard = steps.isNotEmpty() && steps.all { it.marking == com.brain.offlineai.ui.process.ProcessMarking.SEARCHING }
+    var expanded by remember(steps.size, isSearchCard) { mutableStateOf(!isSearchCard && steps.size <= 1) }
     var showSummary by remember { mutableStateOf(false) }
 
     val transition = rememberInfiniteTransition(label = "process-glow")
@@ -94,6 +95,8 @@ fun LiveProcessCard(
             Column {
                 Text(
                     text = when {
+                        isSearchCard && failed -> "Web search needs attention"
+                        isSearchCard -> "Web search"
                         failed -> "Process needs attention"
                         complete -> "Process completed"
                         running -> "Working"
@@ -104,7 +107,10 @@ fun LiveProcessCard(
                 )
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = "${steps.count { it.status == ProcessStepStatus.COMPLETE }}/${steps.size} complete",
+                    text = if (isSearchCard) {
+                        val resultCount = steps.count { it.id != 1L && it.status == ProcessStepStatus.COMPLETE }
+                        "$resultCount result${if (resultCount == 1) "" else "s"}"
+                    } else "${steps.count { it.status == ProcessStepStatus.COMPLETE }}/${steps.size} complete",
                     color = BrainTextMuted,
                     style = MaterialTheme.typography.labelSmall
                 )
@@ -171,23 +177,28 @@ fun LiveProcessCard(
                 }
             }
         } else {
-            val current = steps.lastOrNull {
-                it.status == ProcessStepStatus.RUNNING
-            } ?: steps.last()
-
-            ProcessStepRow(
-                index = steps.indexOf(current) + 1,
-                step = current,
-                accent = accent,
-                onOpenUrl = onOpenUrl
-            )
+            if (isSearchCard) {
+                val firstResult = steps.firstOrNull { it.id != 1L } ?: steps.first()
+                ProcessStepRow(index = 1, step = firstResult, accent = accent, onOpenUrl = onOpenUrl)
+                if (steps.size > 2) {
+                    Text(
+                        text = "+ ${steps.size - 2} more results · tap to expand",
+                        color = BrainTextMuted,
+                        style = MaterialTheme.typography.labelSmall,
+                        modifier = Modifier.padding(start = 50.dp, top = 2.dp)
+                    )
+                }
+            } else {
+                val current = steps.lastOrNull { it.status == ProcessStepStatus.RUNNING } ?: steps.last()
+                ProcessStepRow(index = steps.indexOf(current) + 1, step = current, accent = accent, onOpenUrl = onOpenUrl)
+            }
         }
 
         val completedCount = steps.count {
             it.status == ProcessStepStatus.COMPLETE
         }
 
-        if (completedCount > 0) {
+        if (completedCount > 0 && !isSearchCard) {
             Spacer(Modifier.height(5.dp))
             Text(
                 text = if (showSummary) "Hide summary" else "Summary",

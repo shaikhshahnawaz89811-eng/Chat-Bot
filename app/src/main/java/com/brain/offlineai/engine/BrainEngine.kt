@@ -8,12 +8,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** Real state of the local llama.cpp engine - no state here is decorative. */
@@ -48,7 +48,11 @@ object BrainEngine {
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
     val state: StateFlow<EngineState> = _state
     private val generationActive = AtomicBoolean(false)
-    private val lifecycleMutex = Mutex()
+    /** Serializes every operation that touches the single native model/context.
+     * Generation, load, unload and thermal pause can never enter llama.cpp
+     * concurrently, so a slow/cancelled generation cannot race a settings
+     * reload or thermal teardown. */
+    private val nativeOperationMutex = Mutex()
 
     private var backendReady = false
 
@@ -58,35 +62,30 @@ object BrainEngine {
      * (mmap + metadata parse) is CPU/IO-bound and can take several seconds
      * for a multi-hundred-MB GGUF file - never on the main thread.
      */
-    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 4096, nThreads: Int = 4) = lifecycleMutex.withLock {
-        if (!awaitGenerationIdle(120_000L)) {
-            _state.value = EngineState.Error("The current generation did not stop safely; model reload was not attempted.")
-            return@withLock
-        }
-        _state.value = EngineState.Loading(modelDisplayName)
-        withContext(Dispatchers.Default) {
-            if (!backendReady) {
-                backendReady = BrainNative.nativeBackendInit()
-            }
-            if (!backendReady) {
-                _state.value = EngineState.Error("Native llama.cpp backend could not be initialized.")
-                return@withContext
-            }
-            val ok = BrainNative.nativeLoadModel(modelPath, nCtx, nThreads)
-            _state.value = if (ok) {
-                EngineState.Loaded(modelDisplayName, BrainNative.nativeGetContextSize())
-            } else {
-                EngineState.Error("Model failed to load - check the file is a valid GGUF and fits in device RAM.")
+    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 4096, nThreads: Int = 4) {
+        nativeOperationMutex.withLock {
+            _state.value = EngineState.Loading(modelDisplayName)
+            withContext(Dispatchers.Default) {
+                if (!backendReady) {
+                    backendReady = BrainNative.nativeBackendInit()
+                }
+                val ok = BrainNative.nativeLoadModel(modelPath, nCtx, nThreads)
+                _state.value = if (ok) {
+                    EngineState.Loaded(modelDisplayName, BrainNative.nativeGetContextSize())
+                } else {
+                    EngineState.Error("Model failed to load - check the file is a valid GGUF and fits in device RAM.")
+                }
             }
         }
     }
 
-    suspend fun unloadModel() = lifecycleMutex.withLock {
-        if (!awaitGenerationIdle(120_000L)) return@withLock
-        withContext(Dispatchers.Default) {
-            BrainNative.nativeUnloadModel()
+    suspend fun unloadModel() {
+        nativeOperationMutex.withLock {
+            withContext(Dispatchers.Default) {
+                BrainNative.nativeUnloadModel()
+            }
+            _state.value = EngineState.Unloaded
         }
-        _state.value = EngineState.Unloaded
     }
 
     /**
@@ -99,13 +98,14 @@ object BrainEngine {
      * doc. No-ops (returns without touching native state) if nothing was
      * actually loaded, since there's nothing real to pause.
      */
-    suspend fun pauseForThermal() = lifecycleMutex.withLock {
-        val loaded = _state.value as? EngineState.Loaded ?: return@withLock
-        if (!awaitGenerationIdle(120_000L)) return@withLock
-        withContext(Dispatchers.Default) {
-            BrainNative.nativeUnloadModel()
+    suspend fun pauseForThermal() {
+        nativeOperationMutex.withLock {
+            val loaded = _state.value as? EngineState.Loaded ?: return
+            withContext(Dispatchers.Default) {
+                BrainNative.nativeUnloadModel()
+            }
+            _state.value = EngineState.ThermalPaused(loaded.modelName, loaded.contextSize)
         }
-        _state.value = EngineState.ThermalPaused(loaded.modelName, loaded.contextSize)
     }
 
     val isLoaded: Boolean
@@ -161,8 +161,7 @@ object BrainEngine {
          * apart from "actually stuck". Never called after cancellation.
          * Default no-op so every existing call site is unaffected.
          */
-        onProgress: () -> Unit = {},
-        formatAsChat: Boolean = true
+        onProgress: () -> Unit = {}
     ): Flow<String> =
         callbackFlow {
             if (!isLoaded) {
@@ -219,7 +218,9 @@ object BrainEngine {
             // so the UI watchdog knows this coroutine is actively waiting.
             val idle = withTimeoutOrNull(90_000L) {
                 while (generationActive.get()) {
-                    onProgress()
+                    // Waiting for a previous real native call is not model
+                    // generation progress. Do not manufacture heartbeats or
+                    // the caller's stall watchdog can never detect a real stall.
                     delay(250L)
                 }
             }
@@ -227,21 +228,22 @@ object BrainEngine {
                 close(IllegalStateException("Previous generation did not become idle within 90 seconds"))
                 return@callbackFlow
             }
-            generationActive.set(true)
             val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-                try {
-                    val formattedPrompt = if (formatAsChat) BrainNative.nativeApplyChatTemplate(prompt) ?: prompt else prompt
-                    val stopReason = BrainNative.nativeGenerate(formattedPrompt, maxTokens, temperature, topP, callback)
-                    if (!cancelled.get()) {
-                        if (stopReason.startsWith("error:")) {
-                            close(IllegalStateException(stopReason))
-                        } else {
-                            onStopReason(stopReason)
-                            close()
+                nativeOperationMutex.withLock {
+                    generationActive.set(true)
+                    try {
+                        val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
+                        if (!cancelled.get()) {
+                            if (stopReason.startsWith("error:")) {
+                                close(IllegalStateException(stopReason))
+                            } else {
+                                onStopReason(stopReason)
+                                close()
+                            }
                         }
+                    } finally {
+                        generationActive.set(false)
                     }
-                } finally {
-                    generationActive.set(false)
                 }
             }
             awaitClose {

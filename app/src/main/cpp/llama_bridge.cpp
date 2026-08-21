@@ -136,49 +136,6 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGetContextSize(JNIEnv *, jobje
     return g_n_ctx;
 }
 
-// Uses the real chat template stored in the GGUF metadata. This is important
-// for instruct/chat models (Qwen, Llama, Gemma, Mistral, etc.): feeding the
-// raw user text directly can make an otherwise valid model immediately emit
-// an end token or produce incoherent output. llama.cpp already owns the
-// model-specific template, so the app must not hard-code one template and
-// must not guess a format from the model filename.
-JNIEXPORT jstring JNICALL
-Java_com_brain_offlineai_engine_BrainNative_nativeApplyChatTemplate(
-        JNIEnv *env, jobject /* thiz */, jstring prompt) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
-    if (g_model == nullptr || g_ctx == nullptr) {
-        return nullptr;
-    }
-
-    const char *promptChars = env->GetStringUTFChars(prompt, nullptr);
-    std::string promptStr(promptChars);
-    env->ReleaseStringUTFChars(prompt, promptChars);
-
-    const char *tmpl = llama_model_chat_template(g_model, nullptr);
-    if (tmpl == nullptr || *tmpl == '\0') {
-        return nullptr;
-    }
-
-    llama_chat_message message{};
-    message.role = "user";
-    message.content = promptStr.c_str();
-
-    const int32_t required = llama_chat_apply_template(
-        tmpl, &message, 1, true, nullptr, 0);
-    if (required <= 0) {
-        return nullptr;
-    }
-
-    std::vector<char> buffer(static_cast<size_t>(required) + 1u, '\0');
-    const int32_t written = llama_chat_apply_template(
-        tmpl, &message, 1, true, buffer.data(), static_cast<int32_t>(buffer.size()));
-    if (written <= 0) {
-        return nullptr;
-    }
-
-    return env->NewStringUTF(std::string(buffer.data(), static_cast<size_t>(written)).c_str());
-}
-
 // Streams real generated tokens one at a time into a Kotlin callback object
 // (interface BrainNative.TokenCallback, method `onToken(String): Boolean`).
 // Generation stops when: the model emits a real end-of-generation token,

@@ -1,11 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Phase 4: Local API Server. INTERNET is required for any socket bind
-         even loopback-only (Android enforces this regardless of address);
-         the actual LAN exposure is protected by mandatory API-key authentication in code
-         (LocalApiServer binds "0.0.0.0" intentionally for paired devices) and
-         in network_security_config.xml. FOREGROUND_SERVICE(+DATA_SYNC) lets
+    <!-- Phase 4: Local API Server. INTERNET is required for the real LAN
+         socket bind. The server intentionally listens on the LAN for paired
+         clients and protects every endpoint with a real API key check.
+         FOREGROUND_SERVICE(+DATA_SYNC) lets
          the server keep running while the app is backgrounded, matching the
          mockup's "Works in Background" highlight badge. POST_NOTIFICATIONS
          is needed on Android 13+ to show the ongoing-server notification
@@ -13,6 +12,7 @@
          visible in the status bar). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -103,13 +103,19 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
-        <!-- Chat Bot fix bundle: keeps app at foreground priority while a
-             user-started generation is running (see tasks/ChatTaskForegroundService.kt).
-             Uses the same dataSync type + permissions already declared above. -->
+        <!-- User-requested on-device AI inference can legitimately run much
+             longer than a short/data-sync operation. Android's specialUse
+             type is the platform's real escape hatch for valid foreground
+             work not covered by the standard types; Play review sees the
+             concrete subtype explanation below. -->
         <service
             android:name=".tasks.ChatTaskForegroundService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Long-running on-device AI model inference and user-requested coding/project tasks that cannot be represented by the standard foreground-service types." />
+        </service>
 
         <!-- Phase 11: real FileProvider so Share / Open in File Manager can
              hand a genuine content:// Uri to another app for an artifact

@@ -6,8 +6,6 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.util.Log
-import org.json.JSONArray
-import org.json.JSONObject
 import androidx.compose.runtime.mutableStateOf
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
@@ -16,9 +14,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.brain.offlineai.agent.AgentClarificationGate
 import com.brain.offlineai.agent.AgentTaskRepository
-import com.brain.offlineai.agent.AgentExecutionRepository
-import com.brain.offlineai.agent.AgentExecutionEntity
-import com.brain.offlineai.agent.AgentExecutionStatus
+import com.brain.offlineai.agent.ExecutionCheckpointKind
+import com.brain.offlineai.agent.ExecutionCheckpointEntity
+import com.brain.offlineai.agent.ExecutionCheckpointRepository
 import com.brain.offlineai.agent.ContextManager
 import com.brain.offlineai.agent.FileValidator
 import com.brain.offlineai.agent.PlanningEngine
@@ -89,7 +87,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import com.brain.offlineai.tasks.ChatTaskForegroundService
-import com.brain.offlineai.tasks.ChatTaskRuntimeScope
 
 /**
  * Drives the Chat screen state - Phase 2 rewrite, Phase 5 wiring added,
@@ -143,7 +140,8 @@ class ChatViewModel(
      * genuinely survives process death, not just an in-memory flag.
      */
     private val agentTaskRepository = AgentTaskRepository(application)
-    private val executionRepository = AgentExecutionRepository(application)
+    /** Room-backed execution checkpoint; unlike the old in-memory continuation this survives process death. */
+    private val executionCheckpointRepository = ExecutionCheckpointRepository(application)
 
     /**
      * Phase 21 (Master Plan v2 - Permission/Risk Gate + Tool Registry/
@@ -327,11 +325,6 @@ class ChatViewModel(
             // outcome on its own terms rather than this row being
             // double-claimed by two concurrent resume attempts.
             thermalPauseRepository.markResumed(paused.id)
-            val persistedExecution = executionRepository.latestPaused(sid)
-            if (persistedExecution != null) {
-                activeExecutionId = persistedExecution.id
-                executionRepository.mark(persistedExecution.id, AgentExecutionStatus.RUNNING, paused.continuationPrompt)
-            }
             val installedModel = ModelFileManager(getApplication()).getLastInstalledModel()
             if (installedModel == null) {
                 postSystemNote(
@@ -357,18 +350,7 @@ class ChatViewModel(
                 nThreads = settings.threads
             )
             if (BrainEngine.state.value is EngineState.Loaded) {
-                val persisted = executionRepository.latestPaused(sid)
-                if (persisted?.kind == "MULTI_FILE" && persisted.planJson.isNotBlank()) {
-                    when (runMultiFileBuild(sid, persisted.originalPrompt, "", resumeExecution = persisted)) {
-                        MultiFileBuildOutcome.COMPLETED -> executionRepository.mark(persisted.id, AgentExecutionStatus.COMPLETED)
-                        MultiFileBuildOutcome.FAILED -> executionRepository.mark(persisted.id, AgentExecutionStatus.FAILED)
-                        MultiFileBuildOutcome.NOT_APPLICABLE -> executionRepository.mark(persisted.id, AgentExecutionStatus.FAILED)
-                    }
-                } else {
-                    val resumedId = streamRealResponse(sid, paused.continuationPrompt)
-                    val success = messages.value.firstOrNull { it.id == resumedId }?.state != BotMessageState.SYSTEM_NOTE
-                    activeExecutionId?.let { executionRepository.mark(it, if (success) AgentExecutionStatus.COMPLETED else AgentExecutionStatus.FAILED) }
-                }
+                streamRealResponse(sid, paused.continuationPrompt)
             } else {
                 postSystemNote(
                     sid,
@@ -510,15 +492,12 @@ class ChatViewModel(
      * message means the user moved on and a later unrelated "continue"
      * should not resume stale, out-of-context work.
      */
-    private enum class MultiFileBuildOutcome { NOT_APPLICABLE, COMPLETED, FAILED }
-
     private data class PendingContinuation(
         val sessionId: String,
         val continuationPrompt: String,
         val zipEditTarget: ZipEditTarget?
     )
     private var pendingContinuation: PendingContinuation? = null
-    private var activeExecutionId: String? = null
 
     fun sendMessage() {
         if (isBusy.value) return
@@ -536,7 +515,6 @@ class ChatViewModel(
         // guard above, sending the same message twice.
         isBusy.value = true
         userStopRequested = false
-        activeExecutionId = null
         inputText.value = ""
         // Clear the pending row now - these attachments are about to become
         // real, sent [ChatMessage.attachments], not pending ones anymore.
@@ -562,12 +540,8 @@ class ChatViewModel(
         messages.value = messages.value + userMessage
         analyticsStore.incrementMessagesSent()
 
-        generationJob = ChatTaskRuntimeScope.scope.launch {
-            // Starting the foreground service can be rejected by Android if
-            // the app has already transitioned to a background-only state.
-            // That must not abort the actual task coroutine; the persisted
-            // execution state remains the source of truth and the service is
-            // only the OS priority aid.
+        generationJob = viewModelScope.launch {
+            ChatTaskForegroundService.start(getApplication())
             // Real bug fix: everything below this point used to run inside a
             // try { ... } finally { ... } with NO catch. Any genuine throw
             // before streamRealResponse() started (a Room write in
@@ -579,40 +553,12 @@ class ChatViewModel(
             // failure visible instead of silent, and still lets real
             // cancellation (leaving the screen, process death) propagate.
             var activeSessionIdForError: String? = null
-            var taskCompleted = false
-            var taskCancelled = false
-            var taskFailed = false
             try {
-                val foregroundStartError = runCatching { ChatTaskForegroundService.start(getApplication()) }.exceptionOrNull()
-                if (foregroundStartError != null) {
-                    Log.w("ChatViewModel", "Foreground task service could not be started; continuing with persisted task runtime", foregroundStartError)
-                }
-
                 val activeSessionId = ensureSession(text.ifEmpty { readyAttachments.first().fileName })
                 activeSessionIdForError = activeSessionId
                 persistMessage(activeSessionId, userMessage)
                 if (readyAttachments.isNotEmpty()) {
                     persistAttachments(activeSessionId, userMessage.id, readyAttachments)
-                }
-
-                if (text.trim().lowercase(Locale.getDefault()) !in CONTINUE_TRIGGERS) {
-                    executionRepository.latestPaused(activeSessionId)?.let {
-                        executionRepository.mark(it.id, AgentExecutionStatus.CANCELLED)
-                    }
-                }
-
-                // Long-running work is now a persisted execution, not only a UI coroutine.
-                // This cursor is updated during generation so Continue can recover after
-                // navigation or process restart without guessing where the task stopped.
-                if (text.trim().lowercase(Locale.getDefault()) !in CONTINUE_TRIGGERS) {
-                    activeExecutionId = UUID.randomUUID().toString()
-                    executionRepository.start(
-                        id = activeExecutionId!!,
-                        sessionId = activeSessionId,
-                        kind = if (readyAttachments.any { it.kind == AttachmentKind.ZIP }) "ZIP_TASK" else "CHAT_TASK",
-                        originalPrompt = text,
-                        continuationPrompt = text
-                    )
                 }
 
                 // Compute Bridge: Remote/Auto mode with at least one
@@ -631,8 +577,6 @@ class ChatViewModel(
                             "in the Compute Bridge screen - this build never fabricates an " +
                             "answer without a real model."
                     )
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.FAILED) }
-                    taskFailed = true
                     return@launch
                 }
 
@@ -647,41 +591,40 @@ class ChatViewModel(
                 // genuinely moved on, so the old unfinished reply is
                 // dropped rather than resumed later out of context by a
                 // much later, unrelated "continue".
-                var pending = pendingContinuation
-                if (pending == null && text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS) {
-                    val persisted = executionRepository.latestPaused(activeSessionId)
-                    if (persisted != null) {
-                        activeExecutionId = persisted.id
-                        executionRepository.mark(persisted.id, AgentExecutionStatus.RUNNING)
-                        if (persisted.kind == "MULTI_FILE" && persisted.planJson.isNotBlank()) {
-                            pendingContinuation = null
-                            when (runMultiFileBuild(
-                                activeSessionId,
-                                persisted.originalPrompt,
-                                "",
-                                resumeExecution = persisted
-                            )) {
-                                MultiFileBuildOutcome.COMPLETED -> taskCompleted = true
-                                MultiFileBuildOutcome.FAILED -> taskFailed = true
-                                MultiFileBuildOutcome.NOT_APPLICABLE -> taskFailed = true
-                            }
-                            return@launch
-                        }
-                        pending = PendingContinuation(activeSessionId, persisted.continuationPrompt, null)
-                    }
-                }
-                if (pending != null) {
+                val continueRequested = text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS
+                val persistedCheckpoint = executionCheckpointRepository.getPaused(activeSessionId)
+                val pending = pendingContinuation
+                if (continueRequested && pending != null) {
                     pendingContinuation = null
-                    if (text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS) {
-                        val resumedId = streamRealResponse(activeSessionId, pending.continuationPrompt, pending.zipEditTarget)
-                        taskCompleted = messages.value.firstOrNull { it.id == resumedId }?.state != BotMessageState.SYSTEM_NOTE
-                        return@launch
+                    executionCheckpointRepository.getPaused(activeSessionId)?.let { executionCheckpointRepository.delete(it.id) }
+                    streamRealResponse(activeSessionId, pending.continuationPrompt, pending.zipEditTarget)
+                    return@launch
+                }
+                if (continueRequested && persistedCheckpoint != null) {
+                    if (persistedCheckpoint.kind == ExecutionCheckpointKind.MULTI_FILE) {
+                        val resumed = runMultiFileBuild(
+                            activeSessionId,
+                            persistedCheckpoint.originalRequest,
+                            persistedCheckpoint.extraContext,
+                            persistedCheckpoint
+                        )
+                        if (resumed) executionCheckpointRepository.delete(persistedCheckpoint.id)
+                    } else {
+                        executionCheckpointRepository.delete(persistedCheckpoint.id)
+                        streamRealResponse(activeSessionId, persistedCheckpoint.continuationPrompt, null)
                     }
+                    return@launch
+                }
+                if (!continueRequested && (pending != null || persistedCheckpoint != null)) {
+                    pendingContinuation = null
+                    persistedCheckpoint?.let { executionCheckpointRepository.delete(it.id) }
+                }
+                if (continueRequested && pending == null && persistedCheckpoint == null) {
+                    postSystemNote(activeSessionId, "There is no paused task in this chat to continue. Tell me what you want me to continue, or send the file/project again if the earlier task was in another chat.")
+                    return@launch
                 }
 
                 if (handleArtifactFollowUpIfRequested(activeSessionId, text)) {
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.COMPLETED) }
-                    taskCompleted = true
                     return@launch
                 }
 
@@ -702,8 +645,6 @@ class ChatViewModel(
                             "what you'd like done with ${if (readyAttachments.size > 1) "them" else "it"} so it " +
                             "can be routed and used."
                     )
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.COMPLETED) }
-                    taskCompleted = true
                     return@launch
                 }
 
@@ -726,7 +667,6 @@ class ChatViewModel(
                             "Send a follow-up message clarifying and I'll pick it up " +
                             "from there."
                     )
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.CANCELLED) }
                     return@launch
                 }
 
@@ -744,7 +684,6 @@ class ChatViewModel(
                             "earlier reply in this chat to refer back to. Could you " +
                             "say what you'd like done, specifically?"
                     )
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.CANCELLED) }
                     return@launch
                 }
 
@@ -794,7 +733,6 @@ class ChatViewModel(
                                 now = System.currentTimeMillis()
                             )
                             postSystemNote(activeSessionId, ambiguity.question)
-                            activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.CANCELLED) }
                             return@launch
                         }
                     }
@@ -811,16 +749,17 @@ class ChatViewModel(
                 for (zipInfo in readyAttachments.filter { it.kind == AttachmentKind.ZIP }) {
                     if (ContextManager.needsChunking(zipInfo.storedPath)) {
                         val plan = ContextManager.buildChunkPlan(zipInfo.storedPath, zipInfo.fileName)
-                        postSystemNote(
-                            activeSessionId,
-                            "📦 ${plan.displayName} · ${plan.totalFiles} files · ${plan.chunks.size} chunks\n✓ Entry scan complete · relevant file inspection will read real files as needed"
-                        )
-                        // Real, bounded replacement for this one ZIP's
-                        // context-block section below - Chunk 1's own
-                        // structure summary only, never the unbounded raw
-                        // entry-name dump [AttachmentPromptBuilder] would
-                        // otherwise build for a ZIP this large.
-                        chunkedZipSummaries[zipInfo.id] = plan.chunks.first().body
+                        // Keep the chat compact: the real ZIP is indexed into
+                        // as many display chunks as its actual size requires,
+                        // but the user sees one short row instead of one card
+                        // per chunk. The detailed list remains available only
+                        // through the expandable process/search surfaces.
+                        postSystemNote(activeSessionId, "📦 ${plan.displayName} · ${plan.totalFiles} files · ${plan.chunks.size} chunks indexed")
+                        // Only the real structure summary enters the generic
+                        // attachment prompt. The full entry list is not dumped
+                        // into the model; targeted ZIP inspection is performed
+                        // later when the task actually needs file contents.
+                        chunkedZipSummaries[zipInfo.id] = plan.chunks.first().body.take(1000)
                     }
                 }
 
@@ -851,11 +790,9 @@ class ChatViewModel(
                 // or any message when no key is configured, does zero
                 // extra work and stays fully offline, silently.
                 val hasZipAttachment = readyAttachments.any { it.kind == AttachmentKind.ZIP }
-                val searchQuery = WebSearchTrigger.newProjectSearchQuery(processingText)
-                    ?: WebSearchTrigger.existingProjectSearchQuery(processingText, hasZipAttachment)
-                    ?: WebSearchTrigger.buildTargetSearchQuery(processingText)
-                val webSearchContextBlock = if (searchQuery != null) {
-                    runWebSearch(activeSessionId, searchQuery)
+                val searchPlan = WebSearchTrigger.plan(processingText, hasZipAttachment)
+                val webSearchContextBlock = if (searchPlan != null) {
+                    runWebSearch(activeSessionId, searchPlan)
                 } else {
                     ""
                 }
@@ -926,7 +863,7 @@ class ChatViewModel(
                         postSystemNote(activeSessionId, "Couldn't re-read $resumeEntryName from ${pendingClarification.resumeDisplayName} - it may have moved or been deleted. Please re-attach the ZIP.")
                     }
                 } else if (pendingClarification != null) {
-                    val resumeEntries = toolGateway.listZipEntries(pendingClarification.resumeStoredPath, maxEntries = 5000)
+                    val resumeEntries = toolGateway.listZipEntries(pendingClarification.resumeStoredPath, maxEntries = Int.MAX_VALUE)
                     val resumeMatch = ZipEditResolver.resolveEditTarget(resumeEntries, processingText)
                     if (resumeMatch != null) {
                         val entryContent = toolGateway.readZipEntry(pendingClarification.resumeStoredPath, resumeMatch.name)
@@ -1023,7 +960,7 @@ class ChatViewModel(
                 // attempt to resolve automatically.
                 if (zipEditTarget == null && zipAttachments.size == 1) {
                     val zipInfo = zipAttachments.first()
-                    val entries = toolGateway.listZipEntries(zipInfo.storedPath, maxEntries = 5000)
+                    val entries = toolGateway.listZipEntries(zipInfo.storedPath, maxEntries = Int.MAX_VALUE)
                     // Weakness-review fix - a real filename match was the
                     // only way to resolve a target before; a message that
                     // instead names a function/class ("fix calculateTotal",
@@ -1069,7 +1006,6 @@ class ChatViewModel(
                                     now = System.currentTimeMillis()
                                 )
                                 postSystemNote(activeSessionId, question)
-                                activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.CANCELLED) }
                                 return@launch
                             }
                             val isDiagnoseOnly = isDiagnoseOnlyIntent(processingText)
@@ -1115,7 +1051,6 @@ class ChatViewModel(
                                 now = System.currentTimeMillis()
                             )
                             postSystemNote(activeSessionId, clarification.question)
-                            activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.CANCELLED) }
                             return@launch
                         }
                     }
@@ -1150,10 +1085,7 @@ class ChatViewModel(
                 // (and, per Phase 14 above, may now also carry the real
                 // attachment context block appended after it).
                 if (zipAttachments.size == 1 && zipEditTarget == null && isDiagnoseOnlyIntent(processingText)) {
-                    taskCompleted = runZipDiagnosis(activeSessionId, zipAttachments.first(), processingText, webSearchContextBlock)
-                    if (activeExecutionId != null) {
-                        executionRepository.mark(activeExecutionId!!, if (taskCompleted) AgentExecutionStatus.COMPLETED else AgentExecutionStatus.FAILED)
-                    }
+                    runZipDiagnosis(activeSessionId, zipAttachments.first(), processingText, webSearchContextBlock)
                     return@launch
                 }
 
@@ -1220,17 +1152,16 @@ class ChatViewModel(
                     // earlier phase already used - completely unaffected,
                     // same safe-default posture every other real gate in
                     // this app already holds itself to.
-                    val multiFileOutcome = if (zipAttachments.isEmpty() && zipEditTarget == null &&
+                    val multiFileEligible = zipAttachments.isEmpty() && zipEditTarget == null &&
                         ProjectTypeGate.isCreationRequest(processingText) &&
-                        shouldUseMultiFileBuild(processingText)
-                    ) {
-                        runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
-                    } else MultiFileBuildOutcome.NOT_APPLICABLE
-                    if (multiFileOutcome == MultiFileBuildOutcome.COMPLETED) {
-                        taskCompleted = true
-                    } else if (multiFileOutcome == MultiFileBuildOutcome.FAILED) {
-                        taskFailed = true
-                    } else {
+                        ProjectTypeGate.explicitlyRequestsMultipleFiles(processingText)
+                    val triedMultiFile = multiFileEligible && runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
+                    val pausedMultiFile = multiFileEligible && executionCheckpointRepository.getPaused(activeSessionId)?.kind == ExecutionCheckpointKind.MULTI_FILE
+                    if (pausedMultiFile) {
+                        postSystemNote(activeSessionId, "Project work is paused safely at the saved file. Reply \"continue\" to resume from that exact checkpoint.")
+                        return@launch
+                    }
+                    if (!triedMultiFile) {
                         // Bug fix (user report - planning times out on a
                         // web-search-heavy request, falls back here, and
                         // the fallback *also* looks stuck at "Starting...
@@ -1263,24 +1194,10 @@ class ChatViewModel(
                         val trimmedStreamExtraContext = if (extraContextBlock.length > STREAM_EXTRA_CONTEXT_CHAR_CAP) {
                             extraContextBlock.take(STREAM_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this reply)"
                         } else extraContextBlock
-                        val responseId = streamRealResponse(activeSessionId, processingText + codingContract + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
-                        taskCompleted = messages.value.firstOrNull { it.id == responseId }?.state != BotMessageState.SYSTEM_NOTE
+                        streamRealResponse(activeSessionId, processingText + codingContract + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
                     }
-                }
-                if (taskCompleted == false && activeExecutionId != null && messages.value.lastOrNull { !it.isUser }?.state == BotMessageState.SYSTEM_NOTE) {
-                    taskFailed = true
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
-                taskCancelled = true
-                if (activeExecutionId != null) {
-                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                        executionRepository.mark(
-                            activeExecutionId!!,
-                            if (userStopRequested) AgentExecutionStatus.PAUSED else AgentExecutionStatus.PAUSED,
-                            pendingContinuation?.continuationPrompt
-                        )
-                    }
-                }
                 // A cancelled generation must not leave the live PROCESS/
                 // GENERATING bubble as if work were still running. The
                 // cancellation is still rethrown so coroutine structured
@@ -1292,8 +1209,6 @@ class ChatViewModel(
                 }
                 throw e // lifecycle/process cancellation must keep propagating
             } catch (e: Exception) {
-                taskFailed = true
-                if (activeExecutionId != null) executionRepository.mark(activeExecutionId!!, AgentExecutionStatus.FAILED)
                 Log.e("ChatViewModel", "sendMessage failed before/while generating a response", e)
                 val errorText = "Something went wrong before I could reply: " +
                     (e.message ?: e::class.java.simpleName) +
@@ -1312,13 +1227,9 @@ class ChatViewModel(
                     )
                 }
             } finally {
-                if (taskCompleted && !taskCancelled && !taskFailed && pendingContinuation == null && activeExecutionId != null) {
-                    executionRepository.mark(activeExecutionId!!, AgentExecutionStatus.COMPLETED)
-                }
                 isBusy.value = false
                 generationJob = null
-                runCatching { ChatTaskForegroundService.stop(getApplication()) }
-                    .onFailure { Log.w("ChatViewModel", "Could not stop foreground task service", it) }
+                ChatTaskForegroundService.stop(getApplication())
             }
         }
     }
@@ -1488,6 +1399,12 @@ class ChatViewModel(
         // genuine kill mid-stream leaves whatever the model had actually
         // produced so far, instead of the whole reply vanishing.
         val persistEveryNTokens = 8
+        val replyCheckpointId = java.util.UUID.randomUUID().toString()
+        executionCheckpointRepository.savePaused(
+            id = replyCheckpointId, sessionId = activeSessionId, kind = ExecutionCheckpointKind.REPLY,
+            originalRequest = prompt, extraContext = "", continuationPrompt = prompt,
+            currentFileIndex = 0, projectDirId = "", planMessageId = botId, currentFileName = "", partialOutput = ""
+        )
 
         upsertBotMessage(
             botId,
@@ -1641,6 +1558,19 @@ class ChatViewModel(
                                     activeSessionId,
                                     ChatMessage(id = codeId ?: botId, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT)
                                 )
+                                executionCheckpointRepository.savePaused(
+                                    id = replyCheckpointId,
+                                    sessionId = activeSessionId,
+                                    kind = ExecutionCheckpointKind.REPLY,
+                                    originalRequest = prompt,
+                                    extraContext = "",
+                                    continuationPrompt = prompt + "\n\n" + full,
+                                    currentFileIndex = 0,
+                                    projectDirId = "",
+                                    planMessageId = botId,
+                                    currentFileName = "",
+                                    partialOutput = full
+                                )
                             }
                         }
                     }
@@ -1673,14 +1603,6 @@ class ChatViewModel(
                 stopReason = chunkStopReason
                 if (chunkStopReason == "timeout") break
                 continuationPrompt = prompt + "\n\n" + builder.toString()
-                activeExecutionId?.let {
-                    val currentFile = ArtifactExtractor.extract(builder.toString()).firstOrNull()?.fileName.orEmpty()
-                    executionRepository.updateCursor(
-                        id = it, continuationPrompt = continuationPrompt,
-                        currentFileName = currentFile,
-                        currentChunk = chunkIndex, totalChunks = chunkIndex
-                    )
-                }
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             // Real interruption - the user left the screen, the app was
@@ -1690,10 +1612,6 @@ class ChatViewModel(
             // the time this catch runs, so an ordinary suspend DB write
             // would be rejected immediately.
             kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
-                activeExecutionId?.let {
-                    val resumePrompt = prompt + if (builder.isNotBlank()) "\n\n" + builder.toString() else ""
-                    executionRepository.mark(it, AgentExecutionStatus.PAUSED, resumePrompt)
-                }
                 val partialFull = builder.toString()
                 if (partialFull.isNotBlank()) {
                     val partialSplit = splitIntroAndCode(partialFull)
@@ -1721,13 +1639,6 @@ class ChatViewModel(
         // else. See where this is used below for what happens next.
         val hitChunkCap = fatalError == null && stopReason == "max_tokens" && chunkIndex >= MAX_CONTINUATION_CHUNKS
 
-        // Zero real tokens is an execution failure, not a successful assistant reply.
-        // Previously this became the literal "(model returned no output)" text and the
-        // task could be marked COMPLETED, hiding the actual native/model failure.
-        if (fatalError == null && builder.isBlank()) {
-            fatalError = IllegalStateException("Model returned no output (native stop reason: $stopReason)")
-        }
-
         if (fatalError != null) {
             // Phase 15 (Error & Recovery Flow) - a genuine generation
             // failure no longer becomes a single flat SYSTEM_NOTE; it
@@ -1743,8 +1654,12 @@ class ChatViewModel(
             // reads, so a retry that recovers via a genuinely different
             // id is never silently dropped in favor of the stale [botId].
             codeId = handleGenerationFailure(botId, activeSessionId, prompt, settings, fatalError!!)
+            // A real error path has already completed its bounded recovery
+            // decision; do not leave an old generation checkpoint that could
+            // later be resumed after the user has moved on.
+            executionCheckpointRepository.delete(replyCheckpointId)
         } else {
-            val finalFull = builder.toString()
+            val finalFull = builder.toString().ifBlank { "(model returned no output)" }
             val finalSplit = splitIntroAndCode(finalFull)
             val finalCodeId = codeId
             if (finalSplit.codeLines == null || finalCodeId == null) {
@@ -1816,13 +1731,11 @@ class ChatViewModel(
             // `generate()` call picking up from exactly here.
             if (hitChunkCap) {
                 pendingContinuation = PendingContinuation(activeSessionId, continuationPrompt, zipEditTarget)
-                activeExecutionId?.let {
-                    executionRepository.updateCursor(
-                        id = it, continuationPrompt = continuationPrompt,
-                        currentChunk = chunkIndex, totalChunks = chunkIndex,
-                        status = AgentExecutionStatus.PAUSED
-                    )
-                }
+                executionCheckpointRepository.savePaused(
+                    id = replyCheckpointId, sessionId = activeSessionId, kind = ExecutionCheckpointKind.REPLY,
+                    originalRequest = prompt, extraContext = "", continuationPrompt = continuationPrompt,
+                    currentFileIndex = 0, projectDirId = "", planMessageId = botId, currentFileName = "", partialOutput = builder.toString()
+                )
                 postSystemNote(
                     activeSessionId,
                     "This reply hit this app's per-message length safety limit before the task " +
@@ -1850,6 +1763,7 @@ class ChatViewModel(
                 // attempt - so that's what this says instead of a false
                 // "continue" promise. [pendingContinuation] is
                 // deliberately NOT armed here, unlike [hitChunkCap].
+                executionCheckpointRepository.delete(replyCheckpointId)
                 postSystemNote(
                     activeSessionId,
                     "This reply filled the model's real loaded context window " +
@@ -1872,6 +1786,7 @@ class ChatViewModel(
                 // clarification question (Rule 4). [pendingContinuation]
                 // is deliberately NOT armed here - resume is automatic
                 // (see [attemptThermalResume]), not a typed "continue".
+                executionCheckpointRepository.delete(replyCheckpointId)
                 val pauseId = java.util.UUID.randomUUID().toString()
                 val pausedStatus = (ThermalMonitor.state.value as? com.brain.offlineai.engine.thermal.ThermalReading.Level)?.status ?: -1
                 thermalPauseRepository.savePaused(
@@ -1881,15 +1796,6 @@ class ChatViewModel(
                     pausedAtStatus = pausedStatus,
                     now = System.currentTimeMillis()
                 )
-                activeExecutionId?.let {
-                    executionRepository.updateCursor(
-                        id = it,
-                        continuationPrompt = continuationPrompt,
-                        currentChunk = chunkIndex,
-                        totalChunks = chunkIndex,
-                        status = AgentExecutionStatus.PAUSED
-                    )
-                }
                 BrainEngine.pauseForThermal()
                 postSystemNote(
                     activeSessionId,
@@ -1918,15 +1824,18 @@ class ChatViewModel(
                 // call right away isn't guaranteed safe either. Retrying
                 // the whole message after a pause is the one honest option
                 // stated here.
-                pendingContinuation = PendingContinuation(activeSessionId, continuationPrompt, zipEditTarget)
-                activeExecutionId?.let {
-                    executionRepository.updateCursor(
-                        id = it,
-                        continuationPrompt = continuationPrompt,
-                        currentChunk = chunkIndex,
-                        totalChunks = chunkIndex,
-                        status = AgentExecutionStatus.PAUSED
+                if (builder.isNotBlank()) {
+                    val savedContinuation = prompt + "\n\n" + builder.toString()
+                    pendingContinuation = PendingContinuation(activeSessionId, savedContinuation, zipEditTarget)
+                    executionCheckpointRepository.savePaused(
+                        id = replyCheckpointId, sessionId = activeSessionId, kind = ExecutionCheckpointKind.REPLY,
+                        originalRequest = prompt, extraContext = "", continuationPrompt = savedContinuation,
+                        currentFileIndex = 0, projectDirId = "", planMessageId = botId, currentFileName = "", partialOutput = builder.toString()
                     )
+                    postSystemNote(activeSessionId, "Generation paused after a real stall. Reply \"continue\" to resume from the last generated point.")
+                } else {
+                    executionCheckpointRepository.delete(replyCheckpointId)
+                    postSystemNote(activeSessionId, "Generation paused after a real stall before any output was produced. Shorten the request/context or retry when the device is free.")
                 }
                 postSystemNote(
                     activeSessionId,
@@ -1946,6 +1855,11 @@ class ChatViewModel(
         // completed and its own real suspend work - persistMessage - has
         // already finished, so messages.value already holds both real
         // card(s)' final state here.
+        if (fatalError == null && stopReason == "end_of_generation") {
+            executionCheckpointRepository.delete(replyCheckpointId)
+        } else if (fatalError != null && builder.isBlank()) {
+            executionCheckpointRepository.delete(replyCheckpointId)
+        }
         return codeId ?: botId
     }
 
@@ -1979,57 +1893,16 @@ class ChatViewModel(
      * the caller's own fallback to [streamRealResponse] is the only real
      * bot reply the user ends up seeing, never two.
      */
-    /** Large creation work is automatically promoted to the real multi-file planner.
-     * Explicit multi-file wording still works, but a user no longer has to know
-     * the internal chunking vocabulary. Small one-file requests stay lightweight. */
-    private fun shouldUseMultiFileBuild(request: String): Boolean {
-        if (!ProjectTypeGate.isCreationRequest(request)) return false
-        if (ProjectTypeGate.explicitlyRequestsMultipleFiles(request)) return true
-        val lower = request.lowercase(Locale.getDefault())
-        val projectSignals = listOf(
-            "project", "android app", "android application", "full stack",
-            "backend", "frontend", "api", "database", "multi screen",
-            "multiple screen", "feature", "complete app", "complete website"
-        )
-        val hasProjectSignal = projectSignals.any(lower::contains)
-        val isLong = request.length >= 240
-        return hasProjectSignal || isLong
-    }
-
-    private fun serializeExecutionPlan(plan: PlanningEngine.FilePlan): String {
-        val root = JSONObject()
-        val files = JSONArray()
-        plan.files.forEach { file ->
-            files.put(JSONObject().put("fileName", file.fileName).put("language", file.language).put("purpose", file.purpose))
-        }
-        root.put("files", files)
-        plan.truncatedFromCount?.let { root.put("truncatedFromCount", it) }
-        return root.toString()
-    }
-
-    private fun deserializeExecutionPlan(raw: String): PlanningEngine.FilePlan? {
-        return try {
-            val root = JSONObject(raw)
-            val filesJson = root.optJSONArray("files") ?: return null
-            val files = buildList {
-                for (i in 0 until filesJson.length()) {
-                    val item = filesJson.optJSONObject(i) ?: continue
-                    val name = item.optString("fileName").trim()
-                    if (name.isBlank()) continue
-                    add(PlanningEngine.PlannedFile(name, item.optString("language"), item.optString("purpose")))
-                }
-            }
-            if (files.size < 2) null else PlanningEngine.FilePlan(files, if (root.has("truncatedFromCount")) root.optInt("truncatedFromCount") else null)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private suspend fun runMultiFileBuild(activeSessionId: String, originalRequest: String, extraContextBlock: String, resumeExecution: AgentExecutionEntity? = null): MultiFileBuildOutcome {
+    private suspend fun runMultiFileBuild(
+        activeSessionId: String,
+        originalRequest: String,
+        extraContextBlock: String,
+        resumeCheckpoint: ExecutionCheckpointEntity? = null
+    ): Boolean {
         val settings = settingsRepository.getSettings()
         val loadedContextSize = (BrainEngine.state.value as? EngineState.Loaded)?.contextSize ?: settings.contextLength
 
-        val planBotId = nextId++
+        val planBotId = resumeCheckpoint?.planMessageId?.takeIf { it > 0 } ?: nextId++
         val steps = mutableListOf<ProcessStep>()
         var nextStepId = 1L
 
@@ -2044,29 +1917,14 @@ class ChatViewModel(
             if (index < 0) return
             val existing = steps[index]
             steps[index] = existing.copy(status = if (failed) ProcessStepStatus.FAILED else ProcessStepStatus.COMPLETE, label = label ?: existing.label)
-            // Mutating the local list is not enough: Compose only sees the
-            // new process state when a new ChatMessage is emitted. Without
-            // this immediate upsert, the card could visibly remain RUNNING
-            // until a later step happened to be appended.
-            upsertBotMessage(
-                planBotId,
-                ChatMessage(
-                    id = planBotId,
-                    text = "",
-                    isUser = false,
-                    timestamp = timeNow(),
-                    state = BotMessageState.PROCESS,
-                    processSteps = steps.toList()
-                )
-            )
+            upsertBotMessage(planBotId, ChatMessage(id = planBotId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.PROCESS, processSteps = steps.toList()))
         }
 
-        // Real single generation call, budgeted the same way
-        // [chunkTokenBudget] already sizes every other real call in this
-        // file - never a second, separately-invented budget calculation.
-        // Still used as-is for the planning call itself (a real file list
-        // is always short output, never realistically needs a second
-        // chunk).
+        fun extractSignature(fileName: String, code: String): String {
+            val names = extractDeclarationNames(code).take(8).toList()
+            return if (names.isEmpty()) "" else "$fileName defines: ${names.joinToString(", ")}"
+        }
+
         suspend fun generateOnce(prompt: String, onProgress: () -> Unit = {}): Pair<String, String> {
             val budget = chunkTokenBudget(loadedContextSize, prompt)
             if (budget <= 0) return "" to "context_full"
@@ -2077,178 +1935,56 @@ class ChatViewModel(
             return builder.toString() to reason
         }
 
-        // Weakness-review fix, issue 2 - real, bounded auto-continue for a
-        // single file's own generation, same genuine "re-send prompt +
-        // everything real generated so far, ask for another real chunk"
-        // shape [streamRealResponse]'s own main loop already uses, just
-        // capped at [MAX_FILE_CONTINUATION_CHUNKS] instead of
-        // [MAX_CONTINUATION_CHUNKS] - one planned file that stops on
-        // "max_tokens" now keeps genuinely asking for more of itself
-        // instead of silently being handed back to [FileValidator] as if
-        // it were finished. Returns the real, concatenated content plus
-        // the real final stop reason ("end_of_generation", "context_full",
-        // "chunk_cap", or "error").
-        var activePlanJson = resumeExecution?.planJson.orEmpty()
-        suspend fun generateFileContent(
-            prompt: String,
-            forceMode: ComputeMode? = null,
-            fileName: String = "",
-            fileIndex: Int = 0,
-            onChunkText: (String) -> Unit = {}
-        ): Pair<String, String> {
-            val builder = StringBuilder()
-            var continuationPrompt = prompt
-            var reason = "max_tokens"
-            var chunk = 0
-            while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
-                chunk++
-                if (ThermalPolicy.decide(ThermalMonitor.state.value) == ThermalAction.UNLOAD_AND_PAUSE) {
-                    reason = "thermal_pause"
-                    break
-                }
-                val budget = chunkTokenBudget(loadedContextSize, continuationPrompt)
-                if (budget <= 0) {
-                    reason = "context_full"
-                    break
-                }
-                var chunkReason = "max_tokens"
-                // Bug fix (user request - same "working card hangs" issue
-                // as [streamRealResponse], see [GENERATION_CHUNK_TIMEOUT_MS]'s
-                // own doc) - this per-file call had no ceiling either, so a
-                // slow/stuck prefill on one planned file could leave the
-                // whole multi-file build (CREATING step) stuck with no way
-                // out, the same way the fixed planning call used to.
-                try {
-                    val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature.coerceAtMost(0.35f), topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
-                            .collect {
-                                builder.append(it)
-                                onChunkText(builder.toString())
-                            }
-                    }
-                    if (timedOutOrNull == null) {
-                        reason = "timeout"
-                        break
-                    }
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    reason = if (e.message?.contains("context window") == true) "context_full" else "error"
-                    break
-                }
-                reason = chunkReason
-                continuationPrompt = prompt + "\n\n" + builder.toString()
-                activeExecutionId?.let { id ->
-                    executionRepository.updateCursor(
-                        id = id,
-                        continuationPrompt = continuationPrompt,
-                        currentFileName = fileName,
-                        currentChunk = chunk,
-                        totalChunks = MAX_FILE_CONTINUATION_CHUNKS,
-                        currentFileIndex = fileIndex,
-                        planJson = activePlanJson
-                    )
-                }
-            }
-            if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
-            return builder.toString() to reason
-        }
-
-        // Weakness-review fix, issue 3 - "context sirf pichli 2 files yaad
-        // rakhta hai". Full real content of the last 2 files is still kept
-        // verbatim (unchanged - see [recentFilesContext] below), but every
-        // earlier real file this build already wrote also leaves behind a
-        // short, real "signature" line (its own top-level class/
-        // function/object declarations, taken straight from its own real
-        // generated text - never invented) so a later file that depends on
-        // an *older* one (e.g. file 10 referencing file 2's class name)
-        // still sees a real, if compact, trace of it instead of the model
-        // having to guess. Deliberately cheap: no new model call, just a
-        // real regex read over content this build already produced.
-        // Reuses the same class-level [extractDeclarationNames] the
-        // zip-patch safety check below also uses - not a second, separate
-        // regex definition.
-        fun extractSignature(fileName: String, code: String): String {
-            val names = extractDeclarationNames(code).take(8).toList()
-            return if (names.isEmpty()) "" else "$fileName defines: ${names.joinToString(", ")}"
-        }
-
-        val persistedPlan = resumeExecution?.planJson?.takeIf { it.isNotBlank() }?.let(::deserializeExecutionPlan)
-        val plan: PlanningEngine.FilePlan?
-        val planningTimedOut: Boolean
-        if (persistedPlan != null) {
-            plan = persistedPlan
-            planningTimedOut = false
-            postSystemNote(activeSessionId, "Resuming saved project plan from file ${resumeExecution.currentFileIndex + 1}/${persistedPlan.files.size}: ${resumeExecution.currentFileName.ifBlank { persistedPlan.files.getOrNull(resumeExecution.currentFileIndex)?.fileName ?: "next file" }}")
+        // Resume uses the exact persisted plan instead of asking the model to
+        // plan again. If the persisted plan is corrupt/missing, stop safely.
+        val plan: PlanningEngine.FilePlan? = if (resumeCheckpoint != null) {
+            PlanningEngine.fromJson(resumeCheckpoint.planJson)
         } else {
-            val planningStepId = pushRunning(
-                ProcessMarking.PLANNING,
-                "Planning project files with the local model"
-            )
+            val planningStepId = pushRunning(ProcessMarking.PLANNING, "Planning project files with the local model")
             val trimmedPlanningExtraContext = if (extraContextBlock.length > PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
                 extraContextBlock.take(PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for planning)"
             } else extraContextBlock
             val planningPrompt = PlanningEngine.buildPlanningPrompt(originalRequest, trimmedPlanningExtraContext)
-            var timedOut = false
+            var planningTimedOut = false
             val (planningRaw, _) = try {
                 runWithStallWatchdog(PLANNING_GENERATION_TIMEOUT_MS) { onProgress -> generateOnce(planningPrompt, onProgress) }
-                    ?: run { timedOut = true; "" to "timeout" }
+                    ?: run { planningTimedOut = true; "" to "timeout" }
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (_: Exception) {
                 "" to "error"
             }
-            planningTimedOut = timedOut
-            plan = if (timedOut) {
-                PlanningEngine.fallbackPlan(originalRequest)
-            } else {
-                PlanningEngine.parsePlan(planningRaw) ?: PlanningEngine.fallbackPlan(originalRequest)
+            val parsed = if (planningTimedOut) null else PlanningEngine.parsePlan(planningRaw)
+            val fallback = if (parsed == null) PlanningEngine.fallbackPlan(originalRequest) else parsed
+            if (fallback == null) {
+                completeStep(planningStepId, failed = false, label = "Need the project platform/stack before I can safely create files")
+                postSystemNote(activeSessionId, "I don't have enough real information to choose the project files safely. Tell me the platform/stack (for example Android, Flutter, React, Python, or plain HTML/CSS/JS). I won't invent a main.txt or another placeholder project.")
+                removeBotMessage(planBotId)
+                return true
             }
-            if (plan == null) {
-                if (timedOut && PlanningEngine.fallbackPlan(originalRequest) == null) {
-                    completeStep(planningStepId, failed = false, label = "Planning skipped (took too long) - writing directly instead")
-                    postSystemNote(activeSessionId, "Planning stalled with no progress for ${PLANNING_GENERATION_TIMEOUT_MS / 1000}s on-device and was stopped - continuing with a single-response reply instead.")
-                    BrainEngine.awaitGenerationIdle(timeoutMs = 5_000L)
-                } else if (!timedOut) {
-                    removeBotMessage(planBotId)
-                } else {
-                    completeStep(planningStepId, failed = false, label = "Planner timed out - using the web app file set")
-                    postSystemNote(activeSessionId, "Planner timed out, so I am continuing with the standard web app files and writing each one separately.")
-                }
-                return MultiFileBuildOutcome.NOT_APPLICABLE
-            }
-            completeStep(planningStepId, label = if (timedOut) "Planner timed out - fallback file set ready" else "Planning complete")
-            postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(plan))
+            completeStep(planningStepId, label = if (planningTimedOut) "Planner timed out - verified fallback file set ready" else "Planning complete")
+            postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(fallback))
+            fallback
         }
-        if (plan == null) return MultiFileBuildOutcome.NOT_APPLICABLE
-        activePlanJson = serializeExecutionPlan(plan)
-
-        activeExecutionId?.let { id ->
-            executionRepository.configurePlan(
-                id = id,
-                kind = "MULTI_FILE",
-                planJson = activePlanJson,
-                currentFileIndex = resumeExecution?.currentFileIndex ?: 0,
-                currentFileName = resumeExecution?.currentFileName ?: "",
-                totalChunks = plan.files.size
-            )
+        if (plan == null) {
+            // The request was handled by a real clarification question; do
+            // not fall through into a guessed single-file answer.
+            return true
         }
 
+        if (resumeCheckpoint != null) {
+            postSystemNote(activeSessionId, "Resuming the saved project task from file ${resumeCheckpoint.currentFileIndex + 1} of ${plan.files.size}: ${resumeCheckpoint.currentFileName.ifBlank { plan.files.getOrNull(resumeCheckpoint.currentFileIndex)?.fileName ?: "next file" }}")
+        }
         val missingEssentials = PlanningEngine.missingEssentialFiles(originalRequest, plan)
-        if (missingEssentials.isNotEmpty()) {
-            postSystemNote(
-                activeSessionId,
-                "Heads up: this plan doesn't include ${missingEssentials.joinToString(", ")} - " +
-                    "this project likely won't run/build without ${if (missingEssentials.size == 1) "it" else "them"}. " +
-                    "Ask me to add ${if (missingEssentials.size == 1) "it" else "them"} if you need a complete project."
-            )
+        if (missingEssentials.isNotEmpty() && resumeCheckpoint == null) {
+            postSystemNote(activeSessionId, "Heads up: this plan doesn't include ${missingEssentials.joinToString(", ")} - the project may not run/build without them.")
         }
 
         val artifactInfos = mutableListOf<ArtifactInfo>()
         val projectArtifactEntries = mutableListOf<Pair<String, File>>()
         val fileSummaries = mutableListOf<String>()
-        val generatedSoFar = mutableListOf<Pair<String, String>>() // fileName to content, for later files' own real context
-        val olderFileSignatures = mutableListOf<String>() // real signature lines for files that have aged out of recentFilesContext
+        val generatedSoFar = mutableListOf<Pair<String, String>>()
+        val olderFileSignatures = mutableListOf<String>()
         var contextFullHit = false
         // Bug fix (user report - preview me CSS/JS load nahi hoti thi) -
         // one real, shared folder id for every file this build writes, so
@@ -2256,22 +1992,37 @@ class ChatViewModel(
         // resolve inside WebPreviewScreen's file:// load - see
         // [ArtifactFileManager.writeArtifact]'s own doc for the full
         // reasoning.
-        val projectDirId = java.util.UUID.randomUUID().toString()
-        val resumeStartIndex = (resumeExecution?.currentFileIndex ?: 0).coerceIn(0, plan.files.size)
-        if (resumeExecution != null && resumeStartIndex > 0) {
-            val existingArtifacts = artifactRepository.getForSession(activeSessionId)
-            val planNames = plan.files.map { it.fileName }.toSet()
-            existingArtifacts.filter { it.fileName in planNames && it.fileName in plan.files.take(resumeStartIndex).map { f -> f.fileName } }
-                .forEach { row ->
-                    val content = runCatching { File(row.storedPath).readText() }.getOrNull()
-                    if (content != null) {
-                        generatedSoFar += row.fileName to content
-                        olderFileSignatures += extractSignature(row.fileName, content)
-                    }
-                    val info = ArtifactInfo(row.id, row.fileName, row.sizeBytes, classifyArtifact(row.fileName), row.mimeType, row.storedPath)
-                    artifactInfos += info
-                    projectArtifactEntries += row.fileName to File(row.storedPath)
+        val projectDirId = resumeCheckpoint?.projectDirId?.takeIf { it.isNotBlank() } ?: java.util.UUID.randomUUID().toString()
+        val startFileIndex = resumeCheckpoint?.currentFileIndex?.coerceIn(0, plan.files.size) ?: 0
+
+        // Rehydrate the real files already published in this project folder so
+        // later prompts see the same project memory after process death.
+        if (resumeCheckpoint != null) {
+            val existing = artifactFileManager.listProjectFiles(projectDirId).toMap()
+            for (planned in plan.files.take(startFileIndex)) {
+                val file = existing[planned.fileName]
+                if (file == null || !file.isFile) {
+                    postSystemNote(activeSessionId, "The saved checkpoint references ${planned.fileName}, but its real file is no longer on disk. I stopped rather than inventing or overwriting the missing file.")
+                    return false
                 }
+                val content = runCatching { file.readText(Charsets.UTF_8) }.getOrNull()
+                if (content == null) {
+                    postSystemNote(activeSessionId, "I could not safely read the previously generated ${planned.fileName}; the saved task was left untouched.")
+                    return false
+                }
+                generatedSoFar += planned.fileName to content
+                extractSignature(planned.fileName, content).takeIf { it.isNotBlank() }?.let { olderFileSignatures += it }
+                projectArtifactEntries += planned.fileName to file
+                artifactInfos += ArtifactInfo(
+                    id = java.util.UUID.randomUUID().toString(),
+                    fileName = planned.fileName,
+                    sizeBytes = file.length(),
+                    kind = classifyArtifact(planned.fileName),
+                    mimeType = mimeTypeForArtifact(planned.fileName),
+                    storedPath = file.absolutePath
+                )
+                fileSummaries += "- ${planned.fileName}: OK (restored)"
+            }
         }
 
         // "Worker phone as a tool" - bounded, opt-in real parallelism.
@@ -2300,7 +2051,8 @@ class ChatViewModel(
         // paired an enabled worker and turned on Remote/Auto mode in
         // Compute Bridge - nothing here changes behavior for anyone who
         // hasn't opted into Compute Bridge at all.
-        val canPrefetchSecondFileOnWorker = resumeExecution == null && plan.files.size >= 2 &&
+        val executionCheckpointId = resumeCheckpoint?.id ?: java.util.UUID.randomUUID().toString()
+        val canPrefetchSecondFileOnWorker = resumeCheckpoint == null && startFileIndex == 0 && plan.files.size >= 2 &&
             computeManager.mode != ComputeMode.LOCAL &&
             BrainEngine.isLoaded &&
             computeManager.pairedWorkers().any { it.enabled }
@@ -2336,13 +2088,11 @@ class ChatViewModel(
                 activeSessionId,
                 "Paired worker is available - writing ${plan.files[0].fileName} here and ${secondPlanned.fileName} on the worker phone at the same time."
             )
-            secondFilePrefetch = ChatTaskRuntimeScope.scope.async {
+            secondFilePrefetch = viewModelScope.async {
                 try {
                     generateFileContent(
                         secondPrompt,
                         forceMode = ComputeMode.REMOTE,
-                        fileName = secondPlanned.fileName,
-                        fileIndex = 1,
                         onChunkText = { partial ->
                             upsertBotMessage(
                                 prefetchCodeId,
@@ -2363,8 +2113,22 @@ class ChatViewModel(
         }
 
         for ((fileIndex, planned) in plan.files.withIndex()) {
-            if (fileIndex < resumeStartIndex) continue
-            activeExecutionId?.let { executionRepository.updateCursor(it, resumeExecution?.continuationPrompt ?: "", planned.fileName, 0, plan.files.size, fileIndex, serializeExecutionPlan(plan)) }
+            if (fileIndex < startFileIndex) continue
+            val checkpointId = executionCheckpointId
+            executionCheckpointRepository.savePaused(
+                id = checkpointId,
+                sessionId = activeSessionId,
+                kind = ExecutionCheckpointKind.MULTI_FILE,
+                originalRequest = originalRequest,
+                extraContext = extraContextBlock,
+                continuationPrompt = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.continuationPrompt else "",
+                planJson = PlanningEngine.toJson(plan),
+                currentFileIndex = fileIndex,
+                projectDirId = projectDirId,
+                planMessageId = planBotId,
+                currentFileName = planned.fileName,
+                partialOutput = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.partialOutput else ""
+            )
             if (contextFullHit) {
                 if (fileIndex == 1) secondFilePrefetch?.cancel()
                 fileSummaries += "- ${planned.fileName}: skipped (context window filled by earlier files this turn)"
@@ -2438,19 +2202,32 @@ class ChatViewModel(
             // fileIndex 1: when the prefetch is active, its generation
             // already started above - awaited here instead of starting a
             // second, redundant call for the same file.
-            val effectiveFilePrompt = if (resumeExecution != null && fileIndex == resumeStartIndex && resumeExecution.continuationPrompt.isNotBlank()) {
-                resumeExecution.continuationPrompt
-            } else filePrompt
+            val resumePartial = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.partialOutput else ""
+            val resumeContinuationPrompt = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.continuationPrompt.takeIf { it.isNotBlank() } else null
+            var lastCheckpointChars = resumePartial.length
+            val checkpointCallback: suspend (String) -> Unit = { partial ->
+                if (partial.length - lastCheckpointChars >= 512 || (partial.isNotBlank() && partial.length < 512)) {
+                    lastCheckpointChars = partial.length
+                    executionCheckpointRepository.updateProgress(
+                        checkpointId,
+                        continuationPrompt = filePrompt + "\n\nContinue this exact file from the following real partial output. Do not restart or replace it; continue it to a complete file.\n\n" + partial,
+                        currentFileIndex = fileIndex,
+                        currentFileName = planned.fileName,
+                        partialOutput = partial
+                    )
+                }
+            }
             val (rawOutput, stopReason) = try {
                 if (fileIndex == 1 && secondFilePrefetch != null) {
                     secondFilePrefetch.await()
                 } else {
                     generateFileContent(
-                        effectiveFilePrompt,
+                        if (resumeContinuationPrompt != null) resumeContinuationPrompt else filePrompt,
                         forceMode = if (fileIndex == 0 && secondFilePrefetch != null) ComputeMode.LOCAL else null,
-                        fileName = planned.fileName,
-                        fileIndex = fileIndex,
+                        initialOutput = resumePartial,
+                        initialContinuationPrompt = resumeContinuationPrompt,
                         onChunkText = { partial ->
+                            checkpointCallback(partial)
                             upsertBotMessage(
                                 codeBotId,
                                 ChatMessage(
@@ -2465,11 +2242,15 @@ class ChatViewModel(
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
-                completeStep(creatingStepId, failed = true, label = "Failed: ${planned.fileName}")
-                fileSummaries += "- ${planned.fileName}: generation failed (${e.message ?: e::class.java.simpleName})"
-                continue
+                completeStep(creatingStepId, failed = true, label = "Paused: ${planned.fileName} failed")
+                postSystemNote(activeSessionId, "${planned.fileName} hit a real generation error: ${e.message ?: e::class.java.simpleName}. The checkpoint is saved; reply \"continue\" to retry this file safely.")
+                return false
             }
-            if (stopReason == "context_full") contextFullHit = true
+            if (stopReason == "context_full" || stopReason == "timeout" || stopReason == "error" || stopReason == "thermal_pause" || stopReason == "chunk_cap") {
+                completeStep(creatingStepId, failed = true, label = "Paused ${planned.fileName}: $stopReason")
+                postSystemNote(activeSessionId, "${planned.fileName} could not be completed safely ($stopReason). The real project checkpoint is saved; reply \"continue\" to resume this file instead of starting over.")
+                return false
+            }
 
             val extracted = ArtifactExtractor.extract(rawOutput)
             var content = extracted.firstOrNull()?.content ?: rawOutput.trim()
@@ -2493,44 +2274,18 @@ class ChatViewModel(
                 )
             }
             if (content.isBlank()) {
-                completeStep(creatingStepId, failed = true, label = "Failed: ${planned.fileName}")
-                fileSummaries += "- ${planned.fileName}: model returned no real content"
-                continue
+                completeStep(creatingStepId, failed = true, label = "Paused: ${planned.fileName} returned no content")
+                postSystemNote(activeSessionId, "${planned.fileName} returned no real content. The project checkpoint is saved; reply \"continue\" after checking the model/device state.")
+                return false
             }
             if (ProjectTypeGate.isWebAppCreationRequest(originalRequest)) {
                 val webContract = FileValidator.validateWebAppArtifact(planned.fileName, content)
                 if (!webContract.passed) {
                     completeStep(creatingStepId, failed = true, label = "Rejected wrong output: ${planned.fileName}")
                     fileSummaries += "- ${planned.fileName}: rejected - ${webContract.issues.joinToString("; ")}"
-                    continue
+                    postSystemNote(activeSessionId, "${planned.fileName} failed the real web-project contract check. I stopped before writing dependent files; reply \"continue\" after reviewing the saved task.")
+                    return false
                 }
-            }
-            if (stopReason == "timeout" || stopReason == "error" || stopReason == "thermal_pause" || stopReason == "chunk_cap" || stopReason == "context_full") {
-                completeStep(creatingStepId, failed = true, label = "Incomplete ${planned.fileName}")
-                fileSummaries += "- ${planned.fileName}: incomplete generation ($stopReason); file was not saved"
-                if (stopReason == "thermal_pause") {
-                    val pauseId = UUID.randomUUID().toString()
-                    val pausedStatus = (ThermalMonitor.state.value as? com.brain.offlineai.engine.thermal.ThermalReading.Level)?.status ?: -1
-                    thermalPauseRepository.savePaused(
-                        id = pauseId,
-                        sessionId = activeSessionId,
-                        continuationPrompt = activeExecutionId?.let { executionRepository.get(it) }?.continuationPrompt.orEmpty(),
-                        pausedAtStatus = pausedStatus,
-                        now = System.currentTimeMillis()
-                    )
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.PAUSED) }
-                    postSystemNote(activeSessionId, "Project work paused because the device is genuinely running hot. It will resume automatically after the real thermal status becomes safe.")
-                    BrainEngine.pauseForThermal()
-                } else if (stopReason == "timeout" || stopReason == "chunk_cap") {
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.PAUSED) }
-                    postSystemNote(activeSessionId, "${planned.fileName} stopped after a real no-progress timeout. The saved task cursor remains on this file; reply 'continue' to resume it.")
-                } else {
-                    activeExecutionId?.let { executionRepository.mark(it, AgentExecutionStatus.FAILED) }
-                    if (stopReason == "context_full") {
-                        postSystemNote(activeSessionId, "${planned.fileName} reached the model's real context limit before it was complete. Increase Context Length or split this file/task into smaller real units, then retry.")
-                    }
-                }
-                break
             }
             completeStep(creatingStepId, label = "Created ${planned.fileName}")
 
@@ -2564,7 +2319,7 @@ class ChatViewModel(
                         append("Reply with exactly one fenced code block containing the complete, corrected file, and nothing else.")
                     }
                     val (fixedRaw, fixStopReason) = try {
-                        generateFileContent(fixPrompt, fileName = planned.fileName, fileIndex = fileIndex)
+                        generateFileContent(fixPrompt)
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
@@ -2593,7 +2348,8 @@ class ChatViewModel(
                 // rejected. A failed validation is a real build failure, not
                 // a reason to publish known-bad source.
                 fileSummaries += "- ${planned.fileName}: rejected - ${result.issues.joinToString("; ")}"
-                continue
+                postSystemNote(activeSessionId, "${planned.fileName} still has real validation issues after the allowed fixes. The checkpoint is saved at this file; reply \"continue\" after the task is corrected.")
+                return false
             }
 
             val signature = extractSignature(planned.fileName, content)
@@ -2605,7 +2361,8 @@ class ChatViewModel(
                 is ToolGateway.GatewayResult.Success -> write.value
                 is ToolGateway.GatewayResult.Denied -> {
                     fileSummaries[fileSummaries.lastIndex] = "- ${planned.fileName}: could not be saved (${write.reason})"
-                    continue
+                    postSystemNote(activeSessionId, "${planned.fileName} was generated but could not be saved safely: ${write.reason}. The checkpoint is preserved; reply \"continue\" to retry the saved file.")
+                    return false
                 }
             }
             val info = ArtifactInfo(
@@ -2631,17 +2388,13 @@ class ChatViewModel(
             )
             artifactInfos += info
             projectArtifactEntries += planned.fileName to file
-            activeExecutionId?.let { id ->
-                executionRepository.updateCursor(
-                    id = id,
-                    continuationPrompt = "",
-                    currentFileName = plan.files.getOrNull(fileIndex + 1)?.fileName ?: "",
-                    currentChunk = 0,
-                    totalChunks = plan.files.size,
-                    currentFileIndex = fileIndex + 1,
-                    planJson = activePlanJson
-                )
-            }
+            executionCheckpointRepository.updateProgress(
+                checkpointId,
+                continuationPrompt = "",
+                currentFileIndex = fileIndex + 1,
+                currentFileName = plan.files.getOrNull(fileIndex + 1)?.fileName ?: "",
+                partialOutput = ""
+            )
         }
 
         val testingStepId = pushRunning(ProcessMarking.TESTING, "Checking all files against the plan")
@@ -2725,7 +2478,11 @@ class ChatViewModel(
         )
         upsertBotMessage(planBotId, finalMessage)
         persistMessage(activeSessionId, finalMessage)
-        return if (buildPassed) MultiFileBuildOutcome.COMPLETED else MultiFileBuildOutcome.FAILED
+        resumeCheckpoint?.let { executionCheckpointRepository.delete(it.id) }
+        // New builds use the same checkpoint id created for their last file;
+        // delete the still-open row now that every planned file is real and verified.
+        executionCheckpointRepository.getPaused(activeSessionId)?.takeIf { it.kind == ExecutionCheckpointKind.MULTI_FILE }?.let { executionCheckpointRepository.delete(it.id) }
+        return true
     }
 
     /**
@@ -2898,7 +2655,7 @@ class ChatViewModel(
         private const val CHUNK_MAX_TOKENS = 1024
 
         /** Real floor of context room reserved for the reply itself when estimating how much prompt a chunk can safely carry. */
-        private const val RESERVED_OUTPUT_MARGIN_TOKENS = 128
+        private const val RESERVED_OUTPUT_MARGIN_TOKENS = 64
 
         /**
          * Bug fix (user request - "chunk max ho jae or kaam bach jae toh
@@ -2927,7 +2684,7 @@ class ChatViewModel(
          * generous real headroom while keeping a single pathological file
          * from starving every other file still queued in the same build.
          */
-        private const val MAX_FILE_CONTINUATION_CHUNKS = 64
+        private const val MAX_FILE_CONTINUATION_CHUNKS = 16
 
         /**
          * Weakness-review fix, issue 6 - "fix sirf ek attempt". Real, fixed
@@ -3294,121 +3051,49 @@ class ChatViewModel(
      */
     private suspend fun runZipDiagnosis(activeSessionId: String, zipInfo: AttachmentInfo, request: String, webContext: String): Boolean {
         val inspection = ZipProjectInspector.inspect(zipInfo.storedPath, request)
-        if (inspection.selectedFiles.isEmpty()) {
-            postSystemNote(activeSessionId, "I could not read supported source/config files from ${zipInfo.fileName}; no bug claim was made.")
-            return false
-        }
-
+        if (inspection.selectedFiles.isEmpty()) { postSystemNote(activeSessionId, "I could not read supported source/config files from ${zipInfo.fileName}; no bug claim was made."); return true }
         val botId = nextId++
         val steps = mutableListOf<ProcessStep>()
         fun publish() = upsertBotMessage(botId, ChatMessage(botId, "", false, timeNow(), BotMessageState.PROCESS, processSteps = steps.toList()))
-        fun add(mark: ProcessMarking, label: String): Long {
-            val id = (steps.maxOfOrNull { it.id } ?: 0L) + 1
-            steps += ProcessStep(id, mark, ProcessStepStatus.RUNNING, label)
-            publish()
-            return id
-        }
-        fun finish(id: Long, label: String, failed: Boolean = false) {
-            val i = steps.indexOfFirst { it.id == id }
-            if (i >= 0) steps[i] = steps[i].copy(status = if (failed) ProcessStepStatus.FAILED else ProcessStepStatus.COMPLETE, label = label)
-            publish()
-        }
-
-        val readId = add(ProcessMarking.READING, "Reading ${inspection.selectedFiles.size} relevant real files (${inspection.totalFiles} readable files found)")
+        fun add(mark: ProcessMarking, label: String): Long { val id = (steps.maxOfOrNull { it.id } ?: 0L) + 1; steps += ProcessStep(id, mark, ProcessStepStatus.RUNNING, label); publish(); return id }
+        fun finish(id: Long, label: String, failed: Boolean = false) { val i = steps.indexOfFirst { it.id == id }; if (i >= 0) steps[i] = steps[i].copy(status = if (failed) ProcessStepStatus.FAILED else ProcessStepStatus.COMPLETE, label = label); publish() }
+        val readId = add(ProcessMarking.READING, "Inspecting ${inspection.selectedFiles.size} relevant real files (${inspection.totalFiles} readable files found)")
         val settings = settingsRepository.getSettings()
         val contextSize = (BrainEngine.state.value as? EngineState.Loaded)?.contextSize ?: settings.contextLength
         val findings = mutableListOf<String>()
-
-        // Never put four 6k-character files plus web results into one prompt.
-        // That was a direct cause of the video failure: the deterministic ZIP
-        // inspection succeeded, but the first model pass could receive more text
-        // than the real context window could safely hold. Two compact files per
-        // pass keeps the model call genuinely bounded while still walking every
-        // selected file in order.
-        val filePasses = inspection.selectedFiles.chunked(2)
-        for ((index, chunk) in filePasses.withIndex()) {
-            val stepId = add(ProcessMarking.ANALYZING, "Analysing pass ${index + 1}/${filePasses.size} · ${chunk.joinToString(", ") { it.name.substringAfterLast('/') }}")
+        for ((index, chunk) in inspection.selectedFiles.chunked(4).withIndex()) {
             val prompt = buildString {
                 append("Perform a real software bug review. User request: ").append(request).append("\n")
-                append("Inspect ONLY the supplied files. Find only evidence-supported bugs, broken references, integration risks, configuration problems, or missing wiring. Do not invent unseen code. If no issue is supported by the supplied evidence, say NO CONFIRMED ISSUE. For each finding use FILE, EVIDENCE, IMPACT, MINIMAL FIX PLAN.\n")
-                if (webContext.isNotBlank()) append("External reference (use only if relevant):\n").append(webContext.take(700)).append("\n")
-                chunk.forEach { file ->
-                    append("--- ").append(file.name).append(" ---\n")
-                    append(file.content.take(2600))
-                    if (file.content.length > 2600) append("\n... [file content clipped for this model pass]")
-                    append("\n--- End ").append(file.name).append(" ---\n")
-                }
+                append("This is inspection pass ${index + 1}. Find only evidence-supported errors, bugs, broken references, integration risks, configuration problems, or missing wiring in these real files. Do not invent unseen code. For each finding give FILE, EVIDENCE, IMPACT, and MINIMAL FIX PLAN. If none, say NO CONFIRMED ISSUE.\n")
+                if (webContext.isNotBlank()) append(webContext.take(3500)).append("\n")
+                chunk.forEach { append("--- ${it.name} ---\n").append(it.content).append("\n--- End ${it.name} ---\n") }
             }
-            val budget = chunkTokenBudget(contextSize, prompt).coerceAtMost(700)
-            if (budget <= 0) {
-                finish(stepId, "Skipped: prompt would exceed the real context window", true)
-                findings += "PASS ${index + 1}: model pass skipped because the real context budget was full."
-                continue
-            }
-            val out = StringBuilder()
-            var reason = "max_tokens"
+            val stepId = add(ProcessMarking.ANALYZING, "Analyzing inspection pass ${index + 1}")
+            val budget = chunkTokenBudget(contextSize, prompt).coerceAtMost(900)
+            if (budget <= 0) { finish(stepId, "Skipped: context window full", true); continue }
+            val out = StringBuilder(); var reason = "max_tokens"
             try {
-                val ok = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                    computeManager.generate(prompt, budget, settings.temperature.coerceAtMost(0.25f), settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
-                        .collect { out.append(it) }
-                }
+                val ok = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress -> computeManager.generate(prompt, budget, settings.temperature.coerceAtMost(0.25f), settings.topP, onStopReason = { reason = it }, onProgress = onProgress).collect { out.append(it) } }
                 if (ok == null) reason = "timeout"
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                reason = e.message?.take(100) ?: "error"
-            }
-            if (out.isNotBlank()) {
-                findings += "PASS ${index + 1} (${chunk.joinToString(", ") { it.name }}):\n${out.toString().take(3200)}"
-                finish(stepId, "Pass ${index + 1} produced evidence")
-            } else {
-                findings += "PASS ${index + 1} (${chunk.joinToString(", ") { it.name }}): no model finding produced (real stop: $reason)."
-                finish(stepId, "Pass ${index + 1} produced no model output ($reason)", true)
-            }
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { reason = "error" }
+            findings += if (out.isNotBlank()) "PASS ${index + 1}:\n$out" else "PASS ${index + 1}: no finding produced (stop=$reason)."
+            finish(stepId, if (out.isNotBlank()) "Inspection pass ${index + 1} complete" else "Inspection pass ${index + 1} incomplete", out.isBlank())
         }
         finish(readId, "Inspected ${inspection.selectedFiles.size} real files; ${inspection.omittedReadableFiles} readable files were not sent to the model")
-
-        val synthesisId = add(ProcessMarking.DEBUGGING, "Synthesising evidence without adding unseen files")
-        val evidenceBlock = findings.joinToString("\n\n").take(9000)
-        val synthesisPrompt = buildString {
-            append("Synthesize a real bug report from ONLY the evidence below. Do not claim files were reviewed unless they appear in the evidence. Separate CONFIRMED BUGS from RISKS and UNKNOWN. For each confirmed bug give FILE, EVIDENCE, ROOT CAUSE, IMPACT, MINIMAL FIX PLAN. End with an ordered change plan. Do not output modified source code.\n")
-            append("Project: ").append(zipInfo.fileName).append("; readable files: ").append(inspection.totalFiles).append("; model-inspected files: ").append(inspection.selectedFiles.size).append("; omitted: ").append(inspection.omittedReadableFiles).append(".\n\n")
-            append(evidenceBlock)
-        }
-        val final = StringBuilder()
-        var finalReason = "max_tokens"
+        val synthesisId = add(ProcessMarking.DEBUGGING, "Building root-cause and impact plan")
+        val synthesisPrompt = "Synthesize this evidence into a real bug report. Do not claim unseen files were reviewed. Separate CONFIRMED BUGS from RISKS. For each confirmed item give FILE, EVIDENCE, ROOT CAUSE, IMPACT, and MINIMAL FIX PLAN. End with an ordered change plan that protects unrelated files. Do not output modified source code.\nProject=${zipInfo.fileName}; readable=${inspection.totalFiles}; model-inspected=${inspection.selectedFiles.size}; omitted=${inspection.omittedReadableFiles}.\n\n${findings.joinToString("\n\n")}"
+        val final = StringBuilder(); var finalReason = "max_tokens"
         try {
-            val budget = chunkTokenBudget(contextSize, synthesisPrompt).coerceAtMost(1100)
-            if (budget > 0) {
-                val ok = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                    computeManager.generate(synthesisPrompt, budget, settings.temperature.coerceAtMost(0.2f), settings.topP, onStopReason = { finalReason = it }, onProgress = onProgress)
-                        .collect { final.append(it) }
-                }
-                if (ok == null) finalReason = "timeout"
-            } else finalReason = "context_full"
-        } catch (e: kotlinx.coroutines.CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            finalReason = e.message?.take(100) ?: "error"
-        }
-
-        if (final.isBlank()) {
-            finish(synthesisId, "Synthesis unavailable ($finalReason)", true)
-            val text = "Diagnosis completed the real inspection passes, but the final synthesis produced no output.\n\n" + findings.joinToString("\n\n")
-            val message = ChatMessage(botId, text.take(12000), false, timeNow(), BotMessageState.TEXT, processSteps = steps.toList())
-            upsertBotMessage(botId, message)
-            persistMessage(activeSessionId, message)
-            return true
-        }
-
+            val budget = chunkTokenBudget(contextSize, synthesisPrompt).coerceAtMost(1400)
+            if (budget > 0) { val ok = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress -> computeManager.generate(synthesisPrompt, budget, settings.temperature.coerceAtMost(0.2f), settings.topP, onStopReason = { finalReason = it }, onProgress = onProgress).collect { final.append(it) } }; if (ok == null) finalReason = "timeout" }
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { finalReason = "error" }
+        if (final.isBlank()) { finish(synthesisId, "Synthesis unavailable ($finalReason)", true); val m = ChatMessage(botId, "Diagnosis passes completed, but final synthesis did not finish.\n\n${findings.joinToString("\n\n")}", false, timeNow(), BotMessageState.TEXT, processSteps = steps.toList()); upsertBotMessage(botId, m); persistMessage(activeSessionId, m); return true }
         finish(synthesisId, "Root-cause and impact plan prepared")
-        val verifyId = add(ProcessMarking.VERIFYING, "Checking that the report labels real evidence")
-        val verified = final.contains("FILE", true) || final.contains("CONFIRMED", true) || final.contains("UNKNOWN", true)
-        finish(verifyId, if (verified) "Evidence labels present" else "Manual verification still required", !verified)
+        val verifyId = add(ProcessMarking.VERIFYING, "Checking evidence labels")
+        val verified = final.contains("FILE", true) || final.contains("CONFIRMED", true)
+        finish(verifyId, if (verified) "Diagnosis evidence check passed" else "Diagnosis needs manual verification", !verified)
         val message = ChatMessage(botId, final.toString(), false, timeNow(), BotMessageState.TEXT, processSteps = steps.toList())
-        upsertBotMessage(botId, message)
-        persistMessage(activeSessionId, message)
-        return true
+        upsertBotMessage(botId, message); persistMessage(activeSessionId, message); return true
     }
 
     private suspend fun runMultiTaskMessage(activeSessionId: String, taskTexts: List<String>, attachmentContext: String = "") {
@@ -3481,7 +3166,7 @@ class ChatViewModel(
         // (for example a new function plus its caller/wiring). Accept only
         // explicitly named real ZIP entries; never guess a filename. The primary
         // resolved target remains the fallback for a single unnamed fence.
-        val entries = toolGateway.listZipEntries(zipEditTarget.zipStoredPath, maxEntries = 5000).filter { !it.isDirectory }
+        val entries = toolGateway.listZipEntries(zipEditTarget.zipStoredPath, maxEntries = Int.MAX_VALUE).filter { !it.isDirectory }
         val byBaseName = entries.associateBy { it.name.substringAfterLast('/').lowercase() }
         val replacements = linkedMapOf<String, Pair<String, String>>()
         for (candidate in candidates) {
@@ -4180,14 +3865,9 @@ class ChatViewModel(
         if (!wantsFile && !wantsZip) return false
         val wantsFileOutput = wantsFile || wantsZip
 
-        val previousBot = messages.value.asReversed().drop(1).firstOrNull {
-            !it.isUser && it.text.isNotBlank() && (it.state == BotMessageState.TEXT || it.state == BotMessageState.CODE_DONE)
-        }
-        val previousArtifactBot = messages.value.asReversed().drop(1).firstOrNull {
-            !it.isUser && it.artifacts.isNotEmpty() && (it.state == BotMessageState.TEXT || it.state == BotMessageState.CODE_DONE)
-        }
-        val existingArtifacts = previousArtifactBot?.artifacts.orEmpty()
-        val sourceText = previousBot?.text.orEmpty()
+        val previousUser = messages.value.asReversed().drop(1).firstOrNull { it.isUser && it.text.isNotBlank() }
+        val previousBot = messages.value.asReversed().drop(1).firstOrNull { !it.isUser && it.text.isNotBlank() }
+        val existingArtifacts = previousBot?.artifacts.orEmpty()
 
         if (wantsZip && existingArtifacts.isNotEmpty()) {
             val nonZipArtifacts = existingArtifacts.filterNot { it.fileName.endsWith(".zip", ignoreCase = true) }
@@ -4215,15 +3895,37 @@ class ChatViewModel(
             return true
         }
 
-        if (!wantsFileOutput || previousBot == null) {
-            if (wantsFileOutput) {
-                postSystemNote(activeSessionId, "I need a real previous assistant file/code result before I can save or ZIP it. I won't turn your instruction itself into a file.")
-                return true
-            }
-            return false
+        if (!wantsFileOutput) return false
+
+        // Prefer the immediately previous assistant result when it actually
+        // contains a real fenced/code artifact. A common follow-up is
+        // "file me do" after the bot has just written code; looking only at
+        // the previous user message would re-save the user's instruction
+        // instead of the code they asked the bot to produce. If the bot did
+        // not produce an extractable block, fall back to the previous user
+        // message so the existing "I wrote the code myself, now save it"
+        // workflow still works.
+        val previousBotCandidates = previousBot?.let { ArtifactExtractor.extract(it.text) }.orEmpty()
+        val previousUserCandidates = previousUser?.let { ArtifactExtractor.extract(it.text) }.orEmpty()
+        val source = when {
+            previousBotCandidates.isNotEmpty() -> previousBot!!
+            previousUserCandidates.isNotEmpty() -> previousUser!!
+            else -> null
         }
-        val candidates = ArtifactExtractor.extract(sourceText)
-        val blocks = if (candidates.isNotEmpty()) candidates else listOf(ArtifactCandidate(inferSnippetFileName(request, sourceText), sourceText.trim()))
+        if (source == null) {
+            postSystemNote(
+                activeSessionId,
+                "I couldn't find a real code/file block in the previous messages to save. " +
+                    "Paste the code or tell me which existing artifact you want saved."
+            )
+            return true
+        }
+        val candidates = ArtifactExtractor.extract(source.text)
+        val blocks = if (candidates.isNotEmpty()) {
+            candidates
+        } else {
+            listOf(ArtifactCandidate(inferSnippetFileName(request, source.text), source.text.trim()))
+        }
         val usable = blocks.filter { it.content.isNotBlank() }
         if (usable.isEmpty()) {
             postSystemNote(activeSessionId, "I couldn't find real code/text in the previous message to save as a file.")
@@ -4274,8 +3976,9 @@ class ChatViewModel(
         }
     }
 
-    private suspend fun runWebSearch(activeSessionId: String, query: String): String {
-        return when (val outcome = webSearchRepository.search(query)) {
+    private suspend fun runWebSearch(activeSessionId: String, plan: WebSearchTrigger.SearchPlan): String {
+        val query = plan.query
+        return when (val outcome = webSearchRepository.search(query, plan.includeDomains)) {
             is WebSearchOutcome.Unavailable -> {
                 // Weakness-review fix - staying silent when no key is even
                 // configured is still the right default (zero noise for
@@ -4285,11 +3988,12 @@ class ChatViewModel(
                 // expect to run was skipped this turn, rather than just
                 // getting a reply that quietly has no web context at all.
                 if (webSearchRepository.hasStoredKey()) {
-                    postSystemNote(activeSessionId, "Web search skipped this turn (${outcome.reason}) - continuing offline.")
+                    postSystemNote(activeSessionId, "🌐 Web search off · ${outcome.reason} · continuing offline")
                 }
                 ""
             }
             is WebSearchOutcome.Success -> {
+                val rankedResults = WebSearchContextBuilder.rankResults(query, outcome.results)
                 val botId = nextId++
                 // Keep the actual query and every actual returned URL in the
                 // expandable process card. A generic "search complete"
@@ -4301,10 +4005,10 @@ class ChatViewModel(
                             id = 1L,
                             marking = ProcessMarking.SEARCHING,
                             status = ProcessStepStatus.COMPLETE,
-                            label = "Searched: \"$query\" (${outcome.results.size} result${if (outcome.results.size == 1) "" else "s"})"
+                            label = "Searched: \"$query\" (${rankedResults.size} relevant result${if (rankedResults.size == 1) "" else "s"})"
                         )
                     )
-                    outcome.results.forEachIndexed { index, result ->
+                    rankedResults.forEachIndexed { index, result ->
                         add(
                             ProcessStep(
                                 id = (index + 2).toLong(),
@@ -4321,11 +4025,10 @@ class ChatViewModel(
                 )
                 upsertBotMessage(botId, message)
                 persistMessage(activeSessionId, message)
-                postSystemNote(activeSessionId, WebSearchContextBuilder.buildSearchingSummary(query, outcome.results.size))
-                WebSearchContextBuilder.buildContextBlock(query, outcome.results, outcome.answer)
+                WebSearchContextBuilder.buildContextBlock(query, rankedResults, null)
             }
             is WebSearchOutcome.Failed -> {
-                postSystemNote(activeSessionId, "Web search failed (${outcome.reason}) - continuing offline.")
+                postSystemNote(activeSessionId, "🌐 Web search failed · ${outcome.reason} · continuing offline")
                 ""
             }
         }

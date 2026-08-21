@@ -11,6 +11,9 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.brain.offlineai.R
 
+/** Foreground priority for user-requested on-device AI inference. The manifest
+ * uses Android's real specialUse type because model inference/coding work is
+ * neither a short task nor data synchronization. */
 class ChatTaskForegroundService : Service() {
 
     override fun onCreate() {

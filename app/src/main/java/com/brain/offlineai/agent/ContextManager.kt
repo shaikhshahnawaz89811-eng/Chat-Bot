@@ -14,7 +14,7 @@ import com.brain.offlineai.data.attachments.AttachmentContentReader
  * from data this app already genuinely read: Chunk 1 reuses Phase 19's
  * own [ProjectContextLoader] output verbatim (Master Plan §4 - "do not
  * duplicate an existing abstraction before inspecting/reusing it"), and
- * Additional chunks are real, bounded groups of a ZIP's own real entry names
+ * the remaining chunks are real, bounded groups of a ZIP's own real entry names
  * (from [AttachmentContentReader.listZipEntries], already real since
  * Phase 14) - never file *content*, since a chunk here exists specifically
  * for the case a project's own real entry count/listing is too large to
@@ -24,9 +24,10 @@ import com.brain.offlineai.data.attachments.AttachmentContentReader
  * of that, since one chunk is one of several real pieces shown together
  * in the same conversation, not the app's single largest allowed read).
  *
- * The sequence has no arbitrary maximum: every real entry is assigned to a
- * bounded group, so a larger project naturally creates more chunks and a
- * completed project naturally stops when the real entries are exhausted.
+ * There is no fixed chunk ceiling. Chunk 1 is the real structure summary and
+ * the remaining chunks are real entry-name groups sized from the same safe
+ * character bound. A larger project therefore creates more chunks instead of
+ * silently dropping its tail.
  */
 data class ContextChunk(
     val index: Int,
@@ -88,7 +89,7 @@ object ContextManager {
 
         val chunks = mutableListOf(ContextChunk(index = 1, total = 0, title = "Project structure", body = chunk1Body))
 
-        // Additional chunks - real, bounded groups of the ZIP's own real file
+        // Remaining chunks - real, bounded groups of the ZIP's own real file
         // names in the ZIP's own real order (never reordered/prioritized
         // by a guess about which file "matters more").
         val groups = groupEntriesBySafeSize(files, SAFE_CHUNK_CHARS)
@@ -106,14 +107,11 @@ object ContextManager {
         }
 
         val total = chunks.size
-        val finalized = chunks.mapIndexed { i, chunk ->
-            chunk.copy(total = total, body = chunk.body)
-        }
+        val finalized = chunks.map { chunk -> chunk.copy(total = total) }
         return ChunkPlan(chunks = finalized, totalFiles = files.size, displayName = displayName)
     }
 
-    /** Real, deterministic grouping. The number of chunks grows with the real ZIP size;
-     * there is deliberately no arbitrary five-chunk ceiling. */
+    /** Real, deterministic grouping - closes a group once adding the next real entry would exceed [maxCharsPerGroup]. There is deliberately no fixed chunk-count ceiling: a larger real project produces more real chunks and a finished project produces no further chunks. */
     private fun groupEntriesBySafeSize(
         files: List<AttachmentContentReader.ZipEntrySummary>,
         maxCharsPerGroup: Int
@@ -135,7 +133,7 @@ object ContextManager {
         return groups
     }
 
-    /** Real "Context Info Box" - the real chunk/file counts [buildChunkPlan] already computed, shown once before the chunk sequence starts, per compact Context Info Box -> dynamic chunk sequence -> Complete flow. */
+    /** Real compact chunk/index summary. */
     fun buildContextInfoBox(plan: ChunkPlan): String =
         "Context Info Box: ${plan.displayName} is too large for a single safe read " +
             "(Rule 20) - splitting into ${plan.chunks.size} real chunks covering " +
@@ -143,5 +141,5 @@ object ContextManager {
 
     /** Real "Complete" marker closing the chunk sequence Master Plan §3 describes. */
     fun buildCompleteNote(plan: ChunkPlan): String =
-        "Complete - all ${plan.chunks.size} chunks of ${plan.displayName} reviewed. Continuing with your request now."
+        "Indexing complete - ${plan.displayName}: ${plan.totalFiles} files indexed across ${plan.chunks.size} display chunks. Continuing with the requested task."
 }

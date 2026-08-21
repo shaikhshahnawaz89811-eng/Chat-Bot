@@ -41,9 +41,14 @@ enum class ErrorCategory(
         userSuggestion = "No action needed - send a new message when you're ready.",
         retryable = false
     ),
+    GENERATION_STALLED(
+        rootCauseLabel = "Generation stalled without native progress",
+        userSuggestion = "The task was paused safely. Continue from the saved point, or shorten the context if it happens again.",
+        retryable = false
+    ),
     DECODE_ERROR(
-        rootCauseLabel = "The native decode step failed",
-        userSuggestion = "This can be a one-off native hiccup - a single automatic retry was attempted.",
+        rootCauseLabel = "The native decode step returned a real decode error",
+        userSuggestion = "This is a real native decode error; one bounded retry may recover a transient failure.",
         retryable = true
     ),
     UNKNOWN(
@@ -66,8 +71,9 @@ fun classifyGenerationError(error: Throwable): ErrorCategory {
         error is IllegalStateException && message.contains("no model loaded") -> ErrorCategory.NO_MODEL_LOADED
         error is OutOfMemoryError -> ErrorCategory.OUT_OF_MEMORY
         message.contains("out of memory") || message.contains("oom") -> ErrorCategory.OUT_OF_MEMORY
+        message.contains("timeout") || message.contains("timed out") || message.contains("stalled") || message.contains("did not become idle") -> ErrorCategory.GENERATION_STALLED
         message.contains("cancel") -> ErrorCategory.CANCELLED
-        message.contains("decode") || message.contains("native") -> ErrorCategory.DECODE_ERROR
+        message.contains("decode") -> ErrorCategory.DECODE_ERROR
         else -> ErrorCategory.UNKNOWN
     }
 }

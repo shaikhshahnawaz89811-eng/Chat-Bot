@@ -34,16 +34,21 @@ object TavilySearchClient {
 
     private const val SEARCH_URL = "https://api.tavily.com/search"
     private const val TIMEOUT_MS = 15_000
-    private const val MAX_RESULTS = 5
+    private const val MAX_RESULTS = 3
+    private const val CHUNKS_PER_SOURCE = 1
 
     /** Real POST to Tavily's real endpoint. Returns a real [WebSearchOutcome.Success]/[WebSearchOutcome.Failed] - never a fabricated result. */
-    suspend fun search(apiKey: String, query: String): WebSearchOutcome = withContext(Dispatchers.IO) {
+    suspend fun search(apiKey: String, query: String, includeDomains: List<String> = emptyList()): WebSearchOutcome = withContext(Dispatchers.IO) {
         try {
             val requestBody = JSONObject().apply {
                 put("query", query)
                 put("max_results", MAX_RESULTS)
+                put("chunks_per_source", CHUNKS_PER_SOURCE)
                 put("search_depth", "basic")
-                put("include_answer", true)
+                put("topic", "general")
+                put("include_answer", false)
+                put("include_raw_content", false)
+                put("include_domains", JSONArray(includeDomains))
             }
             val (code, responseText) = post(apiKey, requestBody)
             if (code != HttpURLConnection.HTTP_OK) {

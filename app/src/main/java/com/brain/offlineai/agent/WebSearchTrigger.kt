@@ -1,97 +1,138 @@
 package com.brain.offlineai.agent
 
 /**
- * Phase 22 (Master Plan v2, revised scope - PROGRESS.md's own Phase 19
- * Plan section, "Phase 22 note", records the exact real trigger rule this
- * object implements). A plain, deterministic Kotlin function over the
- * user's own real message text - never a model call asking "should I
- * search?" - the same conservative, no-ungrounded-guess posture
- * [TaskSplitter]/[InputNormalizer]/[AgentClarificationGate] already
- * established for themselves. A search is never triggered "just because"
- * on an ordinary, already-clear message; both real checks below are
- * intentionally narrow, so a false negative (a message that could have
- * used a search but didn't trigger one) just means an ordinary offline
- * generation runs - the same safe default this app has always had.
+ * Deterministic web-search planner. Web search is a tool, not a default
+ * second brain: ordinary coding, project inspection, ZIP bug-fixing and
+ * artifact operations stay local. A search is requested only when the user
+ * explicitly asks for online/current/documentation information, or when a
+ * brand-new creation request names a concrete build target and the search
+ * can supply useful current/official implementation references.
  */
 object WebSearchTrigger {
 
-    // Real creation-intent keywords (English + common Hinglish, matching
-    // this project's own existing keyword lists e.g. TaskSplitter's
-    // sequential connectors, ZipEditResolver's edit-intent words).
     private val CREATE_KEYWORDS = listOf(
-        "build", "create", "make me", "develop", "generate", "banao", "banade", "bana do"
+        "build", "create", "make me", "develop", "generate", "banao", "banade", "bana do", "बना", "बनाओ"
     )
 
-    // Real signals that the request is underspecified/needs current,
-    // outside-the-model information to act on safely - not a general
-    // "sounds vague" guess, a fixed, narrow phrase list only.
-    private val UNFAMILIAR_SIGNALS = listOf(
-        "latest", "current version", "newest", "recommended library", "best library",
-        "which library", "which framework", "up to date", "up-to-date", "most recent"
+    private val BUILD_TARGET_WORDS = ProjectTypeGate.BUILD_TARGET_WORDS_PUBLIC
+
+    private val EXPLICIT_WEB_SIGNALS = listOf(
+        "search web", "web search", "search online", "look online", "look it up online",
+        "search internet", "internet search", "online search", "find online", "web par search",
+        "net par search", "google it", "latest", "current version", "current docs",
+        "official docs", "official documentation", "documentation", "docs", "research online",
+        "up to date", "up-to-date", "most recent", "newest"
     )
 
-    // Real inspection-intent keywords for the existing-project case - the
-    // user is asking what something *is*, not asking for an edit (edit
-    // intent already has its own, separate real gate - see
-    // ZipEditResolver/AgentClarificationGate, both untouched by this file).
-    private val INSPECT_KEYWORDS = listOf(
-        "what is", "what does", "how does", "explain", "look up", "search for", "find out about",
-        "error", "bug", "issue", "problem", "galt", "galat", "dhoondo", "dhundo", "dundo",
-        "dekho", "check karo", "fix", "fix karo"
+    private val INSPECTION_SEARCH_SIGNALS = listOf(
+        "search web", "web search", "search online", "look online", "find online",
+        "official docs", "official documentation", "documentation", "docs", "latest",
+        "current version", "current api", "current sdk", "up to date", "up-to-date",
+        "most recent", "newest"
     )
 
-    /**
-     * Real trigger case 1 - "New-project understanding" (PROGRESS.md's
-     * own heaviest real use case). Only fires when the message genuinely
-     * contains BOTH a real creation-intent keyword AND a real signal that
-     * the request needs current/outside information - a plain "build me
-     * a calculator app" (fully answerable from the offline model alone)
-     * never triggers this.
-     */
-    fun newProjectSearchQuery(normalizedText: String): String? {
-        val lower = normalizedText.lowercase()
-        val hasCreateIntent = CREATE_KEYWORDS.any { lower.contains(it) }
-        val hasUnfamiliarSignal = UNFAMILIAR_SIGNALS.any { lower.contains(it) }
-        if (!hasCreateIntent || !hasUnfamiliarSignal) return null
-        return normalizedText.trim()
-    }
+    data class SearchPlan(
+        val query: String,
+        val includeDomains: List<String> = emptyList()
+    )
 
-    /**
-     * Real trigger case 2 - "Existing-project inspection" (PROGRESS.md's
-     * own situational, lighter real use case). Only fires when the
-     * message brought a real ZIP attachment this same turn AND contains a
-     * real inspection-intent keyword - a plain ZIP upload with no such
-     * keyword takes Phase 14's existing listing/routing path unchanged,
-     * completely unaffected by this object.
-     */
+    fun newProjectSearchQuery(normalizedText: String): String? =
+        plan(normalizedText, hasZipAttachment = false)?.query
+
     fun existingProjectSearchQuery(normalizedText: String, hasZipAttachment: Boolean): String? {
         if (!hasZipAttachment) return null
         val lower = normalizedText.lowercase()
-        if (INSPECT_KEYWORDS.none { lower.contains(it) }) return null
-        return normalizedText.trim()
+        return if (INSPECTION_SEARCH_SIGNALS.any { lower.contains(it) }) {
+            buildPlan(normalizedText, forExistingProject = true).query
+        } else {
+            null
+        }
     }
 
-    /**
-     * Phase 25 (user request - "user jo bhi bole jaise website ya apk vo
-     * net search bhi karta hai, agar na ho toh koi bhi nahin, agar hai toh
-     * search kare or jankari nikale"). A real, wider trigger than
-     * [newProjectSearchQuery] above: fires on genuine creation intent +
-     * a real build-target word ([ProjectTypeGate]'s own fixed lists,
-     * reused rather than duplicated) with NO [UNFAMILIAR_SIGNALS]
-     * requirement - "build me a website" now genuinely searches too, not
-     * just "build me a website with the latest framework". Still only
-     * ever attempted with a real stored key AND real device connectivity
-     * (see [com.brain.offlineai.data.websearch.WebSearchRepository] /
-     * [com.brain.offlineai.data.websearch.ConnectivityChecker]) - "agar na
-     * ho toh koi bhi nahin" is exactly what that existing real check
-     * already gives: no key or no internet means this silently does zero
-     * extra work and generation stays fully offline, same as before.
-     */
-    fun buildTargetSearchQuery(normalizedText: String): String? {
+    /** Kept for existing callers; unlike the old implementation this returns a focused query. */
+    fun buildTargetSearchQuery(normalizedText: String): String? =
+        plan(normalizedText, hasZipAttachment = false)?.query
+
+    /** Single entry point used by ChatViewModel so trigger and query shaping cannot drift apart. */
+    fun plan(normalizedText: String, hasZipAttachment: Boolean): SearchPlan? {
         val lower = normalizedText.lowercase()
-        val hasCreationIntent = ProjectTypeGate.CREATION_KEYWORDS_PUBLIC.any { lower.contains(it) }
-        val hasBuildTarget = ProjectTypeGate.BUILD_TARGET_WORDS_PUBLIC.any { lower.contains(it) }
-        if (!hasCreationIntent || !hasBuildTarget) return null
-        return normalizedText.trim()
+        if (hasZipAttachment) {
+            if (INSPECTION_SEARCH_SIGNALS.none { lower.contains(it) }) return null
+            return buildPlan(normalizedText, forExistingProject = true)
+        }
+
+        val hasCreateIntent = CREATE_KEYWORDS.any { lower.contains(it) }
+        val hasBuildTarget = BUILD_TARGET_WORDS.any { lower.contains(it) }
+        val explicitlyWantsWeb = EXPLICIT_WEB_SIGNALS.any { lower.contains(it) }
+
+        // An explicit web-search request is always eligible, even when it
+        // is phrased as a research question rather than a build request.
+        // Conversely, a creation target alone is NOT permission to search:
+        // ordinary requests such as "create web app" stay local.
+        if (explicitlyWantsWeb) {
+            return buildPlan(normalizedText, forExistingProject = false)
+        }
+        if (!hasCreateIntent || !hasBuildTarget) return null
+        return null
+    }
+
+    private fun buildPlan(text: String, forExistingProject: Boolean): SearchPlan {
+        val lower = text.lowercase()
+        val target = when {
+            listOf("android", "apk", "jetpack compose", "kotlin android").any { lower.contains(it) } -> "Android Kotlin app development"
+            listOf("flutter", "dart").any { lower.contains(it) } -> "Flutter Dart app development"
+            listOf("react", "next.js", "nextjs").any { lower.contains(it) } -> "React web app development"
+            listOf("vue", "nuxt").any { lower.contains(it) } -> "Vue web app development"
+            listOf("node", "node.js", "nodejs").any { lower.contains(it) } -> "Node.js backend development"
+            listOf("python", "django", "flask").any { lower.contains(it) } -> "Python web application development"
+            listOf("ios", "swift").any { lower.contains(it) } -> "iOS Swift app development"
+            "firebase" in lower -> "Firebase official documentation"
+            "supabase" in lower -> "Supabase official documentation"
+            "github api" in lower || "github" in lower -> "GitHub API official documentation"
+            listOf("api", "backend", "server").any { lower.contains(it) } -> "backend API development"
+            listOf("website", "web app", "webapp", "web site").any { lower.contains(it) } -> "modern web app development"
+            else -> "software development"
+        }
+
+        val query = if (forExistingProject) {
+            // Keep the user's concrete problem terms, but make the query a
+            // documentation/reference lookup rather than sending the whole
+            // ZIP-edit instruction verbatim to search.
+            "$target ${searchProblemTerms(text)}"
+        } else {
+            // For a new-project request, preserve the user's actual technical
+            // terms instead of searching only a generic phrase like
+            // "modern web app development". This makes an explicit search
+            // for "service worker", "Firebase auth", etc. actually retrieve
+            // material about that requested part of the build.
+            "$target ${searchProblemTerms(text)} official documentation current implementation guidance"
+        }
+
+        return SearchPlan(query = query.trim(), includeDomains = domainsFor(target))
+    }
+
+    private fun searchProblemTerms(text: String): String {
+        val cleaned = text
+            .replace(Regex("(?i)\\b(search web|web search|search online|look online|find online|latest|current version|official docs?|official documentation|up[- ]to[- ]date|most recent|newest)\\b"), " ")
+            .replace(Regex("(?i)\\b[A-Za-z0-9._-]+\\.zip\\b"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return cleaned.take(180).ifBlank { "current API and integration guidance" }
+    }
+
+    private fun domainsFor(target: String): List<String> = when {
+        target.startsWith("Android Kotlin") -> listOf("developer.android.com", "kotlinlang.org")
+        target.startsWith("Flutter") -> listOf("docs.flutter.dev", "dart.dev")
+        target.startsWith("React") -> listOf("react.dev", "vite.dev", "developer.mozilla.org")
+        target.startsWith("Vue") -> listOf("vuejs.org", "vite.dev", "developer.mozilla.org")
+        target.startsWith("Node.js") -> listOf("nodejs.org", "developer.mozilla.org")
+        target.startsWith("Python") -> listOf("docs.python.org", "docs.djangoproject.com", "flask.palletsprojects.com")
+        target.startsWith("iOS") -> listOf("developer.apple.com", "swift.org")
+        target.startsWith("Firebase") -> listOf("firebase.google.com")
+        target.startsWith("Supabase") -> listOf("supabase.com")
+        target.startsWith("GitHub API") -> listOf("docs.github.com")
+        target.startsWith("backend") -> listOf("developer.mozilla.org", "nodejs.org", "fastapi.tiangolo.com")
+        target.startsWith("modern web") -> listOf("developer.mozilla.org", "web.dev", "vite.dev")
+        else -> emptyList()
     }
 }

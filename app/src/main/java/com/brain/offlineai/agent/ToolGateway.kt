@@ -45,7 +45,7 @@ class ToolGateway(private val context: Context) {
 
     // ---- LOW-risk reads (uniform entry point, no audit row - see class doc) ----
 
-    suspend fun listZipEntries(storedPath: String, maxEntries: Int = 5000): List<AttachmentContentReader.ZipEntrySummary> =
+    suspend fun listZipEntries(storedPath: String, maxEntries: Int = Int.MAX_VALUE): List<AttachmentContentReader.ZipEntrySummary> =
         AttachmentContentReader.listZipEntries(storedPath, maxEntries)
 
     suspend fun readZipEntry(storedPath: String, entryName: String): String? =

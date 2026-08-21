@@ -18,7 +18,7 @@ class WebSearchRepository(context: Context) {
     private val appContext = context.applicationContext
     private val keyStore = WebSearchKeyStore(appContext)
 
-    suspend fun search(query: String): WebSearchOutcome {
+    suspend fun search(query: String, includeDomains: List<String> = emptyList()): WebSearchOutcome {
         if (!keyStore.isSearchEnabled()) {
             return WebSearchOutcome.Unavailable("Web search is disabled")
         }
@@ -27,7 +27,7 @@ class WebSearchRepository(context: Context) {
         if (!ConnectivityChecker.hasInternet(appContext)) {
             return WebSearchOutcome.Unavailable("No internet connectivity")
         }
-        return TavilySearchClient.search(apiKey, query)
+        return TavilySearchClient.search(apiKey, query, includeDomains)
     }
 
     fun hasStoredKey(): Boolean = keyStore.hasKey()

@@ -5,7 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.brain.offlineai.agent.AgentAuditRepository
 import com.brain.offlineai.agent.AgentTaskRepository
-import com.brain.offlineai.agent.AgentExecutionRepository
+import com.brain.offlineai.agent.ExecutionCheckpointRepository
 import com.brain.offlineai.agent.ProjectTypePauseRepository
 import com.brain.offlineai.agent.ThermalPauseRepository
 import com.brain.offlineai.data.artifacts.ArtifactRepository
@@ -42,7 +42,6 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
     // question would otherwise become an orphan row with no session left
     // to resume it.
     private val agentTaskRepository = AgentTaskRepository(application)
-    private val agentExecutionRepository = AgentExecutionRepository(application)
 
     // Phase 21 - same real cleanup for the tool-call audit trail (see
     // ToolGateway): a deleted session's real audit rows would otherwise
@@ -59,6 +58,9 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
     // Phase 24 - real cleanup for a deleted session's real project-type-gate row.
     private val projectTypePauseRepository = ProjectTypePauseRepository(application)
 
+    // Persisted execution checkpoints must die with the session they belong to.
+    private val executionCheckpointRepository = ExecutionCheckpointRepository(application)
+
     val sessions = repository.observeSessions()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
@@ -68,10 +70,10 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
             attachmentRepository.deleteForSession(sessionId)
             artifactRepository.deleteForSession(sessionId)
             agentTaskRepository.deleteForSession(sessionId)
-            agentExecutionRepository.deleteForSession(sessionId)
             agentAuditRepository.deleteForSession(sessionId)
             thermalPauseRepository.deleteForSession(sessionId)
             projectTypePauseRepository.deleteForSession(sessionId)
+            executionCheckpointRepository.deleteForSession(sessionId)
             repository.deleteSession(sessionId)
         }
     }

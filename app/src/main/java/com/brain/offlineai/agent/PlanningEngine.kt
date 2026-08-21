@@ -1,5 +1,8 @@
 package com.brain.offlineai.agent
 
+import org.json.JSONArray
+import org.json.JSONObject
+
 /**
  * Phase 25 (real multi-file planning - user-requested: "pehle plan banaye,
  * phir tukdo me tode, phir alag-alag file likhe, language samjhe"). Closes
@@ -22,7 +25,7 @@ package com.brain.offlineai.agent
  */
 object PlanningEngine {
 
-    /** No everyday file-count ceiling: the real model plan determines how many files the project genuinely needs. Native/context limits still bound how much one plan response can actually describe. */
+    /** No artificial file-count ceiling: every real parsed file remains in the plan and the execution loop handles files independently. */
 
     /** A plan needs at least this many real, parsed files to be worth the multi-file pipeline - a 1-file "plan" is really just an ordinary single-response request, so [parsePlan] returns null below this and the caller falls back to the existing single-response flow unchanged. */
     private const val MIN_FILES_FOR_MULTI_FILE = 2
@@ -130,12 +133,42 @@ object PlanningEngine {
                 )
             )
         }
+        // Unknown project types must not be turned into invented files. The
+        // caller will ask the user for the missing platform/stack instead of
+        // manufacturing a `main.txt` artifact that was never requested.
         return null
     }
 
     /** Real, deterministic fallback only for the rare case [langLine] genuinely didn't have a matching line for this file - never a guess about content, just the file's own real extension. */
     private fun languageFromExtension(fileName: String): String =
         fileName.substringAfterLast('.', "").ifBlank { "text" }
+
+    /** Stable, real JSON representation used only for persisted task resume. */
+    fun toJson(plan: FilePlan): String {
+        val array = JSONArray()
+        plan.files.forEach { file ->
+            array.put(JSONObject().apply {
+                put("fileName", file.fileName)
+                put("language", file.language)
+                put("purpose", file.purpose)
+            })
+        }
+        return JSONObject().put("files", array).toString()
+    }
+
+    /** Exact inverse of [toJson]; invalid persisted state is rejected, never guessed. */
+    fun fromJson(json: String): FilePlan? = runCatching {
+        val array = JSONObject(json).optJSONArray("files") ?: return@runCatching null
+        val files = (0 until array.length()).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            val name = item.optString("fileName").trim()
+            val language = item.optString("language").trim()
+            val purpose = item.optString("purpose").trim()
+            if (!looksLikeFileName.matches(name) || language.isBlank()) null
+            else PlannedFile(name, language, purpose)
+        }.distinctBy { it.fileName }
+        if (files.size < MIN_FILES_FOR_MULTI_FILE) null else FilePlan(files)
+    }.getOrNull()
 
     /** Real, short summary line posted to the user before per-file generation starts - same "route/plan before acting, never a silent internal decision" standard this app already holds itself to. */
     fun buildPlanSummary(plan: FilePlan): String {

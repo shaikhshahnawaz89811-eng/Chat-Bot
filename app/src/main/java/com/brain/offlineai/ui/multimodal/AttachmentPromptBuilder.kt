@@ -48,24 +48,28 @@ object AttachmentPromptBuilder {
                 }
                 AttachmentKind.ZIP -> when {
                     info == null -> "(attachment metadata unavailable)"
-                    // Phase 20 (Context Manager) - a large ZIP is never
-                    // dumped wholesale into the model prompt. The visible
-                    // chat card reports the real dynamic chunk count, while
-                    // this prompt carries only the bounded structure summary;
-                    // actual source content is read later by the deterministic
-                    // project inspector for the task that genuinely needs it.
+                    // Phase 20 (Context Manager) - this ZIP's real entry
+                    // listing was too large for a single safe read; the
+                    // caller already ran the real Chunk 1-5 sequence as
+                    // its own visible SYSTEM_NOTEs (see ChatViewModel) and
+                    // hands back only Chunk 1's own bounded structure
+                    // summary here, instead of the unbounded raw entry
+                    // dump below - never both at once.
                     chunkedZipSummaries.containsKey(route.attachmentId) ->
-                        "Project structure (entry list is split into real dynamic chunks; source files are inspected on demand):\n" +
+                        "Project structure (full entry list shown separately via the chunked context above):\n" +
                             chunkedZipSummaries.getValue(route.attachmentId)
                     else -> {
                         val entries = AttachmentContentReader.listZipEntries(info.storedPath)
                         if (entries.isEmpty()) {
                             "(ZIP entry list could not be read)"
                         } else {
-                            val entryLines = entries.joinToString("\n") { entry ->
+                            val visibleEntries = entries.take(60)
+                            val entryLines = visibleEntries.joinToString("\n") { entry ->
                                 if (entry.isDirectory) "- ${entry.name}" else "- ${entry.name} (${entry.sizeBytes} bytes)"
                             }
-                            "Contains ${entries.size} entr${if (entries.size == 1) "y" else "ies"}:\n$entryLines"
+                            val omitted = entries.size - visibleEntries.size
+                            "Contains ${entries.size} entr${if (entries.size == 1) "y" else "ies"}:\n$entryLines" +
+                                if (omitted > 0) "\n(+ $omitted real entries omitted from the generic prompt; targeted inspection will read relevant files when needed.)" else ""
                         }
                     }
                 }

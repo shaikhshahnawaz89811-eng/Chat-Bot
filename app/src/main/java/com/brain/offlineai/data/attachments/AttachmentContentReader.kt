@@ -44,7 +44,6 @@ object AttachmentContentReader {
     )
 
     private const val MAX_TEXT_PREVIEW_BYTES = 8_000
-    private const val MAX_ZIP_ENTRIES = 200
     private const val MAX_PDF_PREVIEW_CHARS = 8_000
 
     fun isTextReadable(fileName: String): Boolean =
@@ -110,12 +109,12 @@ object AttachmentContentReader {
 
     /**
      * Real ZIP entry listing (names/sizes only, bounded to
-     * [MAX_ZIP_ENTRIES]) read straight from the real ZIP bytes already on
+     * [maxEntries]) read straight from the real ZIP bytes already on
      * disk. An empty list means the file genuinely couldn't be read as a
      * ZIP - never a fabricated "no files found" claim about a ZIP this app
      * never actually opened.
      */
-    suspend fun listZipEntries(storedPath: String, maxEntries: Int = MAX_ZIP_ENTRIES): List<ZipEntrySummary> =
+    suspend fun listZipEntries(storedPath: String, maxEntries: Int = Int.MAX_VALUE): List<ZipEntrySummary> =
         withContext(Dispatchers.IO) {
             val file = File(storedPath)
             if (!file.exists() || !file.isFile) return@withContext emptyList()

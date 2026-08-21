@@ -124,8 +124,11 @@ class LocalApiServer(
         } else {
             val text = runBlocking {
                 val builder = StringBuilder()
-                BrainEngine.generate(prompt, maxTokens, temperature, topP, formatAsChat = false).collect { builder.append(it) }
+                BrainEngine.generate(prompt, maxTokens, temperature, topP).collect { builder.append(it) }
                 builder.toString()
+            }
+            if (text.isBlank()) {
+                return jsonError(Response.Status.SERVICE_UNAVAILABLE, "generation_no_output", "The loaded model produced no output.")
             }
             val body = JSONObject()
                 .put("id", completionId)
@@ -170,7 +173,7 @@ class LocalApiServer(
         Thread {
             try {
                 runBlocking {
-                    BrainEngine.generate(prompt, maxTokens, temperature, topP, formatAsChat = false).collect { token ->
+                    BrainEngine.generate(prompt, maxTokens, temperature, topP).collect { token ->
                         val chunk = JSONObject()
                             .put("id", completionId)
                             .put("object", "chat.completion.chunk")
