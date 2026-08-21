@@ -1920,6 +1920,70 @@ class ChatViewModel(
             upsertBotMessage(planBotId, ChatMessage(id = planBotId, text = "", isUser = false, timestamp = timeNow(), state = BotMessageState.PROCESS, processSteps = steps.toList()))
         }
 
+        // Weakness-review fix, issue 2 - real, bounded auto-continue for a
+        // single file's own generation, same genuine "re-send prompt +
+        // everything real generated so far, ask for another real chunk"
+        // shape [streamRealResponse]'s own main loop already uses, just
+        // capped at [MAX_FILE_CONTINUATION_CHUNKS] instead of
+        // [MAX_CONTINUATION_CHUNKS] - one planned file that stops on
+        // "max_tokens" now keeps genuinely asking for more of itself
+        // instead of silently being handed back to [FileValidator] as if
+        // it were finished. Returns the real, concatenated content plus
+        // the real final stop reason ("end_of_generation", "context_full",
+        // "chunk_cap", or "error").
+        suspend fun generateFileContent(
+            prompt: String,
+            forceMode: ComputeMode? = null,
+            onChunkText: (String) -> Unit = {}
+        ): Pair<String, String> {
+            val builder = StringBuilder()
+            var continuationPrompt = prompt
+            var reason = "max_tokens"
+            var chunk = 0
+            while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
+                chunk++
+                if (ThermalPolicy.decide(ThermalMonitor.state.value) == ThermalAction.UNLOAD_AND_PAUSE) {
+                    reason = "thermal_pause"
+                    break
+                }
+                val budget = chunkTokenBudget(loadedContextSize, continuationPrompt)
+                if (budget <= 0) {
+                    reason = "context_full"
+                    break
+                }
+                var chunkReason = "max_tokens"
+                // Bug fix (user request - same "working card hangs" issue
+                // as [streamRealResponse], see [GENERATION_CHUNK_TIMEOUT_MS]'s
+                // own doc) - this per-file call had no ceiling either, so a
+                // slow/stuck prefill on one planned file could leave the
+                // whole multi-file build (CREATING step) stuck with no way
+                // out, the same way the fixed planning call used to.
+                try {
+                    val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
+                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature.coerceAtMost(0.35f), topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
+                            .collect {
+                                builder.append(it)
+                                onChunkText(builder.toString())
+                            }
+                    }
+                    if (timedOutOrNull == null) {
+                        reason = "timeout"
+                        break
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    reason = if (e.message?.contains("context window") == true) "context_full" else "error"
+                    break
+                }
+                reason = chunkReason
+                continuationPrompt = prompt + "\n\n" + builder.toString()
+            }
+            if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
+            return builder.toString() to reason
+        }
+
+
         fun extractSignature(fileName: String, code: String): String {
             val names = extractDeclarationNames(code).take(8).toList()
             return if (names.isEmpty()) "" else "$fileName defines: ${names.joinToString(", ")}"
