@@ -19,6 +19,9 @@ class WebSearchRepository(context: Context) {
     private val keyStore = WebSearchKeyStore(appContext)
 
     suspend fun search(query: String): WebSearchOutcome {
+        if (!keyStore.isSearchEnabled()) {
+            return WebSearchOutcome.Unavailable("Web search is disabled")
+        }
         val apiKey = keyStore.getKey()
             ?: return WebSearchOutcome.Unavailable("No Tavily API key configured")
         if (!ConnectivityChecker.hasInternet(appContext)) {

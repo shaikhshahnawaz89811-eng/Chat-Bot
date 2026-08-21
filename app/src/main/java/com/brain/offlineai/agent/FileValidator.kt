@@ -124,6 +124,29 @@ object FileValidator {
     }
 
     /**
+     * Real deterministic contract check for a web-app response. It does not
+     * claim semantic correctness; it only rejects an obviously wrong artifact
+     * type such as a shell installer when the user's actual request was a web app.
+     */
+    fun validateWebAppArtifact(fileName: String, content: String): ValidationResult {
+        val issues = mutableListOf<String>()
+        val ext = fileName.substringAfterLast('.', "").lowercase()
+        val lower = content.lowercase()
+        if (ext in setOf("sh", "bash", "zsh", "bat", "ps1")) {
+            issues += "shell script is not a web-app source file"
+        }
+        if (ext == "html" || ext == "htm") {
+            if (!(lower.contains("<html") || lower.contains("<!doctype html") || lower.contains("<body") || lower.contains("<main") || lower.contains("<div"))) {
+                issues += "file is tagged as HTML but contains no recognizable HTML structure"
+            }
+        }
+        if (lower.contains("pip install ") || lower.contains("apt install ") || lower.contains("npm install ") || lower.contains("sudo ")) {
+            issues += "contains terminal installation commands instead of web-app source"
+        }
+        return ValidationResult(fileName, issues.isEmpty(), issues)
+    }
+
+    /**
      * Real, best-effort counter over `{ } ( ) [ ]` - not a full language
      * parser, so it's a heuristic (same honest posture
      * [com.brain.offlineai.ui.screens.chat.ChatViewModel]'s own
@@ -260,7 +283,7 @@ object FileValidator {
                         problems += "</$tagName> has no matching open <$tagName>"
                     }
                 } else if (!isSelfClosing && tagName !in VOID_ELEMENTS) {
-                    stack.addLast(tagName)
+                    stack.add(tagName)
                 }
             }
             i = tagEnd + 1

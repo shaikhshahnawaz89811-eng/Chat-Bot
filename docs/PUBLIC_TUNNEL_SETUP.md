@@ -13,31 +13,24 @@ exec-permission rules only apply to files that were packaged into the
 APK's `jniLibs` folder at build time. So the binary has to be part of the
 project once, before building.
 
-## One-time steps (on your build machine / in your repo, not on the phone)
+## Build-time dependency
 
-1. Download the real `cloudflared` **Linux ARM64** binary (this project
-   only builds for `arm64-v8a`, per `app/build.gradle.kts`) from
-   Cloudflare's own releases:
-   `https://github.com/cloudflare/cloudflared/releases`
-   → look for a file named like `cloudflared-linux-arm64`
+The repository deliberately does **not** ship a prebundled cloudflared file.
+That prevents an accidental wrong-architecture executable from ever being
+installed in the APK. The GitHub Actions workflow downloads Cloudflare's
+official latest `cloudflared-linux-arm64` release, verifies that the downloaded
+file is an ARM64/aarch64 executable, marks it executable, and then runs the
+normal Android build.
 
-2. Rename it to `libcloudflared.so`
-   (Android's packager only accepts `.so`-named files under `jniLibs` —
-   the name is just a required extension, it's still the real cloudflared
-   binary, unmodified otherwise).
+The source URL is Cloudflare's official release endpoint:
+`https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64`
 
-3. Place it at:
-   ```
-   app/src/main/jniLibs/arm64-v8a/libcloudflared.so
-   ```
-
-4. Make sure it's executable in git (some setups need this explicitly):
-   ```bash
-   chmod +x app/src/main/jniLibs/arm64-v8a/libcloudflared.so
-   git update-index --chmod=+x app/src/main/jniLibs/arm64-v8a/libcloudflared.so
-   ```
-
-5. Commit and push. GitHub Actions builds the APK with the binary baked in.
+If you build outside GitHub Actions, add the same real ARM64 binary at:
+```
+app/src/main/jniLibs/arm64-v8a/libcloudflared.so
+```
+and make it executable before building. Never replace it with an x86-64
+binary just because the filename is `libcloudflared.so`.
 
 ## After that
 Install the APK → open Brain → Local API → **Start**. The Local API

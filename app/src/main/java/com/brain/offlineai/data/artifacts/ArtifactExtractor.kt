@@ -90,7 +90,21 @@ object ArtifactExtractor {
     private fun resolveFileName(rawTag: String, index: Int): String {
         if (rawTag.isNotBlank() && filenameTagPattern.matches(rawTag)) return rawTag
         val languageTag = rawTag.lowercase()
-        val extension = extensionForLanguage[languageTag] ?: "txt"
-        return "artifact_${index + 1}.$extension"
+        return when (languageTag) {
+            "html" -> "index.html"
+            "css" -> "styles.css"
+            "javascript", "js" -> "script.js"
+            "typescript", "ts" -> "script.ts"
+            "kotlin", "kt" -> "Main.kt"
+            "java" -> "Main.java"
+            "python", "py" -> "main.py"
+            "json" -> "data.json"
+            "xml" -> "layout.xml"
+            "bash", "sh", "shell" -> "script.sh"
+            else -> {
+                val extension = extensionForLanguage[languageTag] ?: "txt"
+                "artifact_${index + 1}.$extension"
+            }
+        }
     }
 }

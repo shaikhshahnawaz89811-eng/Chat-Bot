@@ -75,6 +75,18 @@ object ProjectTypeGate {
      * English one already was - not a second, stricter bar just because
      * of the language used.
      */
+    /** True only for explicit web-site/app creation wording. */
+    fun isWebAppCreationRequest(text: String): Boolean {
+        val lower = text.lowercase()
+        return isCreationRequest(text) && listOf(
+            "web app", "webapp", "website", "web site", "html css", "html/js", "html css js"
+        ).any { lower.contains(it) }
+    }
+
+    /** Real coding prompts should be sampled more conservatively than casual prose. */
+    fun isCodeCreationRequest(text: String): Boolean =
+        isCreationRequest(text) || listOf("code", "coding", "program", "script", "html", "css", "javascript", "kotlin", "python", "java").any { text.lowercase().contains(it) }
+
     fun explicitlyRequestsMultipleFiles(text: String): Boolean {
         val lower = text.lowercase()
         val explicitMultiFileWords = listOf(

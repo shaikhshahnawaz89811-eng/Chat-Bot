@@ -1123,10 +1123,18 @@ class ChatViewModel(
                         // real chance to finish inside [GENERATION_CHUNK_TIMEOUT_MS]
                         // instead of needing a second, even-longer timeout
                         // to give up on.
+                        val codingContract = if (ProjectTypeGate.isWebAppCreationRequest(processingText)) {
+                            "\n\n--- Web app output contract ---\n" +
+                                "Generate the requested web app itself. Return complete, runnable web source code, not shell commands or installation instructions. " +
+                                "For a simple web app, prefer exactly one complete HTML file and use a filename-style fence such as ```index.html. " +
+                                "Do not output pip/npm/apt commands, terminal setup, or unrelated scripts unless the user explicitly asks for them. " +
+                                "Do not invent placeholder code. If CSS or JavaScript is genuinely needed, include it in the HTML or only when the user explicitly requested separate files.\n" +
+                                "--- End web app output contract ---"
+                        } else ""
                         val trimmedStreamExtraContext = if (extraContextBlock.length > STREAM_EXTRA_CONTEXT_CHAR_CAP) {
                             extraContextBlock.take(STREAM_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this reply)"
                         } else extraContextBlock
-                        streamRealResponse(activeSessionId, processingText + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
+                        streamRealResponse(activeSessionId, processingText + codingContract + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -1441,7 +1449,7 @@ class ChatViewModel(
                         computeManager.generate(
                             continuationPrompt,
                             maxTokens = chunkBudget,
-                            temperature = settings.temperature,
+                            temperature = if (ProjectTypeGate.isCodeCreationRequest(prompt)) settings.temperature.coerceAtMost(0.35f) else settings.temperature,
                             topP = settings.topP,
                             onStopReason = { chunkStopReason = it },
                             onProgress = onProgress
@@ -1819,7 +1827,7 @@ class ChatViewModel(
             if (budget <= 0) return "" to "context_full"
             var reason = "max_tokens"
             val builder = StringBuilder()
-            computeManager.generate(prompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
+            computeManager.generate(prompt, maxTokens = budget, temperature = settings.temperature.coerceAtMost(0.35f), topP = settings.topP, onStopReason = { reason = it }, onProgress = onProgress)
                 .collect { builder.append(it) }
             return builder.toString() to reason
         }
@@ -1860,7 +1868,7 @@ class ChatViewModel(
                 // out, the same way the fixed planning call used to.
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature, topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
+                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature.coerceAtMost(0.35f), topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
                             .collect { builder.append(it) }
                     }
                     if (timedOutOrNull == null) {
@@ -2174,6 +2182,14 @@ class ChatViewModel(
                 completeStep(creatingStepId, failed = true, label = "Failed: ${planned.fileName}")
                 fileSummaries += "- ${planned.fileName}: model returned no real content"
                 continue
+            }
+            if (ProjectTypeGate.isWebAppCreationRequest(originalRequest)) {
+                val webContract = FileValidator.validateWebAppArtifact(planned.fileName, content)
+                if (!webContract.passed) {
+                    completeStep(creatingStepId, failed = true, label = "Rejected wrong output: ${planned.fileName}")
+                    fileSummaries += "- ${planned.fileName}: rejected - ${webContract.issues.joinToString("; ")}"
+                    continue
+                }
             }
             if (stopReason == "timeout" || stopReason == "error" || stopReason == "thermal_pause") {
                 completeStep(creatingStepId, failed = true, label = "Incomplete ${planned.fileName}")
@@ -2579,7 +2595,7 @@ class ChatViewModel(
          * for a short, load-bearing snippet - a URL, a key fact, a code
          * signature - never the full original dump).
          */
-        private const val FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 600
+        private const val FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 400
 
         /**
          * Bug fix (user request - planning step could hang forever with no
@@ -2623,21 +2639,21 @@ class ChatViewModel(
          * file list, but still a real, bounded snippet rather than the
          * whole thing.
          */
-        private const val PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 1500
+        private const val PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP = 1000
 
         /**
          * Bug fix (user request - fallback single-response reply after a
          * planning timeout still looked stuck, because it was the one
          * real call site never given this same cap - see where this is
          * used above for the full explanation). Kept generous (bigger
-         * than [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 600 and
-         * [PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 1500) since a
+         * than [FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 400 and
+         * [PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP]'s 1000) since a
          * fallback reply is the ONE real call for this whole turn - no
          * per-file repetition to worry about - but still a real, bounded
          * ceiling rather than the raw, uncapped web-search/attachment
          * text.
          */
-        private const val STREAM_EXTRA_CONTEXT_CHAR_CAP = 2500
+        private const val STREAM_EXTRA_CONTEXT_CHAR_CAP = 1400
 
         /**
          * Bug fix (user request - "net search karta hai fir working card

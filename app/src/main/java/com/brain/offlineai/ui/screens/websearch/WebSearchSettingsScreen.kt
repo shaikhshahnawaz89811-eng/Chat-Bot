@@ -60,7 +60,23 @@ fun WebSearchSettingsScreen(
                 "never sends your project's source code to Tavily - only a short search query.",
             color = BrainTextMuted, style = MaterialTheme.typography.bodySmall
         )
-        Spacer(Modifier.height(20.dp))
+        Spacer(Modifier.height(16.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Web search", color = BrainTextPrimary, fontWeight = FontWeight.SemiBold)
+                Text(
+                    if (viewModel.searchEnabled) "Enabled when a validated key and internet are available." else "Disabled - no network search will be attempted.",
+                    color = BrainTextMuted,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+            Switch(checked = viewModel.searchEnabled, onCheckedChange = viewModel::setSearchEnabled)
+        }
+        Spacer(Modifier.height(16.dp))
 
         Column(
             modifier = Modifier

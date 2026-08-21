@@ -46,6 +46,12 @@ class WebSearchKeyStore(context: Context) {
 
     fun hasKey(): Boolean = getKey() != null
 
+    fun isSearchEnabled(): Boolean = prefs.getBoolean(KEY_SEARCH_ENABLED, true)
+
+    fun setSearchEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean(KEY_SEARCH_ENABLED, enabled).apply()
+    }
+
     fun saveKey(key: String) {
         prefs.edit().putString(KEY_TAVILY_API_KEY, key.trim()).apply()
     }
@@ -56,5 +62,6 @@ class WebSearchKeyStore(context: Context) {
 
     companion object {
         private const val KEY_TAVILY_API_KEY = "tavily_api_key"
+        private const val KEY_SEARCH_ENABLED = "web_search_enabled"
     }
 }

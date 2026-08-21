@@ -243,7 +243,7 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     // timeout/Stop can now actually interrupt prefill itself, not only
     // the decode-one-token-at-a-time loop below.
     std::string stopReason = "max_tokens";
-    const int kPrefillChunkTokens = 256;
+    const int kPrefillChunkTokens = 64;
     const int n_prompt = static_cast<int>(prompt_tokens.size());
     int n_fed = 0;
     bool prefillCancelled = false;

@@ -28,11 +28,19 @@ class WebSearchSettingsViewModel(application: Application) : AndroidViewModel(ap
     var hasStoredKey by mutableStateOf(keyStore.hasKey())
         private set
 
+    var searchEnabled by mutableStateOf(keyStore.isSearchEnabled())
+        private set
+
     var validationState by mutableStateOf(KeyValidationState.IDLE)
         private set
 
     var errorMessage by mutableStateOf<String?>(null)
         private set
+
+    fun setSearchEnabled(enabled: Boolean) {
+        keyStore.setSearchEnabled(enabled)
+        searchEnabled = enabled
+    }
 
     fun validateAndSaveKey(rawKey: String) {
         val key = rawKey.trim()
