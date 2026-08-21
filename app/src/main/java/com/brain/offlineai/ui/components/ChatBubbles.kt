@@ -148,32 +148,29 @@ fun BotTaskListBubble(message: ChatMessage) {
 @Composable
 fun BotSystemNoteBubble(message: ChatMessage) {
     val lines = message.text.lines()
-    val isChunkReport = lines.count { it.contains("Chunk ") } >= 2 || message.text.contains("Context Info Box")
+    val compactDetails = lines.size > 2 || message.text.length > 180 ||
+        lines.count { it.contains("Chunk ") } >= 2 || message.text.contains("Context Info Box")
     val scrollState = rememberScrollState()
-    LaunchedEffect(message.text) { if (isChunkReport) scrollState.scrollTo(scrollState.maxValue) }
-    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.4f)) {
-        if (isChunkReport) {
-            val title = lines.firstOrNull()?.take(120) ?: "Project context"
-            Text(title, color = BrainTextPrimary, style = MaterialTheme.typography.titleSmall, maxLines = 1)
-            Spacer(Modifier.height(6.dp))
+    LaunchedEffect(message.text) { if (compactDetails) scrollState.scrollTo(scrollState.maxValue) }
+    BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.4f), modifier = Modifier.widthIn(max = 300.dp)) {
+        val title = lines.firstOrNull()?.take(100)?.ifBlank { "Status" } ?: "Status"
+        Text(title, color = BrainTextPrimary, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+        if (compactDetails && lines.drop(1).joinToString("\n").isNotBlank()) {
+            Spacer(Modifier.height(5.dp))
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 180.dp)
+                    .heightIn(max = 150.dp)
                     .verticalScroll(scrollState)
                     .background(BrainBgPrimary, RoundedCornerShape(10.dp))
                     .padding(8.dp)
             ) {
-                Text(
-                    lines.drop(1).joinToString("\n"),
-                    color = BrainTextSecondary,
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text(lines.drop(1).joinToString("\n"), color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
             }
-        } else {
-            Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        } else if (!compactDetails) {
+            Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall)
         }
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.height(3.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
     }
 }

@@ -1,5 +1,6 @@
 package com.brain.offlineai.agent
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
@@ -16,5 +17,7 @@ data class AgentExecutionEntity(
     val currentChunk: Int,
     val totalChunks: Int,
     val createdAt: Long,
-    val updatedAt: Long
+    val updatedAt: Long,
+    @ColumnInfo(defaultValue = "0") val currentFileIndex: Int = 0,
+    @ColumnInfo(defaultValue = "''") val planJson: String = ""
 )

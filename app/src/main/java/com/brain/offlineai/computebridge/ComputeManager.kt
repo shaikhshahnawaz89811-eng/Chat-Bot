@@ -119,8 +119,11 @@ class ComputeManager(private val application: Application) {
                     onProgress()
                     emit(piece)
                 }
-                onStopReason(if (count >= maxTokens) "max_tokens" else "end_of_generation")
-                return@flow
+                if (count > 0) {
+                    onStopReason(if (count >= maxTokens) "max_tokens" else "end_of_generation")
+                    return@flow
+                }
+                lastError = IllegalStateException("Compute Bridge worker returned no output")
             } catch (t: Throwable) {
                 if (sawToken) throw t
                 lastError = t
@@ -145,7 +148,7 @@ class ComputeManager(private val application: Application) {
                 sawToken = true
                 emit(it)
             }
-            return@flow
+            if (sawToken) return@flow
         } catch (t: Throwable) {
             if (sawToken) throw t
         }

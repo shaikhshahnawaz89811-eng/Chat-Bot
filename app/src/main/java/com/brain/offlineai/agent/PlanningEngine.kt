@@ -22,8 +22,7 @@ package com.brain.offlineai.agent
  */
 object PlanningEngine {
 
-    /** Real, fixed safety ceiling on how many files one plan can drive - same "hard ceiling, not a real everyday limit" posture as [com.brain.offlineai.ui.screens.chat.ChatViewModel]'s own `MAX_CONTINUATION_CHUNKS`. A plan that names more is honestly truncated with a note, never silently generated in full. */
-    const val MAX_PLANNED_FILES = 20
+    /** No everyday file-count ceiling: the real model plan determines how many files the project genuinely needs. Native/context limits still bound how much one plan response can actually describe. */
 
     /** A plan needs at least this many real, parsed files to be worth the multi-file pipeline - a 1-file "plan" is really just an ordinary single-response request, so [parsePlan] returns null below this and the caller falls back to the existing single-response flow unchanged. */
     private const val MIN_FILES_FOR_MULTI_FILE = 2
@@ -90,11 +89,7 @@ object PlanningEngine {
 
         if (realFiles.size < MIN_FILES_FOR_MULTI_FILE) return null
 
-        return if (realFiles.size > MAX_PLANNED_FILES) {
-            FilePlan(files = realFiles.take(MAX_PLANNED_FILES), truncatedFromCount = realFiles.size)
-        } else {
-            FilePlan(files = realFiles)
-        }
+        return FilePlan(files = realFiles)
     }
 
     /**
@@ -135,12 +130,7 @@ object PlanningEngine {
                 )
             )
         }
-        return FilePlan(
-            files = listOf(
-                PlannedFile("README.md", "Markdown", "Project overview and run instructions"),
-                PlannedFile("main.txt", "Text", "Primary generated project content")
-            )
-        )
+        return null
     }
 
     /** Real, deterministic fallback only for the rare case [langLine] genuinely didn't have a matching line for this file - never a guess about content, just the file's own real extension. */
@@ -149,11 +139,7 @@ object PlanningEngine {
 
     /** Real, short summary line posted to the user before per-file generation starts - same "route/plan before acting, never a silent internal decision" standard this app already holds itself to. */
     fun buildPlanSummary(plan: FilePlan): String {
-        val header = if (plan.truncatedFromCount != null) {
-            "Planning complete: ${plan.files.size} files (model listed ${plan.truncatedFromCount}; capped at $MAX_PLANNED_FILES for this build)."
-        } else {
-            "Planning complete: ${plan.files.size} files."
-        }
+        val header = "Planning complete: ${plan.files.size} files."
         val lines = plan.files.joinToString("\n") { "- ${it.fileName} (${it.language})${if (it.purpose.isNotBlank()) " - ${it.purpose}" else ""}" }
         return "$header\n$lines"
     }

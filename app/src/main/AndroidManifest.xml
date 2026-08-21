@@ -3,8 +3,8 @@
 
     <!-- Phase 4: Local API Server. INTERNET is required for any socket bind
          even loopback-only (Android enforces this regardless of address);
-         the actual loopback-only restriction is enforced in code
-         (LocalApiServer binds "127.0.0.1" explicitly, never "0.0.0.0") and
+         the actual LAN exposure is protected by mandatory API-key authentication in code
+         (LocalApiServer binds "0.0.0.0" intentionally for paired devices) and
          in network_security_config.xml. FOREGROUND_SERVICE(+DATA_SYNC) lets
          the server keep running while the app is backgrounded, matching the
          mockup's "Works in Background" highlight badge. POST_NOTIFICATIONS

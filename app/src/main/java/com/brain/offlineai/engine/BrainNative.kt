@@ -27,6 +27,12 @@ object BrainNative {
 
     external fun nativeIsModelLoaded(): Boolean
 
+    /** Formats one real user message with the loaded GGUF model's own chat template.
+     * Returns null when the model has no supported template, so the caller can
+     * honestly fall back to the raw prompt rather than inventing a format.
+     */
+    external fun nativeApplyChatTemplate(prompt: String): String?
+
     /** Context window size (n_ctx) of the currently loaded model, or 0 if none. */
     external fun nativeGetContextSize(): Int
 
