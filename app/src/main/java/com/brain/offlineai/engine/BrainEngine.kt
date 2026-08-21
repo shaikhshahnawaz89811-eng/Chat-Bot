@@ -8,6 +8,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -46,6 +48,7 @@ object BrainEngine {
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
     val state: StateFlow<EngineState> = _state
     private val generationActive = AtomicBoolean(false)
+    private val lifecycleMutex = Mutex()
 
     private var backendReady = false
 
@@ -55,11 +58,19 @@ object BrainEngine {
      * (mmap + metadata parse) is CPU/IO-bound and can take several seconds
      * for a multi-hundred-MB GGUF file - never on the main thread.
      */
-    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 4096, nThreads: Int = 4) {
+    suspend fun loadModel(modelPath: String, modelDisplayName: String, nCtx: Int = 4096, nThreads: Int = 4) = lifecycleMutex.withLock {
+        if (!awaitGenerationIdle(120_000L)) {
+            _state.value = EngineState.Error("The current generation did not stop safely; model reload was not attempted.")
+            return@withLock
+        }
         _state.value = EngineState.Loading(modelDisplayName)
         withContext(Dispatchers.Default) {
             if (!backendReady) {
                 backendReady = BrainNative.nativeBackendInit()
+            }
+            if (!backendReady) {
+                _state.value = EngineState.Error("Native llama.cpp backend could not be initialized.")
+                return@withContext
             }
             val ok = BrainNative.nativeLoadModel(modelPath, nCtx, nThreads)
             _state.value = if (ok) {
@@ -70,7 +81,8 @@ object BrainEngine {
         }
     }
 
-    suspend fun unloadModel() {
+    suspend fun unloadModel() = lifecycleMutex.withLock {
+        if (!awaitGenerationIdle(120_000L)) return@withLock
         withContext(Dispatchers.Default) {
             BrainNative.nativeUnloadModel()
         }
@@ -87,8 +99,9 @@ object BrainEngine {
      * doc. No-ops (returns without touching native state) if nothing was
      * actually loaded, since there's nothing real to pause.
      */
-    suspend fun pauseForThermal() {
-        val loaded = _state.value as? EngineState.Loaded ?: return
+    suspend fun pauseForThermal() = lifecycleMutex.withLock {
+        val loaded = _state.value as? EngineState.Loaded ?: return@withLock
+        if (!awaitGenerationIdle(120_000L)) return@withLock
         withContext(Dispatchers.Default) {
             BrainNative.nativeUnloadModel()
         }
@@ -148,7 +161,8 @@ object BrainEngine {
          * apart from "actually stuck". Never called after cancellation.
          * Default no-op so every existing call site is unaffected.
          */
-        onProgress: () -> Unit = {}
+        onProgress: () -> Unit = {},
+        formatAsChat: Boolean = true
     ): Flow<String> =
         callbackFlow {
             if (!isLoaded) {
@@ -216,7 +230,8 @@ object BrainEngine {
             generationActive.set(true)
             val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
                 try {
-                    val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
+                    val formattedPrompt = if (formatAsChat) BrainNative.nativeApplyChatTemplate(prompt) ?: prompt else prompt
+                    val stopReason = BrainNative.nativeGenerate(formattedPrompt, maxTokens, temperature, topP, callback)
                     if (!cancelled.get()) {
                         if (stopReason.startsWith("error:")) {
                             close(IllegalStateException(stopReason))

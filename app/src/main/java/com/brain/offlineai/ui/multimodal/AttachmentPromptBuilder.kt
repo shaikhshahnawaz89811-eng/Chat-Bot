@@ -48,15 +48,14 @@ object AttachmentPromptBuilder {
                 }
                 AttachmentKind.ZIP -> when {
                     info == null -> "(attachment metadata unavailable)"
-                    // Phase 20 (Context Manager) - this ZIP's real entry
-                    // listing was too large for a single safe read; the
-                    // caller already ran the real Chunk 1-5 sequence as
-                    // its own visible SYSTEM_NOTEs (see ChatViewModel) and
-                    // hands back only Chunk 1's own bounded structure
-                    // summary here, instead of the unbounded raw entry
-                    // dump below - never both at once.
+                    // Phase 20 (Context Manager) - a large ZIP is never
+                    // dumped wholesale into the model prompt. The visible
+                    // chat card reports the real dynamic chunk count, while
+                    // this prompt carries only the bounded structure summary;
+                    // actual source content is read later by the deterministic
+                    // project inspector for the task that genuinely needs it.
                     chunkedZipSummaries.containsKey(route.attachmentId) ->
-                        "Project structure (full entry list shown separately via the chunked context above):\n" +
+                        "Project structure (entry list is split into real dynamic chunks; source files are inspected on demand):\n" +
                             chunkedZipSummaries.getValue(route.attachmentId)
                     else -> {
                         val entries = AttachmentContentReader.listZipEntries(info.storedPath)

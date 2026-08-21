@@ -15,7 +15,9 @@ class AgentExecutionRepository(context: Context) {
         continuationPrompt: String,
         currentFileName: String = "",
         currentChunk: Int = 0,
-        totalChunks: Int = 0
+        totalChunks: Int = 0,
+        currentFileIndex: Int = 0,
+        planJson: String = ""
     ) = update(
         AgentExecutionEntity(
             id = id,
@@ -27,6 +29,8 @@ class AgentExecutionRepository(context: Context) {
             currentFileName = currentFileName,
             currentChunk = currentChunk,
             totalChunks = totalChunks,
+            currentFileIndex = currentFileIndex,
+            planJson = planJson,
             createdAt = System.currentTimeMillis(),
             updatedAt = System.currentTimeMillis()
         )
@@ -38,6 +42,8 @@ class AgentExecutionRepository(context: Context) {
         currentFileName: String = "",
         currentChunk: Int = 0,
         totalChunks: Int = 0,
+        currentFileIndex: Int? = null,
+        planJson: String? = null,
         status: AgentExecutionStatus = AgentExecutionStatus.RUNNING
     ) = withContext(Dispatchers.IO) {
         val base = dao.getById(id) ?: return@withContext
@@ -46,6 +52,29 @@ class AgentExecutionRepository(context: Context) {
             continuationPrompt = continuationPrompt,
             currentFileName = currentFileName,
             currentChunk = currentChunk,
+            totalChunks = totalChunks,
+            currentFileIndex = currentFileIndex ?: base.currentFileIndex,
+            planJson = planJson ?: base.planJson,
+            updatedAt = System.currentTimeMillis()
+        ))
+    }
+
+
+    suspend fun configurePlan(
+        id: String,
+        kind: String,
+        planJson: String,
+        currentFileIndex: Int = 0,
+        currentFileName: String = "",
+        totalChunks: Int = 0
+    ) = withContext(Dispatchers.IO) {
+        val base = dao.getById(id) ?: return@withContext
+        dao.upsert(base.copy(
+            kind = kind,
+            planJson = planJson,
+            currentFileIndex = currentFileIndex,
+            currentFileName = currentFileName,
+            currentChunk = 0,
             totalChunks = totalChunks,
             updatedAt = System.currentTimeMillis()
         ))
@@ -61,6 +90,8 @@ class AgentExecutionRepository(context: Context) {
             ))
         }
     }
+
+    suspend fun get(id: String): AgentExecutionEntity? = withContext(Dispatchers.IO) { dao.getById(id) }
 
     suspend fun latestPaused(sessionId: String): AgentExecutionEntity? = withContext(Dispatchers.IO) {
         dao.latest(sessionId, AgentExecutionStatus.PAUSED.name)

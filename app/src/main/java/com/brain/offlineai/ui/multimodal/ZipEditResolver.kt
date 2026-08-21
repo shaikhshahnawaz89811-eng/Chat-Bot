@@ -56,7 +56,7 @@ object ZipEditResolver {
         return candidates.singleOrNull()
     }
 
-    /** Real, bounded set of file extensions this fallback will actually open and scan - same "readable text only" boundary [AttachmentContentReader.isTextReadable] already enforces elsewhere. */
+    /** Real set of file extensions this fallback will actually open and scan - same "readable text only" boundary [AttachmentContentReader.isTextReadable] already enforces elsewhere. */
     private val SCANNABLE_EXTENSIONS = setOf("kt", "kts", "java", "js", "jsx", "ts", "tsx", "py", "go", "rs", "swift", "c", "cpp", "h", "hpp", "cs", "php", "rb", "dart")
 
     /** Real declaration shapes this fallback recognizes - a symbol is only treated as "defined here" when it appears after one of these real keywords, never a bare-word text match that could hit a comment, a call site, or an unrelated string. */
@@ -73,7 +73,7 @@ object ZipEditResolver {
      * Real, bounded fallback: pulls identifier-shaped words out of the
      * user's own message (plain regex - never a model guess at what they
      * meant), then genuinely reads each real, text-scannable entry's
-     * content (bounded to [maxEntriesScanned] entries, same real
+     * content (bounded only by the real ZIP entry list and [maxEntriesScanned] when a caller explicitly supplies one, same real
      * [AttachmentContentReader.readZipEntryText] this project already
      * uses elsewhere) looking for a real declaration of that exact
      * identifier. Only resolves when the identifier is genuinely declared
@@ -85,7 +85,7 @@ object ZipEditResolver {
         entries: List<AttachmentContentReader.ZipEntrySummary>,
         storedPath: String,
         messageText: String,
-        maxEntriesScanned: Int = 250
+        maxEntriesScanned: Int = Int.MAX_VALUE
     ): AttachmentContentReader.ZipEntrySummary? {
         val identifiers = Regex("""\b[A-Za-z_][A-Za-z0-9_]{2,}\b""").findAll(messageText)
             .map { it.value }

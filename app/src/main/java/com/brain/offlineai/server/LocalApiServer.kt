@@ -124,7 +124,7 @@ class LocalApiServer(
         } else {
             val text = runBlocking {
                 val builder = StringBuilder()
-                BrainEngine.generate(prompt, maxTokens, temperature, topP).collect { builder.append(it) }
+                BrainEngine.generate(prompt, maxTokens, temperature, topP, formatAsChat = false).collect { builder.append(it) }
                 builder.toString()
             }
             val body = JSONObject()
@@ -170,7 +170,7 @@ class LocalApiServer(
         Thread {
             try {
                 runBlocking {
-                    BrainEngine.generate(prompt, maxTokens, temperature, topP).collect { token ->
+                    BrainEngine.generate(prompt, maxTokens, temperature, topP, formatAsChat = false).collect { token ->
                         val chunk = JSONObject()
                             .put("id", completionId)
                             .put("object", "chat.completion.chunk")
