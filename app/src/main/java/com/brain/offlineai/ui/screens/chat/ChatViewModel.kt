@@ -2007,20 +2007,22 @@ class ChatViewModel(
         return root.toString()
     }
 
-    private fun deserializeExecutionPlan(raw: String): PlanningEngine.FilePlan? = try {
-        val root = JSONObject(raw)
-        val filesJson = root.optJSONArray("files") ?: return null
-        val files = buildList {
-            for (i in 0 until filesJson.length()) {
-                val item = filesJson.optJSONObject(i) ?: continue
-                val name = item.optString("fileName").trim()
-                if (name.isBlank()) continue
-                add(PlanningEngine.PlannedFile(name, item.optString("language"), item.optString("purpose")))
+    private fun deserializeExecutionPlan(raw: String): PlanningEngine.FilePlan? {
+        return try {
+            val root = JSONObject(raw)
+            val filesJson = root.optJSONArray("files") ?: return null
+            val files = buildList {
+                for (i in 0 until filesJson.length()) {
+                    val item = filesJson.optJSONObject(i) ?: continue
+                    val name = item.optString("fileName").trim()
+                    if (name.isBlank()) continue
+                    add(PlanningEngine.PlannedFile(name, item.optString("language"), item.optString("purpose")))
+                }
             }
+            if (files.size < 2) null else PlanningEngine.FilePlan(files, if (root.has("truncatedFromCount")) root.optInt("truncatedFromCount") else null)
+        } catch (_: Exception) {
+            null
         }
-        if (files.size < 2) null else PlanningEngine.FilePlan(files, if (root.has("truncatedFromCount")) root.optInt("truncatedFromCount") else null)
-    } catch (_: Exception) {
-        null
     }
 
     private suspend fun runMultiFileBuild(activeSessionId: String, originalRequest: String, extraContextBlock: String, resumeExecution: AgentExecutionEntity? = null): MultiFileBuildOutcome {
