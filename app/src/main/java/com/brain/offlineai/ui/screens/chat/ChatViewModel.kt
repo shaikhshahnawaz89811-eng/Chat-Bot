@@ -1305,21 +1305,20 @@ class ChatViewModel(
 
         if (lastBot.text.isNotBlank()) {
             val split = splitIntroAndCode(lastBot.text)
-            if (split.codeLines != null) {
-                val settled = lastBot.copy(
-                    state = BotMessageState.CODE_DONE,
-                    codeLines = split.codeLines,
-                    text = lastBot.text
-                )
-                upsertBotMessage(lastBot.id, settled)
-                sessionId?.let { persistMessage(it, settled) }
-            } else {
-                val settled = lastBot.copy(state = BotMessageState.TEXT)
-                upsertBotMessage(lastBot.id, settled)
-                sessionId?.let { persistMessage(it, settled) }
-            }
+            val settled = lastBot.copy(
+                state = BotMessageState.PAUSED,
+                codeLines = split.codeLines ?: lastBot.codeLines,
+                text = lastBot.text
+            )
+            upsertBotMessage(lastBot.id, settled)
+            sessionId?.let { persistMessage(it, settled) }
         } else {
-            removeBotMessage(lastBot.id)
+            val settled = lastBot.copy(
+                state = BotMessageState.PAUSED,
+                text = if (userStopped) "Generation stopped. Type \"continue\" to resume the saved checkpoint." else "Generation paused. Type \"continue\" to resume the saved checkpoint."
+            )
+            upsertBotMessage(lastBot.id, settled)
+            sessionId?.let { persistMessage(it, settled) }
         }
 
         if (userStopped) {
@@ -1659,7 +1658,7 @@ class ChatViewModel(
                         if (partialSplit.introText.isNotBlank()) {
                             persistMessage(activeSessionId, ChatMessage(id = botId, text = partialSplit.introText, isUser = false, timestamp = timeNow(), state = BotMessageState.TEXT))
                         }
-                        persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = partialSplit.codeLines))
+                        persistMessage(activeSessionId, ChatMessage(id = partialCodeId, text = partialFull, isUser = false, timestamp = timeNow(), state = BotMessageState.PAUSED, codeLines = partialSplit.codeLines))
                     }
                 }
             }
@@ -1705,7 +1704,7 @@ class ChatViewModel(
                     "end_of_generation" -> BotMessageState.TEXT
                     "timeout", "max_tokens", "thermal_pause" -> BotMessageState.PAUSED
                     "context_full" -> BotMessageState.FAILED
-                    else -> BotMessageState.TEXT
+                    else -> BotMessageState.FAILED
                 }
                 val renderedMessage = ChatMessage(id = botId, text = finalFull, isUser = false, timestamp = timeNow(), state = renderedState)
                 upsertBotMessage(botId, renderedMessage)
@@ -1732,7 +1731,7 @@ class ChatViewModel(
                     "end_of_generation" -> BotMessageState.CODE_DONE
                     "timeout", "max_tokens", "thermal_pause" -> BotMessageState.PAUSED
                     "context_full" -> BotMessageState.FAILED
-                    else -> BotMessageState.CODE_DONE
+                    else -> BotMessageState.FAILED
                 }
                 val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = codeRenderedState, codeLines = finalSplit.codeLines)
                 var finalCodeMessage = if (stopReason == "end_of_generation") {
@@ -2147,95 +2146,13 @@ class ChatViewModel(
         }
 
         // "Worker phone as a tool" - bounded, opt-in real parallelism.
-        // Chat-Bot stays in charge (same plan, same file list, same
-        // artifact/validation pipeline below); the only thing that
-        // changes is that when a paired worker is actually available,
-        // the plan's *second* file starts generating on that worker
-        // device at the exact same moment the *first* file starts
-        // generating on this phone's own local engine - both phones
-        // genuinely working at once, not one waiting idle for the other.
-        //
-        // Deliberately narrow: only ever this one file pair, never the
-        // whole plan. Every file from index 2 onward still runs fully
-        // sequential and still gets its real, full [recentFilesContext]
-        // exactly as before (including from file[1], once it's done) -
-        // the only real tradeoff is that file[1]'s own prompt does not
-        // include file[0]'s just-written content (it starts before
-        // file[0] exists), only the same shared plan list every file
-        // already gets. [forceMode] pins each call to a specific engine
-        // so both calls can't ever race for the same one (see
-        // [ComputeManager.generate]'s own doc on why AUTO/REMOTE alone
-        // isn't safe for this).
-        //
-        // Silently inactive (falls straight through to the existing
-        // fully-sequential loop below) unless the user has already
-        // paired an enabled worker and turned on Remote/Auto mode in
-        // Compute Bridge - nothing here changes behavior for anyone who
-        // hasn't opted into Compute Bridge at all.
+        // Project generation is intentionally sequential at the visible UI layer.
+        // A speculative second-file worker used to create a second live CODING
+        // card and an independent progress stream. That made the task state
+        // ambiguous and made Continue impossible to reason about. Compute
+        // Bridge can still be used by the explicit compute route, but this
+        // project builder owns exactly one current-file cursor.
         val executionCheckpointId = resumeCheckpoint?.id ?: java.util.UUID.randomUUID().toString()
-        // Keep one authoritative visible generation at a time. The previous
-        // speculative second-file worker prefetch created two live CODING
-        // cards and two independent progress streams, which made the chat
-        // look as if the task was running in two places and made Continue
-        // ambiguous. Parallel workers remain available through the explicit
-        // Compute Bridge route, but this project builder keeps a single
-        // visible/current-file cursor.
-        val canPrefetchSecondFileOnWorker = false
-        var secondFilePrefetch: kotlinx.coroutines.Deferred<Pair<String, String>>? = null
-        var secondPrefetchCodeBotId: Long? = null
-        if (canPrefetchSecondFileOnWorker) {
-            val secondPlanned = plan.files[1]
-            val prefetchCodeId = nextId++
-            secondPrefetchCodeBotId = prefetchCodeId
-            upsertBotMessage(
-                prefetchCodeId,
-                ChatMessage(
-                    id = prefetchCodeId, text = "", isUser = false, timestamp = timeNow(),
-                    state = BotMessageState.CODING, codeFileName = secondPlanned.fileName,
-                    codeLines = emptyList(), generationProgress = 0
-                )
-            )
-            val planListTextForPrefetch = plan.files.joinToString("\n") { "- ${it.fileName} (${it.language}): ${it.purpose}" }
-            val trimmedExtraContextForPrefetch = if (extraContextBlock.length > FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
-                extraContextBlock.take(FILE_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this file - see plan summary above for full context)"
-            } else extraContextBlock
-            val secondPrompt = buildString {
-                append("Project request: ").append(originalRequest).append("\n")
-                if (trimmedExtraContextForPrefetch.isNotBlank()) append(trimmedExtraContextForPrefetch).append("\n")
-                append("\nFull real file plan for this project:\n").append(planListTextForPrefetch).append("\n")
-                append(
-                    "\nNow write ONLY the complete, real content of this one file: ${secondPlanned.fileName} " +
-                        "(${secondPlanned.language}) - ${secondPlanned.purpose}\n" +
-                        "Reply with exactly one fenced code block containing the complete file, and nothing else."
-                )
-            }
-            postSystemNote(
-                activeSessionId,
-                "Paired worker is available - writing ${plan.files[0].fileName} here and ${secondPlanned.fileName} on the worker phone at the same time."
-            )
-            secondFilePrefetch = viewModelScope.async {
-                try {
-                    generateFileContent(
-                        secondPrompt,
-                        forceMode = ComputeMode.REMOTE,
-                        onChunkText = { partial ->
-                            upsertBotMessage(
-                                prefetchCodeId,
-                                ChatMessage(
-                                    id = prefetchCodeId, text = partial, isUser = false, timestamp = timeNow(),
-                                    state = BotMessageState.CODING, codeFileName = secondPlanned.fileName,
-                                    codeLines = partial.lines(), generationProgress = partial.length
-                                )
-                            )
-                        }
-                    )
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    "" to "error"
-                }
-            }
-        }
 
         for ((fileIndex, planned) in plan.files.withIndex()) {
             if (fileIndex < startFileIndex) continue
@@ -2255,13 +2172,12 @@ class ChatViewModel(
                 partialOutput = if (resumeCheckpoint != null && fileIndex == startFileIndex) resumeCheckpoint.partialOutput else ""
             )
             if (contextFullHit) {
-                if (fileIndex == 1) secondFilePrefetch?.cancel()
                 fileSummaries += "- ${planned.fileName}: skipped (context window filled by earlier files this turn)"
                 continue
             }
             val creatingStepId = pushRunning(ProcessMarking.CREATING, "Creating ${planned.fileName}")
-            val codeBotId = if (fileIndex == 1 && secondPrefetchCodeBotId != null) secondPrefetchCodeBotId!! else nextId++
-            if (fileIndex != 1 || secondPrefetchCodeBotId == null) upsertBotMessage(
+            val codeBotId = nextId++
+            upsertBotMessage(
                 codeBotId,
                 ChatMessage(
                     id = codeBotId,
@@ -2343,27 +2259,22 @@ class ChatViewModel(
                 }
             }
             val (rawOutput, stopReason) = try {
-                if (fileIndex == 1 && secondFilePrefetch != null) {
-                    secondFilePrefetch.await()
-                } else {
-                    generateFileContent(
-                        filePrompt,
-                        forceMode = if (fileIndex == 0 && secondFilePrefetch != null) ComputeMode.LOCAL else null,
-                        initialOutput = resumePartial,
-                        initialContinuationPrompt = resumeContinuationPrompt,
-                        onChunkText = { partial ->
-                            checkpointCallback(partial)
-                            upsertBotMessage(
-                                codeBotId,
-                                ChatMessage(
-                                    id = codeBotId, text = partial, isUser = false, timestamp = timeNow(),
-                                    state = BotMessageState.CODING, codeFileName = planned.fileName,
-                                    codeLines = partial.lines(), generationProgress = partial.length
-                                )
+                generateFileContent(
+                    filePrompt,
+                    initialOutput = resumePartial,
+                    initialContinuationPrompt = resumeContinuationPrompt,
+                    onChunkText = { partial ->
+                        checkpointCallback(partial)
+                        upsertBotMessage(
+                            codeBotId,
+                            ChatMessage(
+                                id = codeBotId, text = partial, isUser = false, timestamp = timeNow(),
+                                state = BotMessageState.CODING, codeFileName = planned.fileName,
+                                codeLines = partial.lines(), generationProgress = partial.length
                             )
-                        }
-                    )
-                }
+                        )
+                    }
+                )
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -2390,16 +2301,6 @@ class ChatViewModel(
                     codeLines = finalCodeLines, generationProgress = content.length
                 )
             )
-            if (fileIndex == 1 && secondPrefetchCodeBotId != null) {
-                upsertBotMessage(
-                    secondPrefetchCodeBotId!!,
-                    ChatMessage(
-                        id = secondPrefetchCodeBotId!!, text = content, isUser = false, timestamp = timeNow(),
-                        state = BotMessageState.CODE_DONE, codeFileName = planned.fileName,
-                        codeLines = finalCodeLines, generationProgress = content.length
-                    )
-                )
-            }
             if (content.isBlank()) {
                 completeStep(creatingStepId, failed = true, label = "Paused: ${planned.fileName} returned no content")
                 postSystemNote(activeSessionId, "${planned.fileName} returned no real content. The project checkpoint is saved; reply \"continue\" after checking the model/device state.")

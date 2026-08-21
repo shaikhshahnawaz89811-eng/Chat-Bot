@@ -304,7 +304,7 @@ fun BotCodeDoneBubble(
             }
         }
         Spacer(Modifier.height(6.dp))
-        Text("Generating…", color = BrainCyanAccent, style = MaterialTheme.typography.bodySmall)
+        Text("Completed", color = BrainSuccessGreen, style = MaterialTheme.typography.bodySmall)
         Spacer(Modifier.height(2.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
         if (message.artifacts.isNotEmpty()) {
@@ -344,7 +344,7 @@ fun BotPausedBubble(message: ChatMessage) {
             Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodySmall, maxLines = 3)
         }
         Spacer(Modifier.height(4.dp))
-        Text("No active generation is running. Type "continue" to resume the saved checkpoint.", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
+        Text("No active generation is running. Type \"continue\" to resume the saved checkpoint.", color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
     }
 }
 
