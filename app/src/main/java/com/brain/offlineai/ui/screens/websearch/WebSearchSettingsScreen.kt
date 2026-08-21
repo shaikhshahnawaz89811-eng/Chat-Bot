@@ -74,7 +74,7 @@ fun WebSearchSettingsScreen(
                     style = MaterialTheme.typography.bodySmall
                 )
             }
-            Switch(checked = viewModel.searchEnabled, onCheckedChange = viewModel::setSearchEnabled)
+            Switch(checked = viewModel.searchEnabled, onCheckedChange = viewModel::updateSearchEnabled)
         }
         Spacer(Modifier.height(16.dp))
 

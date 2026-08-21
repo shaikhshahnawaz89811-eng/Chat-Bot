@@ -37,7 +37,7 @@ class WebSearchSettingsViewModel(application: Application) : AndroidViewModel(ap
     var errorMessage by mutableStateOf<String?>(null)
         private set
 
-    fun setSearchEnabled(enabled: Boolean) {
+    fun updateSearchEnabled(enabled: Boolean) {
         keyStore.setSearchEnabled(enabled)
         searchEnabled = enabled
     }
