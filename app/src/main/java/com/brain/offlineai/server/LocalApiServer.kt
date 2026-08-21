@@ -15,9 +15,14 @@ import java.io.PipedOutputStream
 /**
  * Real OpenAI-compatible HTTP server (mockup screen 10 - "Local API Server
  * Status", the actual OpenAI-compatible highlight badge from the top of the
- * mockup). Bound to "127.0.0.1" explicitly in the constructor call below -
- * this class never listens on "0.0.0.0" or any other interface, so the
- * "100% Offline" guarantee holds at the socket level, not just in the UI.
+ * mockup). Bound to "0.0.0.0" so a paired companion app (e.g. Rani) on
+ * another phone on the same Wi-Fi/hotspot can reach it too - this is the
+ * same LAN-only, no-internet-relay posture the Compute Bridge feature
+ * already uses (see network_security_config.xml's comment). No traffic
+ * ever leaves the local network: there is no cloud relay, no tunnel, no
+ * outbound call added anywhere in this class. Auth is still mandatory on
+ * every route below (see [authenticate]) - opening the socket to the LAN
+ * does not weaken that.
  *
  * Every route below hits real data:
  * - Auth checks the actual SQLCipher-encrypted api_keys table via
@@ -31,7 +36,7 @@ class LocalApiServer(
     port: Int,
     private val apiKeyRepository: ApiKeyRepository,
     private val onRequestServed: () -> Unit
-) : NanoHTTPD("127.0.0.1", port) {
+) : NanoHTTPD("0.0.0.0", port) {
 
     override fun serve(session: IHTTPSession): Response = try {
         when {

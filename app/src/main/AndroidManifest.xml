@@ -33,6 +33,8 @@
          permission above. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
 
+
+
     <!-- Phase 11: Artifact card + ZIP/file output + download flow. Only
          needed for the real legacy (API 26-28) "Save to Device" path in
          ArtifactFileManager.exportToDownloads - API 29+ uses scoped-storage

@@ -3,6 +3,9 @@ package com.brain.offlineai.server
 import android.content.Context
 import com.brain.offlineai.data.analytics.AnalyticsStore
 import com.brain.offlineai.data.apikeys.ApiKeyRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 
@@ -29,6 +32,11 @@ object LocalApiServerManager {
     const val API_VERSION = "v1"
 
     private var server: LocalApiServer? = null
+
+    // Own supervisor scope for PublicTunnelManager's polling job - this object
+    // is a process-wide singleton with no natural ViewModel/Activity scope to
+    // borrow, same reasoning as _state/_requestsServed above being top-level.
+    private val managerScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val _state = MutableStateFlow<ServerState>(ServerState.Stopped)
     val state: StateFlow<ServerState> = _state
@@ -58,6 +66,9 @@ object LocalApiServerManager {
             newServer.start(fi.iki.elonen.NanoHTTPD.SOCKET_READ_TIMEOUT, false)
             server = newServer
             _state.value = ServerState.Running(PORT, System.currentTimeMillis())
+            // Public Tunnel (additive) - same on/off moment as the server
+            // itself, never a separate toggle the user has to remember.
+            PublicTunnelManager.start(context.applicationContext, managerScope)
         } catch (e: Exception) {
             // Real failure surfaced (e.g. port already bound by something
             // else) - not swallowed into a fake "Running" state.
@@ -71,5 +82,6 @@ object LocalApiServerManager {
         server = null
         _state.value = ServerState.Stopped
         _requestsServed.value = 0
+        PublicTunnelManager.stop()
     }
 }

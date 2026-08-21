@@ -22,7 +22,10 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.brain.offlineai.server.LocalApiServerManager
+import com.brain.offlineai.server.NetworkUtils
+import com.brain.offlineai.server.PublicTunnelManager
 import com.brain.offlineai.server.ServerState
+import com.brain.offlineai.server.TunnelState
 import com.brain.offlineai.ui.screens.apikeys.copyKeyToClipboard
 import com.brain.offlineai.ui.theme.*
 import kotlinx.coroutines.delay
@@ -102,6 +105,37 @@ fun LocalApiScreen(
                 onCopy = { copyKeyToClipboard(context, "http://127.0.0.1:${LocalApiServerManager.PORT}/${LocalApiServerManager.API_VERSION}") }
             )
             RowDivider()
+            // Real LAN address of this phone (NetworkUtils.getLocalIpv4Address(),
+            // never a placeholder) - this is what a paired companion app on
+            // another phone (e.g. Rani) on the same Wi-Fi/hotspot should use,
+            // since the server now binds to 0.0.0.0 as well as loopback.
+            val lanIp = remember(state) { NetworkUtils.getLocalIpv4Address() }
+            val lanEndpoint = lanIp?.let { "http://$it:${LocalApiServerManager.PORT}/${LocalApiServerManager.API_VERSION}" }
+            EndpointRow(
+                label = "LAN Endpoint (for other devices)",
+                endpoint = lanEndpoint ?: "Not connected to Wi-Fi/hotspot",
+                onCopy = { lanEndpoint?.let { copyKeyToClipboard(context, it) } }
+            )
+            RowDivider()
+            // Public Tunnel - real state from PublicTunnelManager, which
+            // starts/stops in lockstep with this server (see
+            // LocalApiServerManager) and runs cloudflared as Brain's own
+            // child process. Only ever shows a URL actually parsed from
+            // cloudflared's real stdout - never a placeholder while
+            // Starting/Error.
+            val tunnelState by PublicTunnelManager.state.collectAsState()
+            val tunnelText = when (val t = tunnelState) {
+                is TunnelState.Off -> "Off"
+                is TunnelState.Starting -> "Starting…"
+                is TunnelState.Running -> t.url
+                is TunnelState.Error -> t.message
+            }
+            EndpointRow(
+                label = "Public Tunnel (works away from Wi-Fi)",
+                endpoint = tunnelText,
+                onCopy = { (tunnelState as? TunnelState.Running)?.url?.let { copyKeyToClipboard(context, it) } }
+            )
+            RowDivider()
             InfoRow("API Version", LocalApiServerManager.API_VERSION)
             RowDivider()
             InfoRow("Uptime", uptimeText)
@@ -175,9 +209,9 @@ private fun StatusRow(state: ServerState) {
 }
 
 @Composable
-private fun EndpointRow(endpoint: String, onCopy: () -> Unit) {
+private fun EndpointRow(endpoint: String, onCopy: () -> Unit, label: String = "Endpoint") {
     Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-        Text("Endpoint", color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        Text(label, color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(4.dp))
         Row(
             modifier = Modifier.fillMaxWidth(),
