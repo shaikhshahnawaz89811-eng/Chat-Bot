@@ -1934,10 +1934,13 @@ class ChatViewModel(
         suspend fun generateFileContent(
             prompt: String,
             forceMode: ComputeMode? = null,
-            onChunkText: (String) -> Unit = {}
+            initialOutput: String = "",
+            initialContinuationPrompt: String? = null,
+            onChunkText: suspend (String) -> Unit = {}
         ): Pair<String, String> {
-            val builder = StringBuilder()
-            var continuationPrompt = prompt
+            val builder = StringBuilder(initialOutput)
+            var continuationPrompt = initialContinuationPrompt?.takeIf { it.isNotBlank() } ?: prompt
+            if (builder.isNotEmpty()) onChunkText(builder.toString())
             var reason = "max_tokens"
             var chunk = 0
             while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
@@ -2286,7 +2289,7 @@ class ChatViewModel(
                     secondFilePrefetch.await()
                 } else {
                     generateFileContent(
-                        if (resumeContinuationPrompt != null) resumeContinuationPrompt else filePrompt,
+                        filePrompt,
                         forceMode = if (fileIndex == 0 && secondFilePrefetch != null) ComputeMode.LOCAL else null,
                         initialOutput = resumePartial,
                         initialContinuationPrompt = resumeContinuationPrompt,
