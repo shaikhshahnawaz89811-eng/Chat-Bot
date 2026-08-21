@@ -1,0 +1,80 @@
+package com.brain.offlineai.agent
+
+import android.content.Context
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+class AgentExecutionRepository(context: Context) {
+    private val dao = AgentExecutionDatabase.getInstance(context).dao()
+
+    suspend fun start(
+        id: String,
+        sessionId: String,
+        kind: String,
+        originalPrompt: String,
+        continuationPrompt: String,
+        currentFileName: String = "",
+        currentChunk: Int = 0,
+        totalChunks: Int = 0
+    ) = update(
+        AgentExecutionEntity(
+            id = id,
+            sessionId = sessionId,
+            kind = kind,
+            status = AgentExecutionStatus.RUNNING.name,
+            originalPrompt = originalPrompt,
+            continuationPrompt = continuationPrompt,
+            currentFileName = currentFileName,
+            currentChunk = currentChunk,
+            totalChunks = totalChunks,
+            createdAt = System.currentTimeMillis(),
+            updatedAt = System.currentTimeMillis()
+        )
+    )
+
+    suspend fun updateCursor(
+        id: String,
+        continuationPrompt: String,
+        currentFileName: String = "",
+        currentChunk: Int = 0,
+        totalChunks: Int = 0,
+        status: AgentExecutionStatus = AgentExecutionStatus.RUNNING
+    ) = withContext(Dispatchers.IO) {
+        val base = dao.getById(id) ?: return@withContext
+        dao.upsert(base.copy(
+            status = status.name,
+            continuationPrompt = continuationPrompt,
+            currentFileName = currentFileName,
+            currentChunk = currentChunk,
+            totalChunks = totalChunks,
+            updatedAt = System.currentTimeMillis()
+        ))
+    }
+
+    suspend fun mark(id: String, status: AgentExecutionStatus, continuationPrompt: String? = null) = withContext(Dispatchers.IO) {
+        val current = dao.getById(id)
+        if (current != null) {
+            dao.upsert(current.copy(
+                status = status.name,
+                continuationPrompt = continuationPrompt ?: current.continuationPrompt,
+                updatedAt = System.currentTimeMillis()
+            ))
+        }
+    }
+
+    suspend fun latestPaused(sessionId: String): AgentExecutionEntity? = withContext(Dispatchers.IO) {
+        dao.latest(sessionId, AgentExecutionStatus.PAUSED.name)
+    }
+
+    suspend fun latestPausedAny(): AgentExecutionEntity? = withContext(Dispatchers.IO) {
+        dao.latestAny(AgentExecutionStatus.PAUSED.name)
+    }
+
+    suspend fun deleteForSession(sessionId: String) = withContext(Dispatchers.IO) {
+        dao.deleteForSession(sessionId)
+    }
+
+    private suspend fun update(entity: AgentExecutionEntity) = withContext(Dispatchers.IO) {
+        dao.upsert(entity)
+    }
+}

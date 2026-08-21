@@ -14,6 +14,8 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.brain.offlineai.agent.AgentClarificationGate
 import com.brain.offlineai.agent.AgentTaskRepository
+import com.brain.offlineai.agent.AgentExecutionRepository
+import com.brain.offlineai.agent.AgentExecutionStatus
 import com.brain.offlineai.agent.ContextManager
 import com.brain.offlineai.agent.FileValidator
 import com.brain.offlineai.agent.PlanningEngine
@@ -84,6 +86,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import com.brain.offlineai.tasks.ChatTaskForegroundService
+import com.brain.offlineai.tasks.ChatTaskRuntimeScope
 
 /**
  * Drives the Chat screen state - Phase 2 rewrite, Phase 5 wiring added,
@@ -137,6 +140,7 @@ class ChatViewModel(
      * genuinely survives process death, not just an in-memory flag.
      */
     private val agentTaskRepository = AgentTaskRepository(application)
+    private val executionRepository = AgentExecutionRepository(application)
 
     /**
      * Phase 21 (Master Plan v2 - Permission/Risk Gate + Tool Registry/
@@ -493,6 +497,7 @@ class ChatViewModel(
         val zipEditTarget: ZipEditTarget?
     )
     private var pendingContinuation: PendingContinuation? = null
+    private var activeExecutionId: String? = null
 
     fun sendMessage() {
         if (isBusy.value) return
@@ -510,6 +515,7 @@ class ChatViewModel(
         // guard above, sending the same message twice.
         isBusy.value = true
         userStopRequested = false
+        activeExecutionId = null
         inputText.value = ""
         // Clear the pending row now - these attachments are about to become
         // real, sent [ChatMessage.attachments], not pending ones anymore.
@@ -535,7 +541,7 @@ class ChatViewModel(
         messages.value = messages.value + userMessage
         analyticsStore.incrementMessagesSent()
 
-        generationJob = viewModelScope.launch {
+        generationJob = ChatTaskRuntimeScope.scope.launch {
             ChatTaskForegroundService.start(getApplication())
             // Real bug fix: everything below this point used to run inside a
             // try { ... } finally { ... } with NO catch. Any genuine throw
@@ -548,12 +554,35 @@ class ChatViewModel(
             // failure visible instead of silent, and still lets real
             // cancellation (leaving the screen, process death) propagate.
             var activeSessionIdForError: String? = null
+            var taskCompleted = false
+            var taskCancelled = false
+            var taskFailed = false
             try {
                 val activeSessionId = ensureSession(text.ifEmpty { readyAttachments.first().fileName })
                 activeSessionIdForError = activeSessionId
                 persistMessage(activeSessionId, userMessage)
                 if (readyAttachments.isNotEmpty()) {
                     persistAttachments(activeSessionId, userMessage.id, readyAttachments)
+                }
+
+                if (text.trim().lowercase(Locale.getDefault()) !in CONTINUE_TRIGGERS) {
+                    executionRepository.latestPaused(activeSessionId)?.let {
+                        executionRepository.mark(it.id, AgentExecutionStatus.CANCELLED)
+                    }
+                }
+
+                // Long-running work is now a persisted execution, not only a UI coroutine.
+                // This cursor is updated during generation so Continue can recover after
+                // navigation or process restart without guessing where the task stopped.
+                if (text.trim().lowercase(Locale.getDefault()) !in CONTINUE_TRIGGERS) {
+                    activeExecutionId = UUID.randomUUID().toString()
+                    executionRepository.start(
+                        id = activeExecutionId!!,
+                        sessionId = activeSessionId,
+                        kind = if (readyAttachments.any { it.kind == AttachmentKind.ZIP }) "ZIP_TASK" else "CHAT_TASK",
+                        originalPrompt = text,
+                        continuationPrompt = text
+                    )
                 }
 
                 // Compute Bridge: Remote/Auto mode with at least one
@@ -586,7 +615,15 @@ class ChatViewModel(
                 // genuinely moved on, so the old unfinished reply is
                 // dropped rather than resumed later out of context by a
                 // much later, unrelated "continue".
-                val pending = pendingContinuation
+                var pending = pendingContinuation
+                if (pending == null && text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS) {
+                    val persisted = executionRepository.latestPaused(activeSessionId)
+                    if (persisted != null) {
+                        pending = PendingContinuation(activeSessionId, persisted.continuationPrompt, null)
+                        activeExecutionId = persisted.id
+                        executionRepository.mark(persisted.id, AgentExecutionStatus.RUNNING)
+                    }
+                }
                 if (pending != null) {
                     pendingContinuation = null
                     if (text.trim().lowercase(Locale.getDefault()) in CONTINUE_TRIGGERS) {
@@ -720,11 +757,10 @@ class ChatViewModel(
                 for (zipInfo in readyAttachments.filter { it.kind == AttachmentKind.ZIP }) {
                     if (ContextManager.needsChunking(zipInfo.storedPath)) {
                         val plan = ContextManager.buildChunkPlan(zipInfo.storedPath, zipInfo.fileName)
-                        postSystemNote(activeSessionId, ContextManager.buildContextInfoBox(plan))
-                        plan.chunks.forEach { chunk ->
-                            postSystemNote(activeSessionId, "Chunk ${chunk.index}/${chunk.total} - ${chunk.title}\n${chunk.body}")
-                        }
-                        postSystemNote(activeSessionId, ContextManager.buildCompleteNote(plan))
+                        postSystemNote(
+                            activeSessionId,
+                            "📦 ${plan.displayName} · ${plan.totalFiles} files · ${plan.chunks.size} chunks\n✓ Context scan complete"
+                        )
                         // Real, bounded replacement for this one ZIP's
                         // context-block section below - Chunk 1's own
                         // structure summary only, never the unbounded raw
@@ -1127,7 +1163,7 @@ class ChatViewModel(
                     // this app already holds itself to.
                     val triedMultiFile = zipAttachments.isEmpty() && zipEditTarget == null &&
                         ProjectTypeGate.isCreationRequest(processingText) &&
-                        ProjectTypeGate.explicitlyRequestsMultipleFiles(processingText) &&
+                        shouldUseMultiFileBuild(processingText) &&
                         runMultiFileBuild(activeSessionId, processingText, extraContextBlock)
                     if (!triedMultiFile) {
                         // Bug fix (user report - planning times out on a
@@ -1165,7 +1201,18 @@ class ChatViewModel(
                         streamRealResponse(activeSessionId, processingText + codingContract + trimmedStreamExtraContext + zipEditContext, zipEditTarget)
                     }
                 }
+                taskCompleted = true
             } catch (e: kotlinx.coroutines.CancellationException) {
+                taskCancelled = true
+                if (activeExecutionId != null) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                        executionRepository.mark(
+                            activeExecutionId!!,
+                            if (userStopRequested) AgentExecutionStatus.PAUSED else AgentExecutionStatus.PAUSED,
+                            pendingContinuation?.continuationPrompt
+                        )
+                    }
+                }
                 // A cancelled generation must not leave the live PROCESS/
                 // GENERATING bubble as if work were still running. The
                 // cancellation is still rethrown so coroutine structured
@@ -1177,6 +1224,8 @@ class ChatViewModel(
                 }
                 throw e // lifecycle/process cancellation must keep propagating
             } catch (e: Exception) {
+                taskFailed = true
+                if (activeExecutionId != null) executionRepository.mark(activeExecutionId!!, AgentExecutionStatus.FAILED)
                 Log.e("ChatViewModel", "sendMessage failed before/while generating a response", e)
                 val errorText = "Something went wrong before I could reply: " +
                     (e.message ?: e::class.java.simpleName) +
@@ -1195,6 +1244,9 @@ class ChatViewModel(
                     )
                 }
             } finally {
+                if (taskCompleted && !taskCancelled && !taskFailed && pendingContinuation == null && activeExecutionId != null) {
+                    executionRepository.mark(activeExecutionId!!, AgentExecutionStatus.COMPLETED)
+                }
                 isBusy.value = false
                 generationJob = null
                 ChatTaskForegroundService.stop(getApplication())
@@ -1552,6 +1604,14 @@ class ChatViewModel(
                 stopReason = chunkStopReason
                 if (chunkStopReason == "timeout") break
                 continuationPrompt = prompt + "\n\n" + builder.toString()
+                activeExecutionId?.let {
+                    val currentFile = ArtifactExtractor.extract(builder.toString()).firstOrNull()?.fileName.orEmpty()
+                    executionRepository.updateCursor(
+                        id = it, continuationPrompt = continuationPrompt,
+                        currentFileName = currentFile,
+                        currentChunk = chunkIndex, totalChunks = chunkIndex
+                    )
+                }
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             // Real interruption - the user left the screen, the app was
@@ -1561,6 +1621,10 @@ class ChatViewModel(
             // the time this catch runs, so an ordinary suspend DB write
             // would be rejected immediately.
             kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                activeExecutionId?.let {
+                    val resumePrompt = prompt + if (builder.isNotBlank()) "\n\n" + builder.toString() else ""
+                    executionRepository.mark(it, AgentExecutionStatus.PAUSED, resumePrompt)
+                }
                 val partialFull = builder.toString()
                 if (partialFull.isNotBlank()) {
                     val partialSplit = splitIntroAndCode(partialFull)
@@ -1676,6 +1740,13 @@ class ChatViewModel(
             // `generate()` call picking up from exactly here.
             if (hitChunkCap) {
                 pendingContinuation = PendingContinuation(activeSessionId, continuationPrompt, zipEditTarget)
+                activeExecutionId?.let {
+                    executionRepository.updateCursor(
+                        id = it, continuationPrompt = continuationPrompt,
+                        currentChunk = chunkIndex, totalChunks = chunkIndex,
+                        status = AgentExecutionStatus.PAUSED
+                    )
+                }
                 postSystemNote(
                     activeSessionId,
                     "This reply hit this app's per-message length safety limit before the task " +
@@ -1813,6 +1884,23 @@ class ChatViewModel(
      * the caller's own fallback to [streamRealResponse] is the only real
      * bot reply the user ends up seeing, never two.
      */
+    /** Large creation work is automatically promoted to the real multi-file planner.
+     * Explicit multi-file wording still works, but a user no longer has to know
+     * the internal chunking vocabulary. Small one-file requests stay lightweight. */
+    private fun shouldUseMultiFileBuild(request: String): Boolean {
+        if (!ProjectTypeGate.isCreationRequest(request)) return false
+        if (ProjectTypeGate.explicitlyRequestsMultipleFiles(request)) return true
+        val lower = request.lowercase(Locale.getDefault())
+        val projectSignals = listOf(
+            "project", "android app", "android application", "full stack",
+            "backend", "frontend", "api", "database", "multi screen",
+            "multiple screen", "feature", "complete app", "complete website"
+        )
+        val hasProjectSignal = projectSignals.any(lower::contains)
+        val isLong = request.length >= 240
+        return hasProjectSignal || isLong
+    }
+
     private suspend fun runMultiFileBuild(activeSessionId: String, originalRequest: String, extraContextBlock: String): Boolean {
         val settings = settingsRepository.getSettings()
         val loadedContextSize = (BrainEngine.state.value as? EngineState.Loaded)?.contextSize ?: settings.contextLength
@@ -3868,9 +3956,11 @@ class ChatViewModel(
         if (!wantsFile && !wantsZip) return false
         val wantsFileOutput = wantsFile || wantsZip
 
+        val previousBot = messages.value.asReversed().drop(1).firstOrNull { !it.isUser && (it.artifacts.isNotEmpty() || it.text.isNotBlank()) }
+        val previousArtifactBot = messages.value.asReversed().drop(1).firstOrNull { !it.isUser && it.artifacts.isNotEmpty() }
         val previousUser = messages.value.asReversed().drop(1).firstOrNull { it.isUser && it.text.isNotBlank() }
-        val previousBot = messages.value.asReversed().drop(1).firstOrNull { !it.isUser && it.text.isNotBlank() }
-        val existingArtifacts = previousBot?.artifacts.orEmpty()
+        val existingArtifacts = previousArtifactBot?.artifacts.orEmpty()
+        val sourceText = previousBot?.text?.takeIf { it.isNotBlank() } ?: previousUser?.text.orEmpty()
 
         if (wantsZip && existingArtifacts.isNotEmpty()) {
             val nonZipArtifacts = existingArtifacts.filterNot { it.fileName.endsWith(".zip", ignoreCase = true) }
@@ -3899,8 +3989,8 @@ class ChatViewModel(
         }
 
         if (!wantsFileOutput || previousUser == null) return false
-        val candidates = ArtifactExtractor.extract(previousUser.text)
-        val blocks = if (candidates.isNotEmpty()) candidates else listOf(ArtifactCandidate(inferSnippetFileName(request, previousUser.text), previousUser.text.trim()))
+        val candidates = ArtifactExtractor.extract(sourceText)
+        val blocks = if (candidates.isNotEmpty()) candidates else listOf(ArtifactCandidate(inferSnippetFileName(request, sourceText), sourceText.trim()))
         val usable = blocks.filter { it.content.isNotBlank() }
         if (usable.isEmpty()) {
             postSystemNote(activeSessionId, "I couldn't find real code/text in the previous message to save as a file.")

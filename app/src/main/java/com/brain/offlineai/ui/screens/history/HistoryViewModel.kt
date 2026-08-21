@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.brain.offlineai.agent.AgentAuditRepository
 import com.brain.offlineai.agent.AgentTaskRepository
+import com.brain.offlineai.agent.AgentExecutionRepository
 import com.brain.offlineai.agent.ProjectTypePauseRepository
 import com.brain.offlineai.agent.ThermalPauseRepository
 import com.brain.offlineai.data.artifacts.ArtifactRepository
@@ -41,6 +42,7 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
     // question would otherwise become an orphan row with no session left
     // to resume it.
     private val agentTaskRepository = AgentTaskRepository(application)
+    private val agentExecutionRepository = AgentExecutionRepository(application)
 
     // Phase 21 - same real cleanup for the tool-call audit trail (see
     // ToolGateway): a deleted session's real audit rows would otherwise
@@ -66,6 +68,7 @@ class HistoryViewModel(application: Application) : AndroidViewModel(application)
             attachmentRepository.deleteForSession(sessionId)
             artifactRepository.deleteForSession(sessionId)
             agentTaskRepository.deleteForSession(sessionId)
+            agentExecutionRepository.deleteForSession(sessionId)
             agentAuditRepository.deleteForSession(sessionId)
             thermalPauseRepository.deleteForSession(sessionId)
             projectTypePauseRepository.deleteForSession(sessionId)

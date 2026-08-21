@@ -147,8 +147,32 @@ fun BotTaskListBubble(message: ChatMessage) {
 
 @Composable
 fun BotSystemNoteBubble(message: ChatMessage) {
+    val lines = message.text.lines()
+    val isChunkReport = lines.count { it.contains("Chunk ") } >= 2 || message.text.contains("Context Info Box")
+    val scrollState = rememberScrollState()
+    LaunchedEffect(message.text) { if (isChunkReport) scrollState.scrollTo(scrollState.maxValue) }
     BotCardShell(borderColor = BrainWarningAmber.copy(alpha = 0.4f)) {
-        Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        if (isChunkReport) {
+            val title = lines.firstOrNull()?.take(120) ?: "Project context"
+            Text(title, color = BrainTextPrimary, style = MaterialTheme.typography.titleSmall, maxLines = 1)
+            Spacer(Modifier.height(6.dp))
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 180.dp)
+                    .verticalScroll(scrollState)
+                    .background(BrainBgPrimary, RoundedCornerShape(10.dp))
+                    .padding(8.dp)
+            ) {
+                Text(
+                    lines.drop(1).joinToString("\n"),
+                    color = BrainTextSecondary,
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        } else {
+            Text(message.text, color = BrainTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        }
         Spacer(Modifier.height(4.dp))
         Text(message.timestamp, color = BrainTextMuted, style = MaterialTheme.typography.bodySmall)
     }
