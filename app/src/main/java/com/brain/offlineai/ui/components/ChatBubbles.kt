@@ -226,13 +226,22 @@ fun BotCodingBubble(message: ChatMessage) {
                 .padding(12.dp)
         ) {
             Column {
-                message.codeLines.forEach { line ->
+                if (message.codeLines.isEmpty()) {
                     Text(
-                        text = line,
-                        color = BrainCyanAccent,
+                        text = "Preparing ${message.codeFileName ?: "file"}… waiting for the first code token",
+                        color = BrainTextMuted,
                         fontFamily = FontFamily.Monospace,
                         style = MaterialTheme.typography.bodySmall
                     )
+                } else {
+                    message.codeLines.forEach { line ->
+                        Text(
+                            text = line,
+                            color = BrainCyanAccent,
+                            fontFamily = FontFamily.Monospace,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
                 }
             }
         }

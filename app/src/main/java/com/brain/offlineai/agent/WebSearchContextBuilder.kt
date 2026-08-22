@@ -37,16 +37,22 @@ object WebSearchContextBuilder {
     /** Deterministic relevance pass: keep real results, but prefer pages whose title/content actually contains the user's important query terms. */
     fun rankResults(query: String, results: List<WebSearchResult>): List<WebSearchResult> {
         val terms = Regex("[A-Za-z0-9]{3,}").findAll(query.lowercase()).map { it.value }.filterNot {
-            it in setOf("official", "documentation", "current", "implementation", "guidance", "development")
+            it in setOf(
+                "official", "documentation", "current", "implementation", "guidance", "development",
+                "create", "build", "make", "website", "web", "app", "application", "project",
+                "search", "online", "latest", "version", "help", "how", "to"
+            )
         }.toSet()
-        return results.filter { it.url.startsWith("http://") || it.url.startsWith("https://") }
+        val scoredResults = results.filter { it.url.startsWith("http://") || it.url.startsWith("https://") }
             .mapIndexed { index, result ->
                 val haystack = (result.title + " " + result.content + " " + result.url).lowercase()
-                val score = terms.count { haystack.contains(it) } * 10 + if (result.title.isNotBlank()) 2 else 0
+                val termHits = terms.count { haystack.contains(it) }
+                val score = termHits * 10 + if (termHits > 0 && result.title.isNotBlank()) 2 else 0
                 Triple(result, score, index)
             }
             .sortedWith(compareByDescending<Triple<WebSearchResult, Int, Int>> { it.second }.thenBy { it.third })
-            .map { it.first }
+        val relevant = scoredResults.filter { it.second > 0 }.map { it.first }
+        return if (relevant.isNotEmpty()) relevant else scoredResults.take(1).map { it.first }
     }
 
     /** Real, short label available to UI callers that need a human-readable search event. */

@@ -211,9 +211,13 @@ object BrainEngine {
             if (cancelled.get()) {
                 false
             } else if (token.isEmpty()) {
-                // Empty callback is a real prefill heartbeat only for a fresh
-                // generate() call. It is never a generated token.
-                onProgress()
+                // Empty callback is a native prefill heartbeat only. It is
+                // deliberately NOT reported as generation progress: the
+                // ChatViewModel stall watchdog must measure time to the next
+                // real generated token, otherwise a slow prefill can reset
+                // the 90-second watchdog forever while the UI remains at
+                // "0 tokens" for minutes. Cancellation still returns true
+                // here so the native prefill loop remains interruptible.
                 true
             } else {
                 onProgress()

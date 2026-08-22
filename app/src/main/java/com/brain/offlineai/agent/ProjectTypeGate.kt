@@ -97,16 +97,11 @@ object ProjectTypeGate {
             "har file alag", "poora project", "puri project", "zip me",
             "अलग अलग फाइल", "मल्टीपल फाइल", "पूरा प्रोजेक्ट"
         )
-        val naturallyMultiFileTargets = listOf(
-            "create web app", "build web app", "make web app", "create website",
-            "build website", "make website", "web app banao", "website banao",
-            "create android app", "build android app", "android app banao",
-            "create flutter app", "build flutter app", "flutter app banao",
-            "create react app", "build react app", "react app banao",
-            "full app", "complete app", "complete project", "full project"
-        )
-        return explicitMultiFileWords.any { lower.contains(it) } ||
-            naturallyMultiFileTargets.any { lower.contains(it) }
+        // A plain creation request is intentionally NOT multi-file by default.
+        // "create web app" follows the documented simple web path (one
+        // self-contained HTML artifact). The expensive planner is reserved
+        // for an explicit request for separate/multiple/project files.
+        return explicitMultiFileWords.any { lower.contains(it) }
     }
 
     /**

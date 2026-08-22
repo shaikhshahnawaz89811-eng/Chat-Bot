@@ -114,10 +114,12 @@ object WebSearchTrigger {
     private fun searchProblemTerms(text: String): String {
         val cleaned = text
             .replace(Regex("(?i)\\b(search web|web search|search online|look online|find online|latest|current version|official docs?|official documentation|up[- ]to[- ]date|most recent|newest)\\b"), " ")
+            .replace(Regex("(?i)\\b(create|build|make|develop|generate|banao|banado|bana do)\\b"), " ")
+            .replace(Regex("(?i)\\b(web app|webapp|website|web site|project|application|app)\\b"), " ")
             .replace(Regex("(?i)\\b[A-Za-z0-9._-]+\\.zip\\b"), " ")
             .replace(Regex("\\s+"), " ")
             .trim()
-        return cleaned.take(180).ifBlank { "current API and integration guidance" }
+        return cleaned.take(180).ifBlank { "current web implementation guidance" }
     }
 
     private fun domainsFor(target: String): List<String> = when {
