@@ -569,6 +569,18 @@ class ChatViewModel(
                 val canUseRemoteWorker = computeManager.mode != ComputeMode.LOCAL &&
                     computeManager.pairedWorkers().any { it.enabled }
                 if (BrainEngine.state.value !is EngineState.Loaded && !canUseRemoteWorker) {
+                    val diagnosticZip = readyAttachments.firstOrNull { it.kind == AttachmentKind.ZIP }
+                    if (diagnosticZip != null && isDiagnoseOnlyIntent(text)) {
+                        // A ZIP bug-review request has a deterministic, model-free
+                        // safety path. It never pretends an AI review happened: it
+                        // runs the real static validator over readable source files
+                        // and clearly labels the result as a static scan. This also
+                        // prevents the misleading "90s stall" experience when the
+                        // user only wanted a concrete local ZIP check but no model
+                        // is currently loaded.
+                        runStaticZipDiagnosis(activeSessionId, diagnosticZip)
+                        return@launch
+                    }
                     postSystemNote(
                         activeSessionId,
                         "No model is loaded yet. Go to Models and import + load a " +
@@ -1183,14 +1195,20 @@ class ChatViewModel(
                         // real chance to finish inside [GENERATION_CHUNK_TIMEOUT_MS]
                         // instead of needing a second, even-longer timeout
                         // to give up on.
-                        val codingContract = if (ProjectTypeGate.isWebAppCreationRequest(processingText)) {
-                            "\n\n--- Web app output contract ---\n" +
-                                "Generate the requested web app itself. Return complete, runnable web source code, not a tutorial, explanation, shell commands, or installation instructions. " +
-                                "For a simple web app, output exactly ONE complete HTML file in a filename-style fence: ```index.html. Put required CSS and JavaScript inside that HTML unless the user explicitly requests separate files. " +
-                                "Treat web-search results only as factual reference material; do not copy their tutorials, YouTube instructions, pip/npm/apt commands, or unrelated setup into the answer. " +
-                                "Do not output .sh files, terminal commands, package-install commands, or placeholder/dummy code unless the user explicitly asks for those things. The HTML must be self-contained and runnable by opening it in a browser.\n" +
-                                "--- End web app output contract ---"
-                        } else ""
+                        val codingContract = when {
+                            ProjectTypeGate.isWebAppCreationRequest(processingText) -> {
+                                "\n\n--- Web app output contract ---\n" +
+                                    "Generate the requested web app itself. Return complete, runnable web source code, not a tutorial, explanation, shell commands, or installation instructions. " +
+                                    "For a simple web app, output exactly ONE complete HTML file in a filename-style fence: ```index.html. Put required CSS and JavaScript inside that HTML unless the user explicitly requests separate files. " +
+                                    "Treat web-search results only as factual reference material; do not copy their tutorials, YouTube instructions, pip/npm/apt commands, or unrelated setup into the answer. " +
+                                    "Do not output .sh files, terminal commands, package-install commands, or placeholder/dummy code unless the user explicitly asks for those things. The HTML must be self-contained and runnable by opening it in a browser.\n" +
+                                    "--- End web app output contract ---"
+                            }
+                            ProjectTypeGate.shouldStopAfterFirstCodeBlock(processingText) -> {
+                                "\n\n--- Code output contract ---\nReturn the requested code as exactly ONE complete fenced code block with the correct language tag or filename. Do not add a tutorial, explanation, shell commands, or extra prose unless the user explicitly asks for an explanation. Finish the code completely before closing the fence.\n--- End code output contract ---"
+                            }
+                            else -> ""
+                        }
                         val trimmedStreamExtraContext = if (extraContextBlock.length > STREAM_EXTRA_CONTEXT_CHAR_CAP) {
                             extraContextBlock.take(STREAM_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for this reply)"
                         } else extraContextBlock
@@ -1387,6 +1405,7 @@ class ChatViewModel(
         // codeId becomes its own separate, genuinely distinct card for the
         // code - never the same card changing its own look mid-stream.
         var codeId: Long? = null
+        var contractStopRequested = false
 
         upsertBotMessage(
             botId,
@@ -1576,6 +1595,7 @@ class ChatViewModel(
                                     codeId = nextId++
                                 }
                                 val detectedFileName = ArtifactExtractor.extract(full).firstOrNull()?.fileName
+                                    ?: inferSnippetFileName(prompt, full)
                                 upsertBotMessage(codeId!!, ChatMessage(id = codeId!!, text = full, isUser = false, timestamp = timeNow(), state = BotMessageState.CODING, codeLines = split.codeLines, codeFileName = detectedFileName, generationProgress = tokenCount))
                             }
                             // Bug fix (user request) - real, periodic on-disk copy of
@@ -1586,6 +1606,23 @@ class ChatViewModel(
                             // row - never a stray leftover partial row under a
                             // different id. See [persistEveryNTokens]'s doc above for
                             // why this exists.
+                            if (!contractStopRequested &&
+                                ProjectTypeGate.shouldStopAfterFirstCodeBlock(prompt) &&
+                                ArtifactExtractor.extract(full).isNotEmpty()
+                            ) {
+                                // The requested code block is now genuinely complete.
+                                // Stop the native generator immediately instead of
+                                // letting a small local model keep sampling prose/tokens
+                                // after the answer the user actually asked for. The
+                                // chunk is normalized to end_of_generation below so this
+                                // intentional contract stop is never reported as an error.
+                                contractStopRequested = true
+                                BrainEngine.cancelGeneration()
+                                // Cancel collection too. This closes a real
+                                // remote worker stream as well as stopping the
+                                // local native loop.
+                                throw CodeContractCompleteException()
+                            }
                             if (tokenCount % persistEveryNTokens == 0) {
                                 persistMessage(
                                     activeSessionId,
@@ -1617,6 +1654,10 @@ class ChatViewModel(
                         // zero new tokens while it waits behind the old call.
                         BrainEngine.awaitGenerationIdle(GENERATION_CHUNK_TIMEOUT_MS)
                     }
+                } catch (e: CodeContractCompleteException) {
+                    // Intentional completion: the requested fenced code block
+                    // is complete even if the model had not emitted EOG yet.
+                    contractStopRequested = true
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -1639,6 +1680,10 @@ class ChatViewModel(
 
                 if (chunkTimedOut) {
                     chunkStopReason = "timeout"
+                }
+                if (contractStopRequested) {
+                    chunkStopReason = "end_of_generation"
+                    nativeContinuationReady = false
                 }
 
                 if (chunkFailed) break
@@ -1730,11 +1775,24 @@ class ChatViewModel(
                 // since ArtifactExtractor needs those to find every
                 // real block, not just the first one this card
                 // shows live.
-                val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines)
-                var finalCodeMessage = if (zipEditTarget == null && ProjectTypeGate.isWebAppCreationRequest(prompt)) {
-                    attachArtifactsIfAny(activeSessionId, codeRendered, simpleWebApp = true)
+                val finalFileName = ArtifactExtractor.extract(finalFull).firstOrNull()?.fileName
+                    ?: inferSnippetFileName(prompt, finalFull)
+                val codeRendered = ChatMessage(id = finalCodeId, text = finalFull, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = finalSplit.codeLines, codeFileName = finalFileName)
+                val autoArtifactOutput = ProjectTypeGate.isWebAppCreationRequest(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsMultipleFiles(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsArtifactOutput(prompt)
+                var finalCodeMessage = if (zipEditTarget == null) {
+                    if (autoArtifactOutput) {
+                        attachArtifactsIfAny(
+                            activeSessionId,
+                            codeRendered,
+                            simpleWebApp = ProjectTypeGate.isWebAppCreationRequest(prompt)
+                        )
+                    } else {
+                        codeRendered
+                    }
                 } else {
-                    attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget)
+                    attachArtifactsOrPatchZip(activeSessionId, codeRendered, zipEditTarget, prompt)
                 }
                 // Phase 17.1 (PROGRESS.md Phase 17 Plan) - only
                 // runs when [finalCodeMessage] genuinely has real
@@ -1980,9 +2038,10 @@ class ChatViewModel(
             forceMode: ComputeMode? = null,
             initialOutput: String = "",
             initialContinuationPrompt: String? = null,
-            onChunkText: suspend (String) -> Unit = {}
-        ): Pair<String, String> {
+            onChunkText: suspend (String, Int) -> Unit = { _, _ -> }
+        ): Triple<String, String, Int> {
             val builder = StringBuilder(initialOutput)
+            var generatedTokenCount = 0
             var continuationPrompt = initialContinuationPrompt?.takeIf { it.isNotBlank() } ?: prompt
             var nativeContinuationReady = false
             var reason = "max_tokens"
@@ -2027,7 +2086,17 @@ class ChatViewModel(
                         }
                         generationFlow.collect {
                             builder.append(it)
-                            onChunkText(builder.toString())
+                            generatedTokenCount++
+                            val partial = builder.toString()
+                            onChunkText(partial, generatedTokenCount)
+                            if (ArtifactExtractor.extract(partial).isNotEmpty()) {
+                                // Each multi-file call asks for exactly one complete
+                                // fenced file. Once that real fence closes, stop the
+                                // native/remote stream immediately instead of allowing
+                                // a small model to continue with prose or a second file.
+                                BrainEngine.cancelGeneration()
+                                throw CodeContractCompleteException()
+                            }
                         }
                     }
                     if (timedOutOrNull == null) {
@@ -2042,6 +2111,9 @@ class ChatViewModel(
                         reason = if (nativeIdle) "timeout" else "engine_busy"
                         break
                     }
+                } catch (e: CodeContractCompleteException) {
+                    chunkReason = "end_of_generation"
+                    nativeContinuationReady = false
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -2053,7 +2125,7 @@ class ChatViewModel(
                 if (!nativeContinuationReady) continuationPrompt = buildRecoveryPrompt(prompt, builder.toString(), loadedContextSize)
             }
             if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
-            return builder.toString() to reason
+            return Triple(builder.toString(), reason, generatedTokenCount)
         }
 
 
@@ -2077,6 +2149,13 @@ class ChatViewModel(
         val plan: PlanningEngine.FilePlan? = if (resumeCheckpoint != null) {
             PlanningEngine.fromJson(resumeCheckpoint.planJson)
         } else {
+            val explicitPlan = PlanningEngine.explicitPlan(originalRequest)
+            if (explicitPlan != null) {
+                val planningStepId = pushRunning(ProcessMarking.PLANNING, "Using the explicitly requested web file structure")
+                completeStep(planningStepId, label = "Plan confirmed: ${explicitPlan.files.size} explicitly requested files")
+                postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(explicitPlan))
+                explicitPlan
+            } else {
             val planningStepId = pushRunning(ProcessMarking.PLANNING, "Planning project files with the local model")
             val trimmedPlanningExtraContext = if (extraContextBlock.length > PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) {
                 extraContextBlock.take(PLANNING_PROMPT_EXTRA_CONTEXT_CHAR_CAP) + "\n... (extra context truncated for planning)"
@@ -2102,6 +2181,7 @@ class ChatViewModel(
             completeStep(planningStepId, label = if (planningTimedOut) "Planner timed out - verified fallback file set ready" else "Planning complete")
             postSystemNote(activeSessionId, PlanningEngine.buildPlanSummary(fallback))
             fallback
+            }
         }
         if (plan == null) {
             // The request was handled by a real clarification question; do
@@ -2271,19 +2351,19 @@ class ChatViewModel(
                     )
                 }
             }
-            val (rawOutput, stopReason) = try {
+            val (rawOutput, stopReason, generatedTokenCount) = try {
                 generateFileContent(
                     filePrompt,
                     initialOutput = resumePartial,
                     initialContinuationPrompt = resumeContinuationPrompt,
-                    onChunkText = { partial ->
+                    onChunkText = { partial, generatedTokenCount ->
                         checkpointCallback(partial)
                         upsertBotMessage(
                             codeBotId,
                             ChatMessage(
                                 id = codeBotId, text = partial, isUser = false, timestamp = timeNow(),
                                 state = BotMessageState.CODING, codeFileName = planned.fileName,
-                                codeLines = partial.lines(), generationProgress = partial.length
+                                codeLines = partial.lines(), generationProgress = generatedTokenCount
                             )
                         )
                     }
@@ -2309,7 +2389,7 @@ class ChatViewModel(
                 ChatMessage(
                     id = codeBotId, text = content, isUser = false, timestamp = timeNow(),
                     state = BotMessageState.CODE_DONE, codeFileName = planned.fileName,
-                    codeLines = finalCodeLines, generationProgress = content.length
+                    codeLines = finalCodeLines, generationProgress = generatedTokenCount
                 )
             )
             if (content.isBlank()) {
@@ -2357,12 +2437,12 @@ class ChatViewModel(
                         append("\nCurrent content:\n```\n").append(content).append("\n```\n\n")
                         append("Reply with exactly one fenced code block containing the complete, corrected file, and nothing else.")
                     }
-                    val (fixedRaw, fixStopReason) = try {
+                    val (fixedRaw, fixStopReason, _) = try {
                         generateFileContent(fixPrompt)
                     } catch (e: kotlinx.coroutines.CancellationException) {
                         throw e
                     } catch (e: Exception) {
-                        "" to "error"
+                        Triple("", "error", 0)
                     }
                     val fixedExtracted = ArtifactExtractor.extract(fixedRaw).firstOrNull()?.content
                     if (!fixedExtracted.isNullOrBlank()) {
@@ -2390,6 +2470,18 @@ class ChatViewModel(
                 postSystemNote(activeSessionId, "${planned.fileName} still has real validation issues after the allowed fixes. The checkpoint is saved at this file; reply \"continue\" after the task is corrected.")
                 return false
             }
+
+            // The validator/fix loop may have replaced the original generation.
+            // Keep the visible card synchronized with the exact content that is
+            // about to be written to disk, so chat and artifact never disagree.
+            upsertBotMessage(
+                codeBotId,
+                ChatMessage(
+                    id = codeBotId, text = content, isUser = false, timestamp = timeNow(),
+                    state = BotMessageState.CODE_DONE, codeFileName = planned.fileName,
+                    codeLines = content.lines(), generationProgress = generatedTokenCount
+                )
+            )
 
             val signature = extractSignature(planned.fileName, content)
             if (signature.isNotBlank()) olderFileSignatures += signature
@@ -2492,7 +2584,8 @@ class ChatViewModel(
         }
 
         val completeStepId = pushRunning(ProcessMarking.COMPLETE)
-        val buildPassed = passCount == totalReal && artifactInfos.size == totalReal
+        val sourceArtifactCount = artifactInfos.count { !it.fileName.endsWith(".zip", ignoreCase = true) }
+        val buildPassed = passCount == totalReal && sourceArtifactCount == totalReal
         completeStep(
             completeStepId,
             failed = !buildPassed,
@@ -3005,11 +3098,16 @@ class ChatViewModel(
             val split = splitIntroAndCode(recoveredText)
             if (split.codeLines == null) {
                 val renderedMessage = renderMessage(botId, recoveredText, BotMessageState.TEXT)
-                val finalMessage = attachArtifactsIfAny(
-                    activeSessionId,
-                    renderedMessage,
-                    simpleWebApp = ProjectTypeGate.isWebAppCreationRequest(prompt)
-                )
+                val finalMessage = if (ProjectTypeGate.isWebAppCreationRequest(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsMultipleFiles(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsArtifactOutput(prompt)
+                ) {
+                    attachArtifactsIfAny(
+                        activeSessionId,
+                        renderedMessage,
+                        simpleWebApp = ProjectTypeGate.isWebAppCreationRequest(prompt)
+                    )
+                } else renderedMessage
                 upsertBotMessage(botId, finalMessage)
                 persistMessage(activeSessionId, finalMessage)
                 analyticsStore.addTokensGenerated(recoveredTokenCount.toLong())
@@ -3026,12 +3124,19 @@ class ChatViewModel(
                     removeBotMessage(botId)
                 }
                 val recoveredCodeId = nextId++
-                val codeRendered = ChatMessage(id = recoveredCodeId, text = recoveredText, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = split.codeLines)
-                val finalCodeMessage = attachArtifactsIfAny(
-                    activeSessionId,
-                    codeRendered,
-                    simpleWebApp = ProjectTypeGate.isWebAppCreationRequest(prompt)
-                )
+                val recoveredFileName = ArtifactExtractor.extract(recoveredText).firstOrNull()?.fileName
+                    ?: inferSnippetFileName(prompt, recoveredText)
+                val codeRendered = ChatMessage(id = recoveredCodeId, text = recoveredText, isUser = false, timestamp = timeNow(), state = BotMessageState.CODE_DONE, codeLines = split.codeLines, codeFileName = recoveredFileName)
+                val finalCodeMessage = if (ProjectTypeGate.isWebAppCreationRequest(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsMultipleFiles(prompt) ||
+                    ProjectTypeGate.explicitlyRequestsArtifactOutput(prompt)
+                ) {
+                    attachArtifactsIfAny(
+                        activeSessionId,
+                        codeRendered,
+                        simpleWebApp = ProjectTypeGate.isWebAppCreationRequest(prompt)
+                    )
+                } else codeRendered
                 upsertBotMessage(recoveredCodeId, finalCodeMessage)
                 persistMessage(activeSessionId, finalCodeMessage)
                 analyticsStore.addTokensGenerated(recoveredTokenCount.toLong())
@@ -3085,6 +3190,39 @@ class ChatViewModel(
      * task's own prompt, since a message's attachments apply to the whole
      * turn the user sent, not to just one of its split-out tasks.
      */
+    private suspend fun runStaticZipDiagnosis(activeSessionId: String, zipInfo: AttachmentInfo) {
+        val entries = toolGateway.listZipEntries(zipInfo.storedPath, maxEntries = Int.MAX_VALUE)
+        val readable = entries.filter { !it.isDirectory && AttachmentContentReader.isTextReadable(it.name) }
+        val findings = mutableListOf<String>()
+        var scanned = 0
+        for (entry in readable.take(80)) {
+            val content = toolGateway.readZipEntry(zipInfo.storedPath, entry.name, 16_000) ?: continue
+            scanned++
+            val result = FileValidator.validate(entry.name, content)
+            if (!result.passed) {
+                findings += "- ${entry.name}: ${result.issues.joinToString("; ")}"
+            }
+        }
+        val omitted = (readable.size - scanned).coerceAtLeast(0)
+        val report = buildString {
+            append("Static ZIP scan complete for ${zipInfo.fileName}.\n")
+            append("Readable source/config files: ${readable.size}; scanned: $scanned")
+            if (omitted > 0) append("; not scanned in this bounded pass: $omitted")
+            append(".\n\n")
+            if (findings.isEmpty()) {
+                append("No deterministic structural or placeholder red flags were found in the scanned files. This is not a compiler/build proof and no AI root-cause claim was made because no model is loaded.")
+            } else {
+                append("Confirmed static red flags:\n")
+                append(findings.joinToString("\n"))
+                append("\n\nThese are deterministic scan results only; load a model for evidence-based root-cause analysis across the project.")
+            }
+        }
+        val botId = nextId++
+        val message = ChatMessage(botId, report, false, timeNow(), BotMessageState.TEXT)
+        upsertBotMessage(botId, message)
+        persistMessage(activeSessionId, message)
+    }
+
     private suspend fun runZipDiagnosis(activeSessionId: String, zipInfo: AttachmentInfo, request: String, webContext: String): Boolean {
         val inspection = ZipProjectInspector.inspect(zipInfo.storedPath, request)
         if (inspection.selectedFiles.isEmpty()) { postSystemNote(activeSessionId, "I could not read supported source/config files from ${zipInfo.fileName}; no bug claim was made."); return true }
@@ -3173,14 +3311,12 @@ class ChatViewModel(
     }
 
     /**
-     * Phase 11 (Artifact card + ZIP/file output + download flow) - real,
-     * separate pass over the already-completed [rendered] message's full
-     * text: finds every fenced code block ([ArtifactExtractor]), writes
-     * each one's real content to a real file
-     * ([ArtifactFileManager.writeArtifact]), and persists real metadata
-     * rows ([ArtifactRepository]) so the artifact survives a History
-     * reopen. A plain-prose reply with no fenced block is returned
-     * unchanged - no artifact, no card, nothing invented.
+     * Creates real artifact files only when the caller has already established
+     * an explicit artifact/project-output intent (for example a web-app build,
+     * a multi-file project, or a direct file request). Ordinary fenced code in
+     * chat is deliberately left as chat content until the user asks for it as
+     * a file/ZIP. Once called, every accepted fenced block is written to real
+     * bytes and persisted through [ArtifactRepository].
      */
     /**
      * Phase 16 (Real ZIP content edit) - real router between "one file
@@ -3189,14 +3325,14 @@ class ChatViewModel(
      * attempted when [zipEditTarget] is genuinely set (see
      * [ZipEditResolver]'s own doc for how conservatively that happens) AND
      * the completed response contains **exactly one** real fenced block -
-     * zero or multiple candidates falls straight back to
-     * [attachArtifactsIfAny]'s existing, unchanged behavior rather than
-     * guessing which block was meant as the replacement.
+     * zero or multiple candidates are rejected rather than guessed. A ZIP edit
+     * never falls back to creating a separate artifact, because that would
+     * hide a failed project edit behind an unrelated file.
      */
-    private suspend fun attachArtifactsOrPatchZip(activeSessionId: String, rendered: ChatMessage, zipEditTarget: ZipEditTarget?): ChatMessage {
-        if (zipEditTarget == null) return attachArtifactsIfAny(activeSessionId, rendered)
+    private suspend fun attachArtifactsOrPatchZip(activeSessionId: String, rendered: ChatMessage, zipEditTarget: ZipEditTarget?, userRequest: String = ""): ChatMessage {
+        if (zipEditTarget == null) return rendered
         val candidates = ArtifactExtractor.extract(rendered.text)
-        if (candidates.isEmpty()) return attachArtifactsIfAny(activeSessionId, rendered)
+        if (candidates.isEmpty()) return rendered
 
         // Existing-project changes may legitimately touch more than one real file
         // (for example a new function plus its caller/wiring). Accept only
@@ -3214,16 +3350,16 @@ class ChatViewModel(
                 if (old.isNotBlank()) replacements[match.name] = old to candidate.content
             }
         }
-        if (replacements.isEmpty()) return attachArtifactsIfAny(activeSessionId, rendered)
+        if (replacements.isEmpty()) return rendered
 
         // Real safety check for every changed file: don't silently delete an
         // existing top-level declaration unless the user's request explicitly
         // contains removal language. This is checked before the write.
-        val allowsRemoval = listOf("remove", "delete", "rename", "remove kar", "delete kar", "hatao", "hatana").any { rendered.text.lowercase().contains(it) }
+        val allowsRemoval = listOf("remove", "delete", "rename", "remove kar", "delete kar", "hatao", "hatana").any { userRequest.lowercase().contains(it) }
         val removed = replacements.flatMap { (name, pair) -> detectRemovedDeclarations(pair.first, pair.second).map { decl -> name to decl } }
         if (removed.isNotEmpty() && !allowsRemoval) {
             postSystemNote(activeSessionId, "Blocked the project change because it would remove existing declarations without an explicit removal request: ${removed.joinToString { "${it.first}: ${it.second}" }}")
-            return attachArtifactsIfAny(activeSessionId, rendered)
+            return rendered
         }
 
         val result = toolGateway.patchZipEntries(activeSessionId, File(zipEditTarget.zipStoredPath), replacements, zipEditTarget.zipDisplayName)
@@ -3231,7 +3367,7 @@ class ChatViewModel(
             is ToolGateway.GatewayResult.Success -> result.value
             is ToolGateway.GatewayResult.Denied -> {
                 postSystemNote(activeSessionId, "Could not update ${zipEditTarget.zipDisplayName}: ${result.reason}")
-                return attachArtifactsIfAny(activeSessionId, rendered)
+                return rendered
             }
         }
         val info = ArtifactInfo(UUID.randomUUID().toString(), patchedZip.name, patchedZip.length(), classifyArtifact(patchedZip.name), mimeTypeForArtifact(patchedZip.name), patchedZip.absolutePath)
@@ -3833,6 +3969,8 @@ class ChatViewModel(
      */
     private data class SplitContent(val introText: String, val codeLines: List<String>?)
 
+    private class CodeContractCompleteException : RuntimeException()
+
     private fun splitIntroAndCode(text: String): SplitContent {
         if (!text.contains("```")) return SplitContent(text, null)
         val introText = text.substringBefore("```").trim()
@@ -3896,13 +4034,21 @@ class ChatViewModel(
      */
     private suspend fun handleArtifactFollowUpIfRequested(activeSessionId: String, request: String): Boolean {
         val lower = request.lowercase(Locale.getDefault())
-        val wantsFile = listOf("file me", "file mein", "as a file", "save as file", "isko file", "isko ek file", "file bana", "file do").any { lower.contains(it) }
+        val wantsFile = listOf("file me", "file mein", "fill me", "fill mein", "as a file", "save as file", "isko file", "isko ek file", "file bana", "file do").any { lower.contains(it) }
         val wantsZip = listOf("zip", "zip kar", "zip bana", "zip me", "as zip", "package it").any { lower.contains(it) }
         if (!wantsFile && !wantsZip) return false
         val wantsFileOutput = wantsFile || wantsZip
 
         val previousUser = messages.value.asReversed().drop(1).firstOrNull { it.isUser && it.text.isNotBlank() }
-        val previousBot = messages.value.asReversed().drop(1).firstOrNull { !it.isUser && it.text.isNotBlank() }
+        // Ignore PROCESS/SYSTEM_NOTE bubbles when resolving a file/ZIP follow-up.
+        // Prefer the nearest real assistant answer that actually contains code
+        // or an artifact; status notes must never hide the previous answer.
+        val previousBot = messages.value.asReversed().drop(1).firstOrNull {
+            !it.isUser &&
+                it.text.isNotBlank() &&
+                it.state in setOf(BotMessageState.TEXT, BotMessageState.CODE_DONE) &&
+                (it.artifacts.isNotEmpty() || ArtifactExtractor.extract(it.text).isNotEmpty())
+        }
         val existingArtifacts = previousBot?.artifacts.orEmpty()
 
         if (wantsZip && existingArtifacts.isNotEmpty()) {
@@ -3960,7 +4106,7 @@ class ChatViewModel(
         val blocks = if (candidates.isNotEmpty()) {
             candidates
         } else {
-            listOf(ArtifactCandidate(inferSnippetFileName(request, source.text), source.text.trim()))
+            listOf(ArtifactCandidate(inferSnippetFileName(previousUser?.text.orEmpty() + "\n" + request, source.text), source.text.trim()))
         }
         val usable = blocks.filter { it.content.isNotBlank() }
         if (usable.isEmpty()) {
@@ -4002,12 +4148,16 @@ class ChatViewModel(
             .find(request)?.value
         if (explicit != null) return explicit
         val lower = source.lowercase()
+        val requestLower = request.lowercase()
         return when {
-            "<html" in lower || "<div" in lower -> "index.html"
-            "function " in lower || "const " in lower || "let " in lower || "=>" in source -> "snippet.js"
-            "fun " in lower || "class " in lower && "{}" !in source -> "Snippet.kt"
-            "def " in lower || "import " in lower && "python" in lower -> "snippet.py"
-            "{\n" in source && ":" in source -> "snippet.json"
+            "python" in requestLower || ".py" in requestLower || "def " in lower ||
+                "print(" in lower || "if __name__" in lower || "from " in lower && " import " in lower -> "snippet.py"
+            "html" in requestLower || ".html" in requestLower || "<html" in lower || "<div" in lower -> "index.html"
+            "javascript" in requestLower || ".js" in requestLower || "function " in lower || "const " in lower || "let " in lower || "=>" in source -> "snippet.js"
+            "typescript" in requestLower || ".ts" in requestLower -> "snippet.ts"
+            "kotlin" in requestLower || ".kt" in requestLower || "fun " in lower -> "Snippet.kt"
+            "java" in requestLower || ".java" in requestLower -> "Main.java"
+            "json" in requestLower || ".json" in requestLower || ("{\n" in source && ":" in source) -> "snippet.json"
             else -> "snippet.txt"
         }
     }
@@ -4088,11 +4238,15 @@ class ChatViewModel(
     )
 
     private val diagnoseIntentWords = listOf(
-        "find the bug", "find bug", "find bugs", "what's wrong", "whats wrong", "why is", "why does",
+        "find the bug", "find bug", "find bugs", "bug find", "bugs find",
+        "find the error", "find error", "find errors", "error find", "errors find",
+        "find the problem", "find problem", "problem find", "find the issue", "find issue", "issue find",
+        "what's wrong", "whats wrong", "why is", "why does",
         "explain", "review", "diagnose", "what error", "any bug", "any issue", "kya galat",
         "kya error", "kya bug", "kya problem", "error dekho", "error check", "bug dekho",
-        "bug check", "bug dundo", "bug dhundo", "bug dhoondo", "error dundo", "error dhundo",
-        "error dhoondo", "galt kya", "galat kya", "problem dekho", "issue dekho", "check karo",
+        "bug check", "bug dundo", "bug dhundo", "bug dhoondo", "bug dhoond",
+        "error dundo", "error dhundo", "error dhoondo", "error dhoond",
+        "problem dhoondo", "issue dhoondo", "galt kya", "galat kya", "problem dekho", "issue dekho", "check karo",
         "check this zip", "check the zip", "check zip", "check for bug", "check for error",
         "is there a bug", "is there an issue", "dhoondo", "dhundo", "batao kya"
     )

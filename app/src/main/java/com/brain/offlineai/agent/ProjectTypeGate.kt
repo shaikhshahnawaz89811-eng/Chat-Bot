@@ -87,21 +87,60 @@ object ProjectTypeGate {
     fun isCodeCreationRequest(text: String): Boolean =
         isCreationRequest(text) || listOf("code", "coding", "program", "script", "html", "css", "javascript", "kotlin", "python", "java").any { text.lowercase().contains(it) }
 
+
+    /**
+     * True when the user's own wording explicitly asks for a generated
+     * file/project artifact now. Ordinary code generation is deliberately
+     * excluded: writing code in chat must not silently create files.
+     */
+
+    /** True when the user explicitly asks for an explanation around generated code. */
+    fun explicitlyRequestsCodeExplanation(text: String): Boolean {
+        val lower = text.lowercase()
+        return listOf(
+            "explain", "explanation", "why", "how does", "how it works",
+            "samjha", "samjhao", "samjha do", "kaise", "kyun", "क्यों", "समझा", "समझाओ"
+        ).any { lower.contains(it) }
+    }
+
+    /** Code-only requests can safely finish at the first complete fenced block. */
+    fun shouldStopAfterFirstCodeBlock(text: String): Boolean =
+        isCodeCreationRequest(text) && !explicitlyRequestsCodeExplanation(text)
+
+    fun explicitlyRequestsArtifactOutput(text: String): Boolean {
+        val lower = text.lowercase()
+        val outputWords = listOf(
+            "file me", "file mein", "fill me", "fill mein", "as a file", "save as file", "save it as a file",
+            "isko file", "isko ek file", "file bana", "file do", "file me do",
+            "artifact", "download", "save it", "save this", "export it",
+            "create a file", "create file", "make a file", "generate a file",
+            "file banao", "file banado", "file bana do", "फाइल में", "फाइल बना",
+            "फाइल दो", "फाइल में दो", "डाउनलोड"
+        )
+        if (outputWords.any { lower.contains(it) }) return true
+        return Regex("\\b(?:html?|css|js|ts|jsx|tsx|py|python|kt|kotlin|java|json|xml|md|txt)\\s+file\\b", RegexOption.IGNORE_CASE).containsMatchIn(text)
+    }
+
     fun explicitlyRequestsMultipleFiles(text: String): Boolean {
         val lower = text.lowercase()
         val explicitMultiFileWords = listOf(
-            "multi-file", "multifile", "multiple files", "separate files",
-            "separate html css js", "html css js files", "split into files",
-            "file-by-file", "zip project", "project files",
-            "alag alag files", "alag files", "multiple file", "sabhi files",
+            "multi-file", "multifile", "multi file", "multiple files", "multiple file",
+            "separate files", "separate html css js", "html css js files", "html css and js files",
+            "html, css and javascript", "html css javascript files", "split into files",
+            "file-by-file", "one file at a time", "zip project", "project files", "project zip",
+            "alag alag files", "alag files", "alag html css js", "multiple file", "sabhi files",
             "har file alag", "poora project", "puri project", "zip me",
-            "अलग अलग फाइल", "मल्टीपल फाइल", "पूरा प्रोजेक्ट"
+            "अलग अलग फाइल", "मल्टीपल फाइल", "पूरा प्रोजेक्ट", "हर फाइल अलग"
         )
         // A plain creation request is intentionally NOT multi-file by default.
         // "create web app" follows the documented simple web path (one
         // self-contained HTML artifact). The expensive planner is reserved
         // for an explicit request for separate/multiple/project files.
-        return explicitMultiFileWords.any { lower.contains(it) }
+        if (explicitMultiFileWords.any { lower.contains(it) }) return true
+        val webTripleFileRequest =
+            (lower.contains("html") && lower.contains("css") && (lower.contains("javascript") || lower.contains("js"))) &&
+            listOf("separate", "files", "file", "split", "project", "zip", "alag", "अलग").any { lower.contains(it) }
+        return webTripleFileRequest
     }
 
     /**

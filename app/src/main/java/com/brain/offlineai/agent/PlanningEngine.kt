@@ -33,9 +33,6 @@ object PlanningEngine {
     data class PlannedFile(val fileName: String, val language: String, val purpose: String)
     data class FilePlan(val files: List<PlannedFile>, val truncatedFromCount: Int? = null)
 
-    private val fileLine = Regex("""(?im)^FILE:\s*(.+)$""")
-    private val langLine = Regex("""(?im)^LANG:\s*(.+)$""")
-    private val purposeLine = Regex("""(?im)^PURPOSE:\s*(.+)$""")
     /** A real file name has an extension - guards against the model naming a folder or a vague label ("the backend") as if it were a file. */
     private val looksLikeFileName = Regex("""^[\w./-]+\.[A-Za-z0-9]+$""")
 
@@ -76,23 +73,50 @@ object PlanningEngine {
      * own "a false negative just means an ordinary generation runs" default.
      */
     fun parsePlan(rawModelOutput: String): FilePlan? {
-        val fileMatches = fileLine.findAll(rawModelOutput).map { it.groupValues[1].trim() }.toList()
-        val langMatches = langLine.findAll(rawModelOutput).map { it.groupValues[1].trim() }.toList()
-        val purposeMatches = purposeLine.findAll(rawModelOutput).map { it.groupValues[1].trim() }.toList()
-
-        val realFiles = fileMatches.mapIndexedNotNull { index, name ->
-            val cleanName = name.trim().trim('`', '*', '"', '\'')
-            if (!looksLikeFileName.matches(cleanName)) return@mapIndexedNotNull null
-            PlannedFile(
-                fileName = cleanName,
-                language = langMatches.getOrNull(index)?.trim().takeUnless { it.isNullOrBlank() } ?: languageFromExtension(cleanName),
-                purpose = purposeMatches.getOrNull(index)?.trim().takeUnless { it.isNullOrBlank() } ?: ""
-            )
-        }.distinctBy { it.fileName }
+        val normalized = rawModelOutput.replace("\r\n", "\n").trim()
+        val realFiles = normalized.split(Regex("""(?m)^\s*---\s*$"""))
+            .mapNotNull { block ->
+                val lines = block.lines().map { it.trim() }.filter { it.isNotEmpty() }
+                val file = lines.firstOrNull { it.startsWith("FILE:", ignoreCase = true) }
+                    ?.substringAfter(":", "")?.trim()
+                    ?: return@mapNotNull null
+                if (!isSafePlannedFileName(file)) return@mapNotNull null
+                val languageLine = lines.firstOrNull { it.startsWith("LANG:", ignoreCase = true) }
+                val language = languageLine?.substringAfter(":", "")?.trim().orEmpty().ifBlank { languageFromExtension(file) }
+                val purposeLine = lines.firstOrNull { it.startsWith("PURPOSE:", ignoreCase = true) }
+                val purpose = purposeLine?.substringAfter(":", "")?.trim().orEmpty()
+                PlannedFile(file, language, purpose)
+            }
+            .distinctBy { it.fileName }
 
         if (realFiles.size < MIN_FILES_FOR_MULTI_FILE) return null
-
         return FilePlan(files = realFiles)
+    }
+
+    private fun isSafePlannedFileName(name: String): Boolean {
+        if (!looksLikeFileName.matches(name)) return false
+        if (name.startsWith("/") || name.startsWith("\\")) return false
+        if (name.split('/', '\\').any { it == ".." || it.isBlank() }) return false
+        return true
+    }
+
+    /** Deterministic plan for an explicit, common three-file web request. This avoids spending a local model call merely rediscovering filenames the user already named. */
+    fun explicitPlan(originalRequest: String): FilePlan? {
+        val lower = originalRequest.lowercase()
+        val asksWeb = listOf("web app", "webapp", "website", "html").any { lower.contains(it) }
+        val asksSeparateWebFiles = asksWeb &&
+            lower.contains("html") && lower.contains("css") &&
+            (lower.contains("javascript") || lower.contains("js")) &&
+            listOf("separate", "files", "file", "split", "project", "zip", "alag", "अलग").any { lower.contains(it) }
+        return if (asksSeparateWebFiles) {
+            FilePlan(
+                files = listOf(
+                    PlannedFile("index.html", "HTML", "Application structure and accessible UI"),
+                    PlannedFile("styles.css", "CSS", "Responsive visual styling"),
+                    PlannedFile("script.js", "JavaScript", "Client-side behavior and interactions")
+                )
+            )
+        } else null
     }
 
     /**
@@ -164,7 +188,7 @@ object PlanningEngine {
             val name = item.optString("fileName").trim()
             val language = item.optString("language").trim()
             val purpose = item.optString("purpose").trim()
-            if (!looksLikeFileName.matches(name) || language.isBlank()) null
+            if (!isSafePlannedFileName(name) || language.isBlank()) null
             else PlannedFile(name, language, purpose)
         }.distinctBy { it.fileName }
         if (files.size < MIN_FILES_FOR_MULTI_FILE) null else FilePlan(files)

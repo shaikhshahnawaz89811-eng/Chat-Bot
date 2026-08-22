@@ -82,7 +82,7 @@ object ArtifactExtractor {
             val rawTag = match.groupValues[1].trim()
             val body = match.groupValues[2]
             if (body.isBlank()) return@mapIndexedNotNull null
-            var fileName = resolveFileName(rawTag, index)
+            var fileName = resolveFileName(rawTag, index, body)
             if (!usedNames.add(fileName)) {
                 val languageTag = rawTag.lowercase()
                 val extension = extensionForLanguage[languageTag] ?: fileName.substringAfterLast('.', "txt")
@@ -97,11 +97,11 @@ object ArtifactExtractor {
      * A real filename the model itself wrote in the fence tag is used
      * as-is (case preserved - `MainActivity.kt` stays `MainActivity.kt`,
      * never lowercased into something that won't match a real Android
-     * class name). Only when the tag genuinely isn't a filename (a plain
-     * language tag, or no tag at all) does this fall back to the existing
-     * `artifact_N.ext` generic naming - unchanged from before.
+     * class name). A normal language tag maps to a deterministic extension;
+     * when a small model omits the language tag entirely, strong syntax
+     * markers are used before falling back to `artifact_N.txt`.
      */
-    private fun resolveFileName(rawTag: String, index: Int): String {
+    private fun resolveFileName(rawTag: String, index: Int, body: String): String {
         if (rawTag.isNotBlank() && filenameTagPattern.matches(rawTag)) return rawTag
         val languageTag = rawTag.lowercase()
         return when (languageTag) {
@@ -116,8 +116,22 @@ object ArtifactExtractor {
             "xml" -> "layout.xml"
             "bash", "sh", "shell" -> "script.sh"
             else -> {
-                val extension = extensionForLanguage[languageTag] ?: "txt"
-                "artifact_${index + 1}.$extension"
+                // Small local models sometimes omit the fence language entirely.
+                // Infer only from strong, deterministic syntax markers so a real
+                // Python/HTML/JS response does not become artifact_N.txt.
+                val lower = body.lowercase()
+                when {
+                    "<!doctype html" in lower || "<html" in lower || "<head" in lower || "<body" in lower -> "index.html"
+                    "def " in lower || "print(" in lower || "if __name__" in lower || "from " in lower && " import " in lower -> "main.py"
+                    "function " in lower || "const " in lower || "let " in lower || "=>" in body -> "script.js"
+                    "fun " in lower || "val " in lower && "var " in lower -> "Main.kt"
+                    "public static void main" in lower || "system.out." in lower -> "Main.java"
+                    "{\n" in body && ":" in body -> "data.json"
+                    else -> {
+                        val extension = extensionForLanguage[languageTag] ?: "txt"
+                        "artifact_${index + 1}.$extension"
+                    }
+                }
             }
         }
     }

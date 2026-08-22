@@ -117,6 +117,17 @@ object BrainEngine {
         get() = _state.value is EngineState.Loaded
 
     /**
+     * Requests cancellation of the currently running local native generation.
+     * This is intentionally a best-effort, lock-free signal; the native loop
+     * observes it between bounded prefill/decode steps.
+     */
+    fun cancelGeneration() {
+        if (generationActive.get()) {
+            BrainNative.nativeCancelGeneration()
+        }
+    }
+
+    /**
      * A timed-out collector can return before the detached native worker has
      * released llama.cpp's process-wide mutex. Callers must wait for this
      * endpoint before starting a fallback generation.
@@ -211,13 +222,15 @@ object BrainEngine {
             if (cancelled.get()) {
                 false
             } else if (token.isEmpty()) {
-                // Empty callback is a native prefill heartbeat only. It is
-                // deliberately NOT reported as generation progress: the
-                // ChatViewModel stall watchdog must measure time to the next
-                // real generated token, otherwise a slow prefill can reset
-                // the 90-second watchdog forever while the UI remains at
-                // "0 tokens" for minutes. Cancellation still returns true
-                // here so the native prefill loop remains interruptible.
+                // Empty callback is a real native prefill heartbeat. It is
+                // never counted as a generated token, but it IS forward
+                // progress: the native bridge has just decoded another real
+                // prompt chunk. Reporting that heartbeat keeps the stall
+                // watchdog from killing a slow-but-healthy first-token
+                // prefill while the UI correctly remains at 0 generated
+                // tokens. Cancellation still returns true so the native
+                // prefill loop remains interruptible.
+                onProgress()
                 true
             } else {
                 onProgress()

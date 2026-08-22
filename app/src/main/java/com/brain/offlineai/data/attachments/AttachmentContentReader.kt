@@ -95,9 +95,18 @@ object AttachmentContentReader {
             if (!file.exists() || !file.isFile) return@withContext null
             try {
                 val bytesToRead = minOf(file.length(), maxBytes.toLong()).toInt()
+                if (bytesToRead <= 0) return@withContext ""
                 val buffer = ByteArray(bytesToRead)
-                val actuallyRead = file.inputStream().use { it.read(buffer) }
-                val safeCount = if (actuallyRead > 0) actuallyRead else 0
+                val safeCount = file.inputStream().use { input ->
+                    var total = 0
+                    while (total < buffer.size) {
+                        val read = input.read(buffer, total, buffer.size - total)
+                        if (read < 0) break
+                        if (read == 0) continue
+                        total += read
+                    }
+                    total
+                }
                 val text = String(buffer, 0, safeCount, Charsets.UTF_8)
                 if (file.length() > safeCount) "$text\n... (truncated - ${file.length()} bytes total)" else text
             } catch (e: Exception) {
@@ -153,12 +162,17 @@ object AttachmentContentReader {
                     while (entry != null) {
                         if (!entry.isDirectory && entry.name == entryName) {
                             val buffer = ByteArray(maxBytes)
-                            val actuallyRead = zip.read(buffer)
-                            val safeCount = if (actuallyRead > 0) actuallyRead else 0
+                            var safeCount = 0
+                            while (safeCount < buffer.size) {
+                                val read = zip.read(buffer, safeCount, buffer.size - safeCount)
+                                if (read < 0) break
+                                if (read == 0) continue
+                                safeCount += read
+                            }
                             val text = String(buffer, 0, safeCount, Charsets.UTF_8)
                             // A real, honest truncation note when this real entry is
                             // larger than the cap - never silently cut with no sign.
-                            val hasMore = zip.read() != -1
+                            val hasMore = safeCount == maxBytes && zip.read() != -1
                             return@withContext if (hasMore) "$text\n... (truncated at $maxBytes bytes)" else text
                         }
                         zip.closeEntry()
