@@ -51,6 +51,14 @@ class ToolGateway(private val context: Context) {
     suspend fun readZipEntry(storedPath: String, entryName: String): String? =
         AttachmentContentReader.readZipEntryText(storedPath, entryName)
 
+    /**
+     * Bounded ZIP-entry read for diagnosis/inspection passes. Keep the
+     * one-argument overload above for existing callers; callers that need a
+     * larger or smaller inspection window can explicitly provide [maxBytes].
+     */
+    suspend fun readZipEntry(storedPath: String, entryName: String, maxBytes: Int): String? =
+        AttachmentContentReader.readZipEntryText(storedPath, entryName, maxBytes.coerceAtLeast(1))
+
     suspend fun readTextPreview(storedPath: String): String? =
         AttachmentContentReader.readTextPreview(storedPath)
 
