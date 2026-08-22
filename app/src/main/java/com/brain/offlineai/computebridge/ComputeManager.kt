@@ -78,6 +78,27 @@ class ComputeManager(private val application: Application) {
             }
     }
 
+    /**
+     * Continues the same local llama.cpp KV context without re-reading the
+     * previous prompt/history. Remote workers are intentionally excluded:
+     * their HTTP API is stateless from this client's point of view, so
+     * pretending they have the local KV cache would be fake continuation.
+     */
+    fun continueGenerate(
+        maxTokens: Int = 512,
+        temperature: Float = 0.7f,
+        topP: Float = 0.9f,
+        onStopReason: (String) -> Unit = {},
+        onProgress: () -> Unit = {},
+        forceMode: ComputeMode? = null
+    ): Flow<String> {
+        val effective = forceMode ?: store.mode
+        if (effective != ComputeMode.LOCAL) {
+            throw IllegalStateException("Stateful continuation requires the local model")
+        }
+        return BrainEngine.continueGenerate(maxTokens, temperature, topP, onStopReason, onProgress)
+    }
+
     /** Auto mode's real resource check - the architecture doc's "Low-
      * resource condition mein remote worker prefer kiya ja sakta hai": no
      * local model loaded at all, or this phone's own RAM is already over

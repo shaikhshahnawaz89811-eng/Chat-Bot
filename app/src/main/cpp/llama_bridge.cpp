@@ -32,6 +32,7 @@ llama_context *g_ctx = nullptr;
 const llama_vocab *g_vocab = nullptr;
 bool g_backend_initialized = false;
 int g_n_ctx = 0;
+int g_n_cur = 0;
 
 // Frees whatever is currently loaded. Caller must hold g_engine_mutex.
 void unload_locked() {
@@ -45,6 +46,26 @@ void unload_locked() {
     }
     g_vocab = nullptr;
     g_n_ctx = 0;
+    g_n_cur = 0;
+}
+
+// Creates the real llama sampler used for every generation segment.
+// The sampler itself is per segment; the model/KV context is what carries
+// the actual prompt + generated-token state across nativeContinueGenerate().
+llama_sampler *make_sampler(const llama_vocab *vocab, float temperature, float topP) {
+    const int penalty_last_n = 64;
+    const float penalty_repeat = 1.1f;
+    const float penalty_freq = 0.0f;
+    const float penalty_present = 0.0f;
+    llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
+    llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
+    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
+        llama_vocab_n_tokens(vocab), penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
+    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(topP > 0 ? topP : 0.9f, 1));
+    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.7f));
+    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    return sampler;
 }
 
 } // namespace
@@ -199,34 +220,8 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
         return env->NewStringUTF("error: prompt longer than context window");
     }
 
-    // --- Build a real sampler chain (repeat-penalty -> top-k -> top-p ->
-    // temperature -> distribution) ---
-    // Real bug fix: with no repetition penalty at all, a small on-device
-    // model (e.g. Qwen2.5-1.5B) very often falls into a genuine sampling
-    // loop - once it emits a phrase, that same phrase's tokens keep
-    // scoring highest again on every following step, so it regenerates
-    // the identical line over and over until maxTokens is hit, both
-    // offline and when web-search context is used (the search only
-    // changes the prompt/context fed in - this sampler chain runs the
-    // same way regardless). llama_sampler_init_penalties looks back over
-    // the last [penalty_last_n] real generated tokens and down-weights
-    // ones already seen, which is the standard llama.cpp fix for this -
-    // added first in the chain so it applies before top-k/top-p narrow
-    // the distribution.
-    const int penalty_last_n = 64;
-    const float penalty_repeat = 1.1f;
-    const float penalty_freq = 0.0f;
-    const float penalty_present = 0.0f;
-
-    llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
-    llama_sampler *sampler = llama_sampler_chain_init(sampler_params);
-    llama_sampler_chain_add(sampler, llama_sampler_init_penalties(
-        llama_vocab_n_tokens(g_vocab),
-        penalty_last_n, penalty_repeat, penalty_freq, penalty_present));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_k(40));
-    llama_sampler_chain_add(sampler, llama_sampler_init_top_p(topP > 0 ? topP : 0.9f, 1));
-    llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature > 0 ? temperature : 0.7f));
-    llama_sampler_chain_add(sampler, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    // --- Build the real sampler chain used for this generation segment. ---
+    llama_sampler *sampler = make_sampler(g_vocab, temperature, topP);
 
     // --- Feed the prompt through decode, in chunks ---
     // Real bug fix (user report - after a Kotlin-side timeout gives up
@@ -278,8 +273,9 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
         return env->NewStringUTF("cancelled");
     }
 
+    g_n_cur = n_prompt_tokens;
     int n_generated = 0;
-    int n_cur = n_prompt_tokens;
+    int n_cur = g_n_cur;
     const int limit = maxTokens > 0 ? maxTokens : 512;
     char piece_buf[256];
 
@@ -308,6 +304,8 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
             break;
         }
 
+        llama_sampler_accept(sampler, new_token);
+
         if (n_cur >= g_n_ctx - 1) {
             stopReason = "context_full";
             break;
@@ -319,8 +317,79 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
             break;
         }
         n_cur++;
+        g_n_cur = n_cur;
     }
 
+    g_n_cur = n_cur;
+    llama_sampler_free(sampler);
+    return env->NewStringUTF(stopReason.c_str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_brain_offlineai_engine_BrainNative_nativeContinueGenerate(
+        JNIEnv *env, jobject /* thiz */, jint maxTokens,
+        jfloat temperature, jfloat topP, jobject callback) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+
+    if (g_model == nullptr || g_ctx == nullptr || g_vocab == nullptr) {
+        return env->NewStringUTF("error: no model loaded");
+    }
+    if (g_n_cur <= 0 || g_n_cur >= g_n_ctx - 1) {
+        return env->NewStringUTF("context_full");
+    }
+
+    jclass callbackClass = env->GetObjectClass(callback);
+    jmethodID onTokenMethod = env->GetMethodID(callbackClass, "onToken", "(Ljava/lang/String;)Z");
+    if (onTokenMethod == nullptr) {
+        return env->NewStringUTF("error: callback missing onToken(String):Boolean");
+    }
+
+    llama_sampler *sampler = make_sampler(g_vocab, temperature, topP);
+    std::string stopReason = "max_tokens";
+    int n_generated = 0;
+    int n_cur = g_n_cur;
+    const int limit = maxTokens > 0 ? maxTokens : 512;
+    char piece_buf[256];
+
+    while (n_generated < limit) {
+        if (n_cur >= g_n_ctx - 1) {
+            stopReason = "context_full";
+            break;
+        }
+
+        llama_token new_token = llama_sampler_sample(sampler, g_ctx, -1);
+        if (llama_vocab_is_eog(g_vocab, new_token)) {
+            stopReason = "end_of_generation";
+            break;
+        }
+
+        int piece_len = llama_token_to_piece(g_vocab, new_token, piece_buf, sizeof(piece_buf), 0, true);
+        if (piece_len < 0) {
+            stopReason = "error: token_to_piece failed";
+            break;
+        }
+        std::string piece(piece_buf, piece_len);
+        jstring jpiece = env->NewStringUTF(piece.c_str());
+        jboolean keepGoing = env->CallBooleanMethod(callback, onTokenMethod, jpiece);
+        env->DeleteLocalRef(jpiece);
+        n_generated++;
+
+        if (!keepGoing) {
+            stopReason = "cancelled";
+            break;
+        }
+
+        llama_sampler_accept(sampler, new_token);
+        llama_batch next_batch = llama_batch_get_one(&new_token, 1);
+        if (llama_decode(g_ctx, next_batch) != 0) {
+            stopReason = "error: llama_decode failed mid-generation";
+            break;
+        }
+        n_cur++;
+        g_n_cur = n_cur;
+    }
+
+    g_n_cur = n_cur;
     llama_sampler_free(sampler);
     return env->NewStringUTF(stopReason.c_str());
 }

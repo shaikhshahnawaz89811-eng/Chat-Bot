@@ -1358,6 +1358,20 @@ class ChatViewModel(
      * to [attachArtifactsOrPatchZip] to attempt a real, in-place ZIP patch
      * instead of only ever becoming a standalone file artifact.
      */
+    /** Recovery prompt used only when the native KV context cannot be reused.
+     * Normal max_tokens chunking uses BrainEngine.continueGenerate() instead,
+     * so the already-generated output is never prefilled a second time. */
+    private fun buildRecoveryPrompt(originalRequest: String, partialOutput: String): String {
+        // Recovery after timeout/process death rebuilds the native context
+        // once, but never drags the whole old search result set, transcript,
+        // or enormous generated prefix back through the 7B/8B model.
+        val request = originalRequest.take(6000)
+        val output = partialOutput.takeLast(14000)
+        return request + "\n\n[RESUME CHECKPOINT - TAIL OF PRESERVED OUTPUT]\n" +
+            output +
+            "\n[END RESUME CHECKPOINT]\nContinue from the exact end above. Do not repeat the preserved output."
+    }
+
     private suspend fun streamRealResponse(activeSessionId: String, prompt: String, zipEditTarget: ZipEditTarget? = null): Long {
         val botId = nextId++
         val builder = StringBuilder()
@@ -1453,11 +1467,13 @@ class ChatViewModel(
         // is reached (a hard safety ceiling against a pathological model
         // that never emits an end-of-generation token, so this can never
         // loop forever). Continuation prompts are just the real original
-        // prompt plus every real token produced so far - never an invented
-        // rewrite of what the model already said - so a short task that
-        // finishes in the first real chunk behaves exactly as before
-        // (single call, single stop reason, loop runs once).
+        // A local max_tokens boundary continues the same native KV context
+        // without re-reading the already generated text. Only recovery after
+        // timeout/process death uses the bounded checkpoint prompt. A short
+        // task that finishes in the first real chunk still behaves as before.
         var continuationPrompt = prompt
+        var recoveryPrompt = prompt
+        var nativeContinuationReady = computeManager.mode == ComputeMode.LOCAL
         var stopReason = "max_tokens"
         var chunkIndex = 0
         var fatalError: Throwable? = null
@@ -1512,14 +1528,25 @@ class ChatViewModel(
                 var chunkTimedOut = false
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        computeManager.generate(
-                            continuationPrompt,
-                            maxTokens = chunkBudget,
-                            temperature = if (ProjectTypeGate.isCodeCreationRequest(prompt)) settings.temperature.coerceAtMost(0.35f) else settings.temperature,
-                            topP = settings.topP,
-                            onStopReason = { chunkStopReason = it },
-                            onProgress = onProgress
-                        ).collect { piece ->
+                        val generationFlow = if (chunkIndex > 1 && nativeContinuationReady) {
+                            computeManager.continueGenerate(
+                                maxTokens = chunkBudget,
+                                temperature = if (ProjectTypeGate.isCodeCreationRequest(prompt)) settings.temperature.coerceAtMost(0.35f) else settings.temperature,
+                                topP = settings.topP,
+                                onStopReason = { chunkStopReason = it },
+                                onProgress = onProgress
+                            )
+                        } else {
+                            computeManager.generate(
+                                continuationPrompt,
+                                maxTokens = chunkBudget,
+                                temperature = if (ProjectTypeGate.isCodeCreationRequest(prompt)) settings.temperature.coerceAtMost(0.35f) else settings.temperature,
+                                topP = settings.topP,
+                                onStopReason = { chunkStopReason = it },
+                                onProgress = onProgress
+                            )
+                        }
+                        generationFlow.collect { piece ->
                             builder.append(piece)
                             tokenCount++
                             val full = builder.toString()
@@ -1564,7 +1591,7 @@ class ChatViewModel(
                                     kind = ExecutionCheckpointKind.REPLY,
                                     originalRequest = prompt,
                                     extraContext = "",
-                                    continuationPrompt = prompt + "\n\n" + full,
+                                    continuationPrompt = buildRecoveryPrompt(prompt, full),
                                     currentFileIndex = 0,
                                     projectDirId = "",
                                     planMessageId = botId,
@@ -1574,7 +1601,16 @@ class ChatViewModel(
                             }
                         }
                     }
-                    if (timedOutOrNull == null) chunkTimedOut = true
+                    if (timedOutOrNull == null) {
+                        chunkTimedOut = true
+                        nativeContinuationReady = false
+                        // Do not expose a resumable task while the detached
+                        // native worker is still inside llama.cpp. Waiting here
+                        // makes the later Continue start from a genuinely idle
+                        // engine instead of showing a second glowing card with
+                        // zero new tokens while it waits behind the old call.
+                        BrainEngine.awaitGenerationIdle(GENERATION_CHUNK_TIMEOUT_MS)
+                    }
                 } catch (e: kotlinx.coroutines.CancellationException) {
                     throw e
                 } catch (e: Exception) {
@@ -1601,8 +1637,10 @@ class ChatViewModel(
 
                 if (chunkFailed) break
                 stopReason = chunkStopReason
+                recoveryPrompt = buildRecoveryPrompt(prompt, builder.toString())
+                nativeContinuationReady = nativeContinuationReady && stopReason == "max_tokens"
+                if (!nativeContinuationReady) continuationPrompt = recoveryPrompt
                 if (chunkStopReason == "timeout") break
-                continuationPrompt = prompt + "\n\n" + builder.toString()
             }
         } catch (ce: kotlinx.coroutines.CancellationException) {
             // Real interruption - the user left the screen, the app was
@@ -1825,7 +1863,7 @@ class ChatViewModel(
                 // the whole message after a pause is the one honest option
                 // stated here.
                 if (builder.isNotBlank()) {
-                    val savedContinuation = prompt + "\n\n" + builder.toString()
+                    val savedContinuation = buildRecoveryPrompt(prompt, builder.toString())
                     pendingContinuation = PendingContinuation(activeSessionId, savedContinuation, zipEditTarget)
                     executionCheckpointRepository.savePaused(
                         id = replyCheckpointId, sessionId = activeSessionId, kind = ExecutionCheckpointKind.REPLY,
@@ -1921,10 +1959,9 @@ class ChatViewModel(
         }
 
         // Weakness-review fix, issue 2 - real, bounded auto-continue for a
-        // single file's own generation, same genuine "re-send prompt +
-        // everything real generated so far, ask for another real chunk"
-        // shape [streamRealResponse]'s own main loop already uses, just
-        // capped at [MAX_FILE_CONTINUATION_CHUNKS] instead of
+        // single file. Local generation keeps the live native KV context
+        // across max_tokens chunks; only a recovery path rebuilds a bounded
+        // prompt. This is capped at [MAX_FILE_CONTINUATION_CHUNKS] instead of
         // [MAX_CONTINUATION_CHUNKS] - one planned file that stops on
         // "max_tokens" now keeps genuinely asking for more of itself
         // instead of silently being handed back to [FileValidator] as if
@@ -1940,6 +1977,7 @@ class ChatViewModel(
         ): Pair<String, String> {
             val builder = StringBuilder(initialOutput)
             var continuationPrompt = initialContinuationPrompt?.takeIf { it.isNotBlank() } ?: prompt
+            var nativeContinuationReady = false
             var reason = "max_tokens"
             var chunk = 0
             while (reason == "max_tokens" && chunk < MAX_FILE_CONTINUATION_CHUNKS) {
@@ -1962,11 +2000,28 @@ class ChatViewModel(
                 // out, the same way the fixed planning call used to.
                 try {
                     val timedOutOrNull = runWithStallWatchdog(GENERATION_CHUNK_TIMEOUT_MS) { onProgress ->
-                        computeManager.generate(continuationPrompt, maxTokens = budget, temperature = settings.temperature.coerceAtMost(0.35f), topP = settings.topP, onStopReason = { chunkReason = it }, onProgress = onProgress, forceMode = forceMode)
-                            .collect {
-                                builder.append(it)
-                                onChunkText(builder.toString())
-                            }
+                        val generationFlow = if (chunk > 1 && nativeContinuationReady) {
+                            computeManager.continueGenerate(
+                                maxTokens = budget,
+                                temperature = settings.temperature.coerceAtMost(0.35f),
+                                topP = settings.topP,
+                                onStopReason = { chunkReason = it },
+                                onProgress = onProgress,
+                                forceMode = forceMode
+                            )
+                        } else {
+                            computeManager.generate(
+                                continuationPrompt, maxTokens = budget,
+                                temperature = settings.temperature.coerceAtMost(0.35f),
+                                topP = settings.topP,
+                                onStopReason = { chunkReason = it },
+                                onProgress = onProgress, forceMode = forceMode
+                            )
+                        }
+                        generationFlow.collect {
+                            builder.append(it)
+                            onChunkText(builder.toString())
+                        }
                     }
                     if (timedOutOrNull == null) {
                         // Kotlin's watchdog can stop waiting before the detached
@@ -1975,6 +2030,7 @@ class ChatViewModel(
                         // engine: that was the exact "glow but token count stays 0"
                         // failure seen after the first timeout. Wait for the real
                         // native operation to finish before exposing PAUSED.
+                        nativeContinuationReady = false
                         val nativeIdle = BrainEngine.awaitGenerationIdle(GENERATION_CHUNK_TIMEOUT_MS)
                         reason = if (nativeIdle) "timeout" else "engine_busy"
                         break
@@ -1986,7 +2042,8 @@ class ChatViewModel(
                     break
                 }
                 reason = chunkReason
-                continuationPrompt = prompt + "\n\n" + builder.toString()
+                nativeContinuationReady = nativeContinuationReady || (chunk == 1 && reason == "max_tokens" && (forceMode ?: computeManager.mode) == ComputeMode.LOCAL)
+                if (!nativeContinuationReady) continuationPrompt = buildRecoveryPrompt(prompt, builder.toString())
             }
             if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
             return builder.toString() to reason
@@ -2595,12 +2652,9 @@ class ChatViewModel(
          * karne ki zaroorat na pade") - real chunks are cheap to loop
          * (each one is bounded by a real, shrinking [chunkTokenBudget]
          * anyway), and the actual, hard stopping point for a single reply
-         * was never really this count - it's the real loaded context
-         * window ([loadedContextSize] in [streamRealResponse]): every
-         * chunk re-decodes the *entire* prompt-so-far from scratch (native
-         * side clears the KV cache on every call), so the prompt genuinely
-         * cannot grow past `contextLength` tokens no matter how many
-         * chunks are allowed. At the max real Context Length setting
+         * is the real loaded context window. Local max_tokens chunks now
+         * reuse the live native KV context; only recovery after an invalidated
+         * native call rebuilds a bounded prompt. At the max real Context Length setting
          * (8192, see [com.brain.offlineai.data.settings.ModelSettingsRepository.MAX_CONTEXT_LENGTH])
          * that's only ever ~8 real chunks before [chunkTokenBudget]
          * genuinely hits 0 and the loop stops itself via "context_full" -

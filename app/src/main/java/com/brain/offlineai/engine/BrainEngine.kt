@@ -48,6 +48,8 @@ object BrainEngine {
     private val _state = MutableStateFlow<EngineState>(EngineState.Unloaded)
     val state: StateFlow<EngineState> = _state
     private val generationActive = AtomicBoolean(false)
+    /** True only while the native KV context contains a resumable generation. */
+    private val continuationReady = AtomicBoolean(false)
     /** Serializes every operation that touches the single native model/context.
      * Generation, load, unload and thermal pause can never enter llama.cpp
      * concurrently, so a slow/cancelled generation cannot race a settings
@@ -70,6 +72,7 @@ object BrainEngine {
                     backendReady = BrainNative.nativeBackendInit()
                 }
                 val ok = BrainNative.nativeLoadModel(modelPath, nCtx, nThreads)
+                continuationReady.set(false)
                 _state.value = if (ok) {
                     EngineState.Loaded(modelDisplayName, BrainNative.nativeGetContextSize())
                 } else {
@@ -84,6 +87,7 @@ object BrainEngine {
             withContext(Dispatchers.Default) {
                 BrainNative.nativeUnloadModel()
             }
+            continuationReady.set(false)
             _state.value = EngineState.Unloaded
         }
     }
@@ -104,6 +108,7 @@ object BrainEngine {
             withContext(Dispatchers.Default) {
                 BrainNative.nativeUnloadModel()
             }
+            continuationReady.set(false)
             _state.value = EngineState.ThermalPaused(loaded.modelName, loaded.contextSize)
         }
     }
@@ -151,104 +156,104 @@ object BrainEngine {
         temperature: Float = 0.7f,
         topP: Float = 0.9f,
         onStopReason: (String) -> Unit = {},
-        /**
-         * Bug fix (user report - "phone slow hai", planning and the
-         * single-response fallback both timing out on a genuinely slow
-         * device even while the model is still honestly working). Called
-         * on every real native callback - both a real decoded token AND a
-         * real prefill heartbeat (see the empty-token branch below) - so
-         * a caller can tell "still genuinely making progress, just slow"
-         * apart from "actually stuck". Never called after cancellation.
-         * Default no-op so every existing call site is unaffected.
-         */
         onProgress: () -> Unit = {}
-    ): Flow<String> =
-        callbackFlow {
-            if (!isLoaded) {
-                close(IllegalStateException("No model loaded"))
-                return@callbackFlow
-            }
-            /*
-             * Do not call the blocking JNI function directly from this
-             * callbackFlow producer.  A coroutine timeout/cancellation cannot
-             * regain control while nativeGenerate is doing prompt prefill, so
-             * the old implementation could leave the UI on "Working" forever
-             * and keep the model running in an orphaned coroutine.
-             *
-             * The native call still owns the process-wide native mutex, so a
-             * later request cannot corrupt the model while a timed-out call is
-             * finishing.  The detached worker is deliberately cancelled from
-             * the flow, while the callback's atomic flag makes nativeGenerate
-             * stop at its next token boundary.
-             */
-            val cancelled = AtomicBoolean(false)
-            val callback = BrainNative.TokenCallback { token ->
-                if (cancelled.get()) {
-                    false
-                } else if (token.isEmpty()) {
-                    // Real prefill heartbeat (see llama_bridge.cpp's own
-                    // doc on the chunked-prefill fix) - native calls this
-                    // between prompt chunks purely so a real Kotlin-side
-                    // cancel/timeout can interrupt prefill itself, not
-                    // only the token-by-token decode loop after it. Never
-                    // a real generated token: not sent into the flow, and
-                    // never counted toward the reply. Still real forward
-                    // motion, so it counts toward [onProgress] the same as
-                    // a decoded token does.
-                    onProgress()
-                    true
-                } else {
-                    onProgress()
-                    trySend(token).isSuccess && !cancelled.get()
-                }
-            }
+    ): Flow<String> = generateInternal(prompt, maxTokens, temperature, topP, true, onStopReason, onProgress)
 
-            // This scope is independent of the collector.  That is
-            // intentional: cancelling the collector must return immediately
-            // even if JNI is currently inside a long, non-cancellable prefill.
-            // A timed-out caller can leave the detached native worker alive
-            // until the next prefill heartbeat. Queue the next request here
-            // as well as exposing awaitGenerationIdle(), so every caller is
-            // protected even when it is not the planner fallback path.
-            // A previous call can still be unwinding inside the real native
-            // llama.cpp mutex after a Kotlin-side watchdog stopped waiting.
-            // Do not turn that normal native teardown race into a generic
-            // generation error for the user's next message. Wait for the real
-            // engine to become idle, while emitting genuine liveness heartbeats
-            // so the UI watchdog knows this coroutine is actively waiting.
-            val idle = withTimeoutOrNull(90_000L) {
-                while (generationActive.get()) {
-                    // Waiting for a previous real native call is not model
-                    // generation progress. Do not manufacture heartbeats or
-                    // the caller's stall watchdog can never detect a real stall.
-                    delay(250L)
-                }
-            }
-            if (idle == null) {
-                close(IllegalStateException("Previous generation did not become idle within 90 seconds"))
-                return@callbackFlow
-            }
-            val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
-                nativeOperationMutex.withLock {
-                    generationActive.set(true)
-                    try {
-                        val stopReason = BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
-                        if (!cancelled.get()) {
-                            if (stopReason.startsWith("error:")) {
-                                close(IllegalStateException(stopReason))
-                            } else {
-                                onStopReason(stopReason)
-                                close()
-                            }
-                        }
-                    } finally {
-                        generationActive.set(false)
-                    }
-                }
-            }
-            awaitClose {
-                cancelled.set(true)
-                worker.cancel()
+    /**
+     * Continues the exact native llama.cpp KV context left by a previous
+     * generation that ended at max_tokens. No conversation/history/prompt is
+     * re-read or re-prefilled. This is intentionally separate from generate()
+     * so a brand-new user message always gets a clean context.
+     */
+    fun continueGenerate(
+        maxTokens: Int = 512,
+        temperature: Float = 0.7f,
+        topP: Float = 0.9f,
+        onStopReason: (String) -> Unit = {},
+        onProgress: () -> Unit = {}
+    ): Flow<String> = generateInternal("", maxTokens, temperature, topP, false, onStopReason, onProgress)
+
+    private fun generateInternal(
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float,
+        topP: Float,
+        resetContext: Boolean,
+        onStopReason: (String) -> Unit,
+        onProgress: () -> Unit
+    ): Flow<String> = callbackFlow {
+        if (!isLoaded) {
+            close(IllegalStateException("No model loaded"))
+            return@callbackFlow
+        }
+
+        val idle = withTimeoutOrNull(90_000L) {
+            while (generationActive.get()) {
+                // This is engine teardown/waiting, not model token progress.
+                // Keep the caller informed that resume is waiting for the
+                // previous native operation to become genuinely idle, while
+                // deliberately never incrementing the token counter.
+                onProgress()
+                delay(250L)
             }
         }
+        if (idle == null) {
+            close(IllegalStateException("Previous generation did not become idle within 90 seconds"))
+            return@callbackFlow
+        }
+        if (!resetContext && !continuationReady.get()) {
+            close(IllegalStateException("No resumable native generation context"))
+            return@callbackFlow
+        }
+
+        val cancelled = AtomicBoolean(false)
+        val callback = BrainNative.TokenCallback { token ->
+            if (cancelled.get()) {
+                false
+            } else if (token.isEmpty()) {
+                // Empty callback is a real prefill heartbeat only for a fresh
+                // generate() call. It is never a generated token.
+                onProgress()
+                true
+            } else {
+                onProgress()
+                trySend(token).isSuccess && !cancelled.get()
+            }
+        }
+
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            nativeOperationMutex.withLock {
+                generationActive.set(true)
+                try {
+                    val stopReason = if (resetContext) {
+                        BrainNative.nativeGenerate(prompt, maxTokens, temperature, topP, callback)
+                    } else {
+                        BrainNative.nativeContinueGenerate(maxTokens, temperature, topP, callback)
+                    }
+                    if (!cancelled.get()) {
+                        if (stopReason.startsWith("error:")) {
+                            continuationReady.set(false)
+                            close(IllegalStateException(stopReason))
+                        } else {
+                            onStopReason(stopReason)
+                            continuationReady.set(stopReason == "max_tokens")
+                            close()
+                        }
+                    }
+                } finally {
+                    generationActive.set(false)
+                }
+            }
+        }
+
+        awaitClose {
+            cancelled.set(true)
+            worker.cancel()
+            // A cancellation/timeout must never advertise the native KV cache
+            // as a safe continuation point: the native worker may have stopped
+            // at a prefill boundary rather than after a complete generated token.
+            if (cancelled.get()) continuationReady.set(false)
+        }
+    }
+
 }

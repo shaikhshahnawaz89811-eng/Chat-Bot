@@ -45,6 +45,19 @@ object BrainNative {
         callback: TokenCallback
     ): String
 
+    /**
+     * Continues the already-running conversation context from the previous
+     * nativeGenerate() call. It does NOT clear the llama KV cache and does
+     * NOT re-tokenize/re-prefill the previous prompt. This is the real
+     * same-context path used after a chunk ends at max_tokens.
+     */
+    external fun nativeContinueGenerate(
+        maxTokens: Int,
+        temperature: Float,
+        topP: Float,
+        callback: TokenCallback
+    ): String
+
     /** Implemented on the Kotlin side; invoked from native code per token. */
     fun interface TokenCallback {
         /** @return true to keep generating, false to stop early. */
