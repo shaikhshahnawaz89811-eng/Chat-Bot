@@ -248,6 +248,14 @@ object BrainEngine {
 
         awaitClose {
             cancelled.set(true)
+            // Coroutine cancellation cannot interrupt a blocking JNI call by
+            // itself. Explicitly signal the native inference loop before
+            // cancelling the worker so a watchdog/Stop can actually release
+            // the llama.cpp call instead of leaving a hidden native worker
+            // running behind the UI.
+            if (generationActive.get()) {
+                BrainNative.nativeCancelGeneration()
+            }
             worker.cancel()
             // A cancellation/timeout must never advertise the native KV cache
             // as a safe continuation point: the native worker may have stopped

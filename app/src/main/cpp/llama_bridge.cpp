@@ -17,6 +17,7 @@
 #include <mutex>
 #include <cstring>
 #include <algorithm>
+#include <atomic>
 
 #include "llama.h"
 
@@ -31,6 +32,10 @@ llama_model *g_model = nullptr;
 llama_context *g_ctx = nullptr;
 const llama_vocab *g_vocab = nullptr;
 bool g_backend_initialized = false;
+// Set from a separate JNI call when Kotlin cancels/stalls a generation.
+// This must remain independent of g_engine_mutex because native generation
+// holds that mutex for the duration of llama.cpp inference.
+std::atomic<bool> g_cancel_requested{false};
 int g_n_ctx = 0;
 int g_n_cur = 0;
 
@@ -145,6 +150,15 @@ Java_com_brain_offlineai_engine_BrainNative_nativeUnloadModel(JNIEnv *, jobject)
     LOGI("Model unloaded");
 }
 
+JNIEXPORT void JNICALL
+Java_com_brain_offlineai_engine_BrainNative_nativeCancelGeneration(JNIEnv *, jobject) {
+    // Do not take g_engine_mutex here: nativeGenerate/nativeContinueGenerate
+    // intentionally hold it while llama.cpp is running. The cancel flag is
+    // atomic so the inference thread can observe it between decode steps.
+    g_cancel_requested.store(true, std::memory_order_release);
+    LOGI("Generation cancellation requested");
+}
+
 JNIEXPORT jboolean JNICALL
 Java_com_brain_offlineai_engine_BrainNative_nativeIsModelLoaded(JNIEnv *, jobject) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
@@ -172,6 +186,8 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     if (g_model == nullptr || g_ctx == nullptr || g_vocab == nullptr) {
         return env->NewStringUTF("error: no model loaded");
     }
+
+    g_cancel_requested.store(false, std::memory_order_release);
 
     // Real bug fix: g_ctx (and its KV cache) is a single process-wide
     // context that lives across every call to this function - nothing
@@ -245,11 +261,15 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     // timeout/Stop can now actually interrupt prefill itself, not only
     // the decode-one-token-at-a-time loop below.
     std::string stopReason = "max_tokens";
-    const int kPrefillChunkTokens = 16;
+    const int kPrefillChunkTokens = 8;
     const int n_prompt = static_cast<int>(prompt_tokens.size());
     int n_fed = 0;
     bool prefillCancelled = false;
     while (n_fed < n_prompt) {
+        if (g_cancel_requested.load(std::memory_order_acquire)) {
+            llama_sampler_free(sampler);
+            return env->NewStringUTF("cancelled");
+        }
         int chunkLen = std::min(kPrefillChunkTokens, n_prompt - n_fed);
         llama_batch chunkBatch = llama_batch_get_one(prompt_tokens.data() + n_fed, chunkLen);
         if (llama_decode(g_ctx, chunkBatch) != 0) {
@@ -257,6 +277,11 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
             return env->NewStringUTF("error: llama_decode failed on prompt");
         }
         n_fed += chunkLen;
+
+        if (g_cancel_requested.load(std::memory_order_acquire)) {
+            llama_sampler_free(sampler);
+            return env->NewStringUTF("cancelled");
+        }
 
         if (n_fed < n_prompt) {
             jstring heartbeat = env->NewStringUTF("");
@@ -280,6 +305,10 @@ Java_com_brain_offlineai_engine_BrainNative_nativeGenerate(
     char piece_buf[256];
 
     while (n_generated < limit) {
+        if (g_cancel_requested.load(std::memory_order_acquire)) {
+            stopReason = "cancelled";
+            break;
+        }
         llama_token new_token = llama_sampler_sample(sampler, g_ctx, -1);
 
         if (llama_vocab_is_eog(g_vocab, new_token)) {
@@ -334,6 +363,7 @@ Java_com_brain_offlineai_engine_BrainNative_nativeContinueGenerate(
     if (g_model == nullptr || g_ctx == nullptr || g_vocab == nullptr) {
         return env->NewStringUTF("error: no model loaded");
     }
+    g_cancel_requested.store(false, std::memory_order_release);
     if (g_n_cur <= 0 || g_n_cur >= g_n_ctx - 1) {
         return env->NewStringUTF("context_full");
     }
@@ -352,6 +382,10 @@ Java_com_brain_offlineai_engine_BrainNative_nativeContinueGenerate(
     char piece_buf[256];
 
     while (n_generated < limit) {
+        if (g_cancel_requested.load(std::memory_order_acquire)) {
+            stopReason = "cancelled";
+            break;
+        }
         if (n_cur >= g_n_ctx - 1) {
             stopReason = "context_full";
             break;

@@ -1361,12 +1361,18 @@ class ChatViewModel(
     /** Recovery prompt used only when the native KV context cannot be reused.
      * Normal max_tokens chunking uses BrainEngine.continueGenerate() instead,
      * so the already-generated output is never prefilled a second time. */
-    private fun buildRecoveryPrompt(originalRequest: String, partialOutput: String): String {
-        // Recovery after timeout/process death rebuilds the native context
-        // once, but never drags the whole old search result set, transcript,
-        // or enormous generated prefix back through the 7B/8B model.
-        val request = originalRequest.take(6000)
-        val output = partialOutput.takeLast(14000)
+    private fun buildRecoveryPrompt(originalRequest: String, partialOutput: String, contextSize: Int = 2048): String {
+        // Recovery is a fresh native context, so the checkpoint itself must
+        // fit inside the real model window. The old fixed 14,000-character
+        // tail could be ~4,600 tokens and therefore exceeded a 2,048-token
+        // context before the model had a chance to emit even one new token.
+        // Keep the request small and reserve most of the window for the
+        // model's actual continuation output.
+        val safeContext = contextSize.coerceAtLeast(512)
+        val requestChars = (safeContext * 1.5).toInt().coerceAtMost(3000)
+        val outputChars = (safeContext * 1.5).toInt().coerceAtMost(4500)
+        val request = originalRequest.take(requestChars)
+        val output = partialOutput.takeLast(outputChars)
         return request + "\n\n[RESUME CHECKPOINT - TAIL OF PRESERVED OUTPUT]\n" +
             output +
             "\n[END RESUME CHECKPOINT]\nContinue from the exact end above. Do not repeat the preserved output."
@@ -1591,7 +1597,7 @@ class ChatViewModel(
                                     kind = ExecutionCheckpointKind.REPLY,
                                     originalRequest = prompt,
                                     extraContext = "",
-                                    continuationPrompt = buildRecoveryPrompt(prompt, full),
+                                    continuationPrompt = buildRecoveryPrompt(prompt, full, loadedContextSize),
                                     currentFileIndex = 0,
                                     projectDirId = "",
                                     planMessageId = botId,
@@ -1637,7 +1643,7 @@ class ChatViewModel(
 
                 if (chunkFailed) break
                 stopReason = chunkStopReason
-                recoveryPrompt = buildRecoveryPrompt(prompt, builder.toString())
+                recoveryPrompt = buildRecoveryPrompt(prompt, builder.toString(), loadedContextSize)
                 nativeContinuationReady = nativeContinuationReady && stopReason == "max_tokens"
                 if (!nativeContinuationReady) continuationPrompt = recoveryPrompt
                 if (chunkStopReason == "timeout") break
@@ -1857,13 +1863,14 @@ class ChatViewModel(
                 // context_full branch above): [BrainEngine]'s native call
                 // for this chunk may genuinely still be running in the
                 // background even though this coroutine stopped waiting on
-                // it (there is no real way to interrupt mid-prefill - see
-                // [BrainEngine.generate]'s own doc), so a fresh generate()
-                // call right away isn't guaranteed safe either. Retrying
+                // it (the native bridge now has an explicit atomic cancel
+                // endpoint that interrupts between bounded prefill/decode
+                // steps), so the engine is allowed to settle before any
+                // fresh generation is started. Retrying
                 // the whole message after a pause is the one honest option
                 // stated here.
                 if (builder.isNotBlank()) {
-                    val savedContinuation = buildRecoveryPrompt(prompt, builder.toString())
+                    val savedContinuation = buildRecoveryPrompt(prompt, builder.toString(), loadedContextSize)
                     pendingContinuation = PendingContinuation(activeSessionId, savedContinuation, zipEditTarget)
                     executionCheckpointRepository.savePaused(
                         id = replyCheckpointId, sessionId = activeSessionId, kind = ExecutionCheckpointKind.REPLY,
@@ -2043,7 +2050,7 @@ class ChatViewModel(
                 }
                 reason = chunkReason
                 nativeContinuationReady = nativeContinuationReady || (chunk == 1 && reason == "max_tokens" && (forceMode ?: computeManager.mode) == ComputeMode.LOCAL)
-                if (!nativeContinuationReady) continuationPrompt = buildRecoveryPrompt(prompt, builder.toString())
+                if (!nativeContinuationReady) continuationPrompt = buildRecoveryPrompt(prompt, builder.toString(), loadedContextSize)
             }
             if (reason == "max_tokens" && chunk >= MAX_FILE_CONTINUATION_CHUNKS) reason = "chunk_cap"
             return builder.toString() to reason
@@ -2257,7 +2264,7 @@ class ChatViewModel(
                     lastCheckpointChars = partial.length
                     executionCheckpointRepository.updateProgress(
                         checkpointId,
-                        continuationPrompt = filePrompt + "\n\nContinue this exact file from the following real partial output. Do not restart or replace it; continue it to a complete file.\n\n" + partial,
+                        continuationPrompt = buildRecoveryPrompt(filePrompt, partial, loadedContextSize),
                         currentFileIndex = fileIndex,
                         currentFileName = planned.fileName,
                         partialOutput = partial

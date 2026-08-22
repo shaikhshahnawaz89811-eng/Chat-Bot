@@ -27,6 +27,14 @@ object BrainNative {
 
     external fun nativeIsModelLoaded(): Boolean
 
+    /**
+     * Requests cancellation of the currently running native generation. This
+     * is deliberately a lock-free JNI endpoint because native generation
+     * holds its native mutex while llama.cpp is decoding.
+     */
+    external fun nativeCancelGeneration()
+
+
     /** Context window size (n_ctx) of the currently loaded model, or 0 if none. */
     external fun nativeGetContextSize(): Int
 
